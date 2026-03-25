@@ -1,5 +1,5 @@
-use crate::types::*;
 use crate::system::System;
+use crate::types::*;
 
 /// Scale a one-hot encoding h by a scalar s.
 /// h entries are binary (Z_2), s is in some integer ring R.

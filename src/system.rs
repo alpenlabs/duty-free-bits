@@ -59,10 +59,14 @@ impl System {
     }
 
     /// Number of wires in the system.
-    pub fn num_wires(&self) -> usize { self.values.len() }
+    pub fn num_wires(&self) -> usize {
+        self.values.len()
+    }
 
     /// Number of gates in the system.
-    pub fn num_gates(&self) -> usize { self.gates.len() }
+    pub fn num_gates(&self) -> usize {
+        self.gates.len()
+    }
 
     // --- Wire constructors ---
 
@@ -109,7 +113,13 @@ impl System {
 
     fn one_in_one_out(&mut self, typ: GateType, x: Wire, param: u64, out_mod: u64) -> Wire {
         let out = self.alloc_wire(out_mod);
-        let g = Gate { typ, param, in0: x, in1: Wire { wid: 0 }, out };
+        let g = Gate {
+            typ,
+            param,
+            in0: x,
+            in1: Wire { wid: 0 },
+            out,
+        };
         self.add_gate(g);
         out
     }
@@ -121,7 +131,13 @@ impl System {
     pub fn switch(&mut self, x: Wire, s: Wire) -> Wire {
         debug_assert_eq!(self.modulus(s), 2, "switch control must be binary (Z_2)");
         let out = self.alloc_wire(self.modulus(x));
-        let g = Gate { typ: GateType::Switch, param: 0, in0: x, in1: s, out };
+        let g = Gate {
+            typ: GateType::Switch,
+            param: 0,
+            in0: x,
+            in1: s,
+            out,
+        };
         self.add_gate(g);
         out
     }
@@ -132,8 +148,18 @@ impl System {
         assert_eq!(self.modulus(x), self.modulus(y));
         let m = self.modulus(x);
         // join complexity in bits
-        self.join_complexity += if is_power_of_2(m) { log2(m) as usize } else { (m as f64).log2().ceil() as usize };
-        let g = Gate { typ: GateType::Join, param: 0, in0: x, in1: y, out: Wire { wid: 0 } };
+        self.join_complexity += if is_power_of_2(m) {
+            log2(m) as usize
+        } else {
+            (m as f64).log2().ceil() as usize
+        };
+        let g = Gate {
+            typ: GateType::Join,
+            param: 0,
+            in0: x,
+            in1: y,
+            out: Wire { wid: 0 },
+        };
         self.add_gate(g);
         x
     }
@@ -141,7 +167,13 @@ impl System {
     /// SameWire: constrain x = y without join cost (when one side is unconstrained).
     pub fn same_wire(&mut self, x: Wire, y: Wire) -> Wire {
         assert_eq!(self.modulus(x), self.modulus(y));
-        let g = Gate { typ: GateType::SameWire, param: 0, in0: x, in1: y, out: Wire { wid: 0 } };
+        let g = Gate {
+            typ: GateType::SameWire,
+            param: 0,
+            in0: x,
+            in1: y,
+            out: Wire { wid: 0 },
+        };
         self.add_gate(g);
         x
     }
@@ -150,7 +182,13 @@ impl System {
     pub fn add(&mut self, x: Wire, y: Wire) -> Wire {
         assert_eq!(self.modulus(x), self.modulus(y));
         let out = self.alloc_wire(self.modulus(x));
-        let g = Gate { typ: GateType::Add, param: 0, in0: x, in1: y, out };
+        let g = Gate {
+            typ: GateType::Add,
+            param: 0,
+            in0: x,
+            in1: y,
+            out,
+        };
         self.add_gate(g);
         out
     }
@@ -159,7 +197,13 @@ impl System {
     pub fn sub(&mut self, x: Wire, y: Wire) -> Wire {
         assert_eq!(self.modulus(x), self.modulus(y));
         let out = self.alloc_wire(self.modulus(x));
-        let g = Gate { typ: GateType::Sub, param: 0, in0: x, in1: y, out };
+        let g = Gate {
+            typ: GateType::Sub,
+            param: 0,
+            in0: x,
+            in1: y,
+            out,
+        };
         self.add_gate(g);
         out
     }
@@ -217,7 +261,8 @@ impl System {
     /// Element-wise addition of two wire vectors.
     pub fn add_vec(&mut self, x: &[Wire], y: &[Wire]) -> Vec<Wire> {
         assert_eq!(x.len(), y.len());
-        x.iter().zip(y.iter())
+        x.iter()
+            .zip(y.iter())
             .map(|(&a, &b)| self.add(a, b))
             .collect()
     }

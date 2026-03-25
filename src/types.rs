@@ -64,12 +64,20 @@ impl Val {
     pub fn new(v: u64, modulus: u64) -> Val {
         assert!(modulus > 0);
         assert!(v < modulus, "v={} >= modulus={}", v, modulus);
-        Val { v, modulus, defined: true }
+        Val {
+            v,
+            modulus,
+            defined: true,
+        }
     }
 
     /// Create an undefined value in Z_modulus.
     pub fn none(modulus: u64) -> Val {
-        Val { v: 0, modulus, defined: false }
+        Val {
+            v: 0,
+            modulus,
+            defined: false,
+        }
     }
 
     /// Returns true if this value is undefined.
@@ -102,7 +110,11 @@ impl Eq for Val {}
 
 impl fmt::Display for Val {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.defined { write!(f, "{}", self.v) } else { write!(f, "?") }
+        if self.defined {
+            write!(f, "{}", self.v)
+        } else {
+            write!(f, "?")
+        }
     }
 }
 
@@ -110,27 +122,35 @@ impl fmt::Display for Val {
 
 /// Switch guard: returns x if ctrl=0, undefined otherwise.
 pub fn guard(x: Val, ctrl: Val) -> Val {
-    if ctrl.is_none() { return Val::none(x.modulus); }
+    if ctrl.is_none() {
+        return Val::none(x.modulus);
+    }
     if ctrl.v == 0 { x } else { Val::none(x.modulus) }
 }
 
 /// Add two values in the same ring.
 pub fn val_add(x: Val, y: Val) -> Val {
     assert_eq!(x.modulus, y.modulus);
-    if x.is_none() || y.is_none() { return Val::none(x.modulus); }
+    if x.is_none() || y.is_none() {
+        return Val::none(x.modulus);
+    }
     Val::new((x.v + y.v) % x.modulus, x.modulus)
 }
 
 /// Subtract two values in the same ring.
 pub fn val_sub(x: Val, y: Val) -> Val {
     assert_eq!(x.modulus, y.modulus);
-    if x.is_none() || y.is_none() { return Val::none(x.modulus); }
+    if x.is_none() || y.is_none() {
+        return Val::none(x.modulus);
+    }
     Val::new((x.modulus + x.v - y.v) % x.modulus, x.modulus)
 }
 
 /// Scalar multiplication: s * x in x's ring.
 pub fn val_mul(s: u64, x: Val) -> Val {
-    if x.is_none() { return Val::none(x.modulus); }
+    if x.is_none() {
+        return Val::none(x.modulus);
+    }
     let p = ((s as u128) * (x.v as u128)) % (x.modulus as u128);
     Val::new(p as u64, x.modulus)
 }
@@ -140,7 +160,9 @@ pub fn val_mod2k(x: Val, k: u32) -> Val {
     assert!(k < 64);
     let m = 1u64 << k;
     assert!(m <= x.modulus);
-    if x.is_none() { return Val::none(m); }
+    if x.is_none() {
+        return Val::none(m);
+    }
     Val::new(x.v % m, m)
 }
 
@@ -149,7 +171,9 @@ pub fn val_div2k(x: Val, k: u32) -> Val {
     assert!(k < 64);
     let d = 1u64 << k;
     assert!(x.modulus > d);
-    if x.is_none() { return Val::none(x.modulus / d); }
+    if x.is_none() {
+        return Val::none(x.modulus / d);
+    }
     assert_eq!(x.v % d, 0, "div2k: {} not divisible by 2^{}", x.v, k);
     Val::new(x.v / d, x.modulus / d)
 }

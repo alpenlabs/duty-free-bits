@@ -1,6 +1,6 @@
-use crate::types::*;
-use crate::system::System;
 use super::ohe::{ohe, ohe_scale};
+use crate::system::System;
+use crate::types::*;
 
 fn halves(x: &[Wire]) -> (Vec<Wire>, Vec<Wire>) {
     let n = x.len();
@@ -75,7 +75,12 @@ pub fn word_to_hot(sys: &mut System, x: Wire) -> Vec<Wire> {
 pub fn bin_to_word(sys: &mut System, bits: &[Wire], k: u32) -> Wire {
     let n = bits.len();
     assert!(n > 0);
-    assert!(k as usize >= n, "k={} must be >= n={} for bin_to_word", k, n);
+    assert!(
+        k as usize >= n,
+        "k={} must be >= n={} for bin_to_word",
+        k,
+        n
+    );
     let out_mod = 1u64 << k;
 
     // Step 1: Build binary OHE of the bit vector
@@ -100,12 +105,7 @@ pub fn bin_to_word(sys: &mut System, bits: &[Wire], k: u32) -> Wire {
 /// Evaluate an arbitrary function g on a one-hot encoding.
 /// Given binary OHE h of x, computes g(x) in Z_{r_mod}.
 /// Join width: lg|r_mod| bits.
-pub fn hot_to_ring(
-    sys: &mut System,
-    h: &[Wire],
-    truth_table: &[u64],
-    r_mod: u64,
-) -> Wire {
+pub fn hot_to_ring(sys: &mut System, h: &[Wire], truth_table: &[u64], r_mod: u64) -> Wire {
     assert_eq!(h.len(), truth_table.len());
 
     let one = sys.constant(1, r_mod);
@@ -126,12 +126,7 @@ pub fn hot_to_ring(
 /// Composes word_to_hot with hot_to_ring.
 ///
 /// g: truth table of g: Z_{2^k} → Z_{r_mod}
-pub fn word_to_ring(
-    sys: &mut System,
-    x: Wire,
-    truth_table: &[u64],
-    r_mod: u64,
-) -> Wire {
+pub fn word_to_ring(sys: &mut System, x: Wire, truth_table: &[u64], r_mod: u64) -> Wire {
     let m = sys.modulus(x);
     assert!(is_power_of_2(m));
     let k = log2(m);

@@ -1,5 +1,5 @@
-use crate::types::*;
 use crate::system::System;
+use crate::types::*;
 
 /// Concrete executor: propagates wire values by eagerly firing gates.
 #[derive(Debug)]
@@ -11,7 +11,10 @@ pub struct Exec<'a> {
 impl<'a> Exec<'a> {
     /// Create an executor seeded with the system's initial values.
     pub fn new(system: &'a System) -> Self {
-        Exec { system, values: system.values.clone() }
+        Exec {
+            system,
+            values: system.values.clone(),
+        }
     }
 
     /// Read the current value of a wire.
@@ -39,9 +42,11 @@ impl<'a> Exec<'a> {
 
     fn try_set(&mut self, w: Wire, v: Val, queue: &mut Vec<GateId>) {
         if self.values[w.wid].is_none() && !v.is_none() {
-            assert_eq!(self.values[w.wid].modulus, v.modulus,
+            assert_eq!(
+                self.values[w.wid].modulus, v.modulus,
                 "modulus mismatch on wire {}: expected {}, got {}",
-                w.wid, self.values[w.wid].modulus, v.modulus);
+                w.wid, self.values[w.wid].modulus, v.modulus
+            );
             self.values[w.wid] = v;
             queue.extend_from_slice(&self.system.subscriptions[w.wid]);
         }
