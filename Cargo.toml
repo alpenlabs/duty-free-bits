@@ -1,17 +1,17 @@
 [package]
-name = "alpen-rust-template" # CHANGEME
-version = "0.0.0" # CHANGEME
-edition = "2024" # CHANGEME
+name = "duty-free-bits"
+version = "0.1.0"
+edition = "2024"
 authors = [
-  "John Doe <noreply@alpenlabs.io>",  # CHANGEME
-  "Janet Doe <noreply@alpenlabs.io>", # CHANGEME
+  "Nakul Khambhati <nakul@cs.ucla.edu>",
+  "David Heath <daheath@illinois.edu>",
 ]
-description = "Alpen Rust Template" # CHANGEME
-license = "MIT OR Apache-2.0" # CHANGEME
+description = "Switch system construction from Duty-Free Bits"
+license = "MIT OR Apache-2.0"
 readme = "README.md"
-repository = "https://github.com/alpenlabs/rust-template" # CHANGEME
-categories = ["cryptography::cryptocurrencies"] # CHANGEME
-keywords = ["crypto", "bitcoin"] # CHANGEME
+repository = "https://github.com/alpenlabs/duty-free-bits"
+categories = ["cryptography"]
+keywords = ["garbled-circuits", "mpc", "switch-system", "bitvm"]
 
 [lints]
 rust.missing_debug_implementations = "warn"
