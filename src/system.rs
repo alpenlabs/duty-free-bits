@@ -47,7 +47,11 @@ impl System {
     /// Get bitlen for a wire in Z_{2^k}. Panics if modulus is not a power of 2.
     pub fn bitlen(&self, x: Wire) -> u32 {
         let m = self.modulus(x);
-        assert!(m.is_power_of_two(), "bitlen: modulus {} is not a power of 2", m);
+        assert!(
+            m.is_power_of_two(),
+            "bitlen: modulus {} is not a power of 2",
+            m
+        );
         m.ilog2()
     }
 
