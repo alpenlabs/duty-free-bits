@@ -2,13 +2,6 @@ use super::ohe::{ohe, ohe_scale};
 use crate::system::System;
 use crate::types::*;
 
-fn halves(x: &[Wire]) -> (Vec<Wire>, Vec<Wire>) {
-    let n = x.len();
-    let l = x[..n / 2].to_vec();
-    let r = x[n / 2..].to_vec();
-    (l, r)
-}
-
 /// Given an arithmetic OHE (entries in Z_M), compute the word encoding:
 /// result = Σ (i * h_i)
 pub fn arith_ohe_to_word(sys: &mut System, h: &[Wire]) -> Wire {
@@ -53,8 +46,8 @@ pub fn word_to_hot(sys: &mut System, x: Wire) -> Vec<Wire> {
     // Take successive halves, add them, and use that to constrain bits
     let mut acc = hot.clone();
     for i in 1..((k + 1) as usize) {
-        let (l, r) = halves(&acc);
-        acc = sys.add_vec(&l, &r);
+        let mid = acc.len() / 2;
+        acc = sys.add_vec(&acc[..mid], &acc[mid..]);
 
         let word = arith_ohe_to_word(sys, &acc);
         let diff = sys.sub(x, word);
