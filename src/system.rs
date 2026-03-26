@@ -8,10 +8,6 @@ pub struct System {
     pub(crate) subscriptions: Vec<Vec<GateId>>,
     /// Total join cost in bits accumulated so far.
     pub join_complexity: usize,
-    /// Constant wire holding 0 in Z_2.
-    pub lo: Wire,
-    /// Constant wire holding 1 in Z_2.
-    pub hi: Wire,
 }
 
 impl Default for System {
@@ -21,19 +17,14 @@ impl Default for System {
 }
 
 impl System {
-    /// Create a new system with constant lo (0) and hi (1) wires.
+    /// Create a new, empty system.
     pub fn new() -> Self {
-        let mut s = System {
+        System {
             gates: Vec::new(),
             values: Vec::new(),
             subscriptions: Vec::new(),
             join_complexity: 0,
-            lo: Wire { wid: 0 },
-            hi: Wire { wid: 0 },
-        };
-        s.lo = s.constant(0, 2);
-        s.hi = s.constant(1, 2);
-        s
+        }
     }
 
     /// Allocate a fresh wire in Z_modulus (initially undefined).
@@ -234,24 +225,24 @@ impl System {
     /// Boolean NOT (Z_2 wire)
     pub fn not(&mut self, x: Wire) -> Wire {
         debug_assert_eq!(self.modulus(x), 2);
-        let hi = self.hi;
-        self.add(x, hi)
+        let one = self.constant(1, 2);
+        self.add(x, one)
     }
 
     /// Boolean AND (Z_2 wires)
     pub fn and(&mut self, x: Wire, y: Wire) -> Wire {
         let nx = self.not(x);
         let left = self.switch(y, nx);
-        let lo = self.lo;
-        let right = self.switch(lo, x);
+        let zero = self.constant(0, 2);
+        let right = self.switch(zero, x);
         self.join(left, right)
     }
 
     /// Boolean OR (Z_2 wires)
     pub fn or(&mut self, x: Wire, y: Wire) -> Wire {
         let nx = self.not(x);
-        let hi = self.hi;
-        let left = self.switch(hi, nx);
+        let one = self.constant(1, 2);
+        let left = self.switch(one, nx);
         let right = self.switch(y, x);
         self.join(left, right)
     }
