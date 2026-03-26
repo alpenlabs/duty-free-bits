@@ -46,7 +46,9 @@ impl System {
 
     /// Get bitlen for a wire in Z_{2^k}. Panics if modulus is not a power of 2.
     pub fn bitlen(&self, x: Wire) -> u32 {
-        log2(self.modulus(x))
+        let m = self.modulus(x);
+        assert!(m.is_power_of_two(), "bitlen: modulus {} is not a power of 2", m);
+        m.ilog2()
     }
 
     /// Number of wires in the system.
@@ -120,7 +122,7 @@ impl System {
     /// Switch: data wire x (any ring), control wire s (must be Z_2).
     /// Output has same modulus as x. If s=0, output=x.
     pub fn switch(&mut self, x: Wire, s: Wire) -> Wire {
-        debug_assert_eq!(self.modulus(s), 2, "switch control must be binary (Z_2)");
+        assert_eq!(self.modulus(s), 2, "switch control must be binary (Z_2)");
         let out = self.alloc_wire(self.modulus(x));
         let g = Gate {
             typ: GateType::Switch,
@@ -139,11 +141,7 @@ impl System {
         assert_eq!(self.modulus(x), self.modulus(y));
         let m = self.modulus(x);
         // join complexity in bits
-        self.join_complexity += if is_power_of_2(m) {
-            log2(m) as usize
-        } else {
-            (m as f64).log2().ceil() as usize
-        };
+        self.join_complexity += (m as f64).log2().ceil() as usize;
         let g = Gate {
             typ: GateType::Join,
             param: 0,
@@ -207,16 +205,16 @@ impl System {
     /// Modular reduction: x mod 2^k. Input must be in Z_{2^n} with k ≤ n.
     pub fn mod2k(&mut self, x: Wire, k: u32) -> Wire {
         let m = self.modulus(x);
-        assert!(is_power_of_2(m));
-        assert!(k <= log2(m));
+        assert!(m.is_power_of_two());
+        assert!(k <= m.ilog2());
         self.one_in_one_out(GateType::Mod2k, x, k as u64, 1u64 << k)
     }
 
     /// Division by 2^k. Input must be in Z_{2^{k+c}}, output in Z_{2^c}.
     pub fn div2k(&mut self, x: Wire, k: u32) -> Wire {
         let m = self.modulus(x);
-        assert!(is_power_of_2(m));
-        assert!(k < log2(m));
+        assert!(m.is_power_of_two());
+        assert!(k < m.ilog2());
         self.one_in_one_out(GateType::Div2k, x, k as u64, m >> k)
     }
 
@@ -224,7 +222,7 @@ impl System {
 
     /// Boolean NOT (Z_2 wire)
     pub fn not(&mut self, x: Wire) -> Wire {
-        debug_assert_eq!(self.modulus(x), 2);
+        assert_eq!(self.modulus(x), 2);
         let one = self.constant(1, 2);
         self.add(x, one)
     }

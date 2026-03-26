@@ -23,8 +23,8 @@ pub fn arith_ohe_to_word(sys: &mut System, h: &[Wire]) -> Wire {
 /// Join width: 2k-1 bits.
 pub fn word_to_hot(sys: &mut System, x: Wire) -> Vec<Wire> {
     let m = sys.modulus(x);
-    assert!(is_power_of_2(m));
-    let k = log2(m);
+    assert!(m.is_power_of_two());
+    let k = m.ilog2();
 
     // Allocate k unconstrained binary wires (the bits of x)
     let mut bs = Vec::with_capacity(k as usize);
@@ -121,8 +121,8 @@ pub fn hot_to_ring(sys: &mut System, h: &[Wire], truth_table: &[u64], r_mod: u64
 /// g: truth table of g: Z_{2^k} → Z_{r_mod}
 pub fn word_to_ring(sys: &mut System, x: Wire, truth_table: &[u64], r_mod: u64) -> Wire {
     let m = sys.modulus(x);
-    assert!(is_power_of_2(m));
-    let k = log2(m);
+    assert!(m.is_power_of_two());
+    let k = m.ilog2();
     assert_eq!(truth_table.len(), 1usize << k);
 
     let hot = word_to_hot(sys, x);

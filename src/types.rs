@@ -177,16 +177,3 @@ pub fn val_div2k(x: Val, k: u32) -> Val {
     assert_eq!(x.v % d, 0, "div2k: {} not divisible by 2^{}", x.v, k);
     Val::new(x.v / d, x.modulus / d)
 }
-
-// === Utility ===
-
-/// Returns true if `n` is a power of two.
-pub fn is_power_of_2(n: u64) -> bool {
-    n > 0 && (n & (n - 1)) == 0
-}
-
-/// Returns log2(n). Panics if `n` is not a power of two.
-pub fn log2(n: u64) -> u32 {
-    assert!(is_power_of_2(n), "{} is not a power of 2", n);
-    n.trailing_zeros()
-}
