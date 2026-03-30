@@ -629,11 +629,7 @@ fn test_ohe_2bit() {
         assert_eq!(h.len(), 4);
         for (i, &w) in h.iter().enumerate() {
             let expected = if i as u64 == input { 1 } else { 0 };
-            assert_eq!(
-                exec.get(w),
-                Val::new(expected, 2),
-                "ohe_2bit({input})[{i}]"
-            );
+            assert_eq!(exec.get(w), Val::new(expected, 2), "ohe_2bit({input})[{i}]");
         }
     }
 }
@@ -759,11 +755,7 @@ fn test_bin_to_word_all_values_2bit() {
         exec.set(b1, Val::new((input >> 1) & 1, 2));
         exec.run();
 
-        assert_eq!(
-            exec.get(out),
-            Val::new(input, 8),
-            "bin_to_word({input})"
-        );
+        assert_eq!(exec.get(out), Val::new(input, 8), "bin_to_word({input})");
     }
 }
 
@@ -786,7 +778,11 @@ fn test_hot_to_ring() {
         exec.set(b1, Val::new((input >> 1) & 1, 2));
         exec.run();
 
-        assert_eq!(exec.get(out), Val::new(input, r_mod), "hot_to_ring({input})");
+        assert_eq!(
+            exec.get(out),
+            Val::new(input, r_mod),
+            "hot_to_ring({input})"
+        );
     }
 }
 
