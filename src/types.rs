@@ -89,7 +89,7 @@ impl Val {
     pub fn from_bits(v: u64, bitlen: u32) -> Val {
         assert!(bitlen < 64);
         let m = 1u64 << bitlen;
-        Val::new(v % m, m)
+        Val::new(v, m)
     }
 
     /// Create an undefined value in Z_{2^bitlen}.
