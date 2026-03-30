@@ -80,7 +80,7 @@ impl System {
     /// Create a constant wire holding `n` in Z_modulus.
     pub fn constant(&mut self, n: u64, modulus: u64) -> Wire {
         let w = self.alloc_wire(modulus);
-        self.values[w.wid] = Val::new(n % modulus, modulus);
+        self.values[w.wid] = Val::new(n, modulus);
         w
     }
 
