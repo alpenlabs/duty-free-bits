@@ -54,7 +54,11 @@ impl CrtParams {
         }
 
         // Chunk the n-bit input into ceil(lg n)-bit words.
-        let chunk_size = if n <= 1 { 1 } else { (n as f64).log2().ceil() as u32 };
+        let chunk_size = if n <= 1 {
+            1
+        } else {
+            (n as f64).log2().ceil() as u32
+        };
         let num_chunks = (n as usize + chunk_size as usize - 1) / chunk_size as usize;
 
         // 2^ell must exceed the worst-case residue accumulation:
@@ -65,14 +69,20 @@ impl CrtParams {
         let ell = (max_sum as f64).log2().ceil() as u32 + 1;
         assert!(ell < 64, "working modulus 2^{} exceeds u64", ell);
 
-        CrtParams { n, primes, num_primes, num_chunks, chunk_size, ell }
+        CrtParams {
+            n,
+            primes,
+            num_primes,
+            num_chunks,
+            chunk_size,
+            ell,
+        }
     }
 
     /// M = Π p_i
     pub fn primorial(&self) -> u128 {
         self.primes.iter().map(|&p| p as u128).product()
     }
-
 }
 
 /// 2^j mod p via binary exponentiation. Requires p >= 2.
@@ -96,7 +106,9 @@ pub fn pow2_mod(j: u32, p: u64) -> u64 {
 pub fn crt_reconstruct(residues: &[u64], primes: &[u64]) -> u128 {
     assert_eq!(residues.len(), primes.len());
     let t = primes.len();
-    if t == 0 { return 0; }
+    if t == 0 {
+        return 0;
+    }
 
     // Garner's algorithm: find coefficients c_i such that
     //   x = c_0 + c_1·p_0 + c_2·p_0·p_1 + ...
@@ -128,25 +140,30 @@ pub fn crt_reconstruct(residues: &[u64], primes: &[u64]) -> u128 {
     let mut result: u128 = coeffs[0];
     let mut product: u128 = 1;
     for i in 1..t {
-        product = product.checked_mul(primes[i - 1] as u128)
+        product = product
+            .checked_mul(primes[i - 1] as u128)
             .expect("primorial overflow (M > u128)");
-        result = result.checked_add(
-            coeffs[i].checked_mul(product).expect("CRT overflow")
-        ).expect("CRT overflow");
+        result = result
+            .checked_add(coeffs[i].checked_mul(product).expect("CRT overflow"))
+            .expect("CRT overflow");
     }
     result
 }
 
 /// (a * b) % m, overflow-safe for m < 2^127.
 fn mulmod128(a: u128, b: u128, m: u128) -> u128 {
-    if m == 0 { return 0; }
+    if m == 0 {
+        return 0;
+    }
     if a < (1u128 << 64) && b < (1u128 << 64) {
         return (a * b) % m;
     }
     let (mut a, mut b) = (a % m, b % m);
     let mut result = 0u128;
     while b > 0 {
-        if b & 1 == 1 { result = (result + a) % m; }
+        if b & 1 == 1 {
+            result = (result + a) % m;
+        }
         a = (a + a) % m;
         b >>= 1;
     }
@@ -155,7 +172,9 @@ fn mulmod128(a: u128, b: u128, m: u128) -> u128 {
 
 /// Modular inverse via extended Euclidean algorithm.
 fn mod_inverse(a: u128, m: u128) -> u128 {
-    if m == 1 { return 0; }
+    if m == 1 {
+        return 0;
+    }
     let a = a % m;
     assert!(a > 0, "no inverse of 0 mod {}", m);
     let (mut old_r, mut r) = (a as i128, m as i128);
@@ -240,10 +259,10 @@ mod tests {
 
     #[test]
     fn test_pow2_mod_known() {
-        assert_eq!(pow2_mod(0, 5), 1);    // 2^0 = 1
-        assert_eq!(pow2_mod(3, 5), 3);    // 8 mod 5
-        assert_eq!(pow2_mod(4, 5), 1);    // 16 mod 5
-        assert_eq!(pow2_mod(10, 7), 2);   // 1024 mod 7
+        assert_eq!(pow2_mod(0, 5), 1); // 2^0 = 1
+        assert_eq!(pow2_mod(3, 5), 3); // 8 mod 5
+        assert_eq!(pow2_mod(4, 5), 1); // 16 mod 5
+        assert_eq!(pow2_mod(10, 7), 2); // 1024 mod 7
     }
 
     #[test]
