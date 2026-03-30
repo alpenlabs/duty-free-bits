@@ -762,7 +762,7 @@ fn test_bin_to_word_all_values_2bit() {
 #[test]
 fn test_hot_to_ring() {
     // Identity function via truth table on 2-bit OHE
-    // g(x) = x, r_mod = 8
+    // g(x) = x, a=1, b=0, r_mod = 8 → computes 1·x + 0 = x
     let truth_table = vec![0, 1, 2, 3];
     let r_mod = 8u64;
 
@@ -771,7 +771,9 @@ fn test_hot_to_ring() {
         let b0 = sys.input(2);
         let b1 = sys.input(2);
         let h = ohe(&mut sys, &[b0, b1]);
-        let out = hot_to_ring(&mut sys, &h, &truth_table, r_mod);
+        let a = sys.constant(1, r_mod);
+        let b = sys.constant(0, r_mod);
+        let out = hot_to_ring(&mut sys, &h, &truth_table, a, b);
 
         let mut exec = Exec::new(&sys);
         exec.set(b0, Val::new(input & 1, 2));
@@ -788,14 +790,16 @@ fn test_hot_to_ring() {
 
 #[test]
 fn word_to_ring_square() {
-    // g(x) = x^2 mod 32, evaluated over a 3-bit input (Z_8 → Z_32)
+    // g(x) = x^2 mod 32, a=1, b=0 → computes x^2 mod 32
     let truth_table: Vec<u64> = (0u64..8).map(|x| (x * x) % 32).collect();
     let r_mod = 32u64;
 
     for input in 0u64..8 {
         let mut sys = System::new();
         let x = sys.input_bits(3);
-        let out = word_to_ring(&mut sys, x, &truth_table, r_mod);
+        let a = sys.constant(1, r_mod);
+        let b = sys.constant(0, r_mod);
+        let out = word_to_ring(&mut sys, x, &truth_table, a, b);
 
         let mut exec = Exec::new(&sys);
         exec.set(x, Val::from_bits(input, 3));
@@ -812,14 +816,16 @@ fn word_to_ring_square() {
 
 #[test]
 fn word_to_ring_identity() {
-    // g(x) = x, from Z_4 → Z_8
+    // g(x) = x, a=1, b=0, from Z_4 → Z_8
     let truth_table = vec![0, 1, 2, 3];
     let r_mod = 8u64;
 
     for input in 0..4u64 {
         let mut sys = System::new();
         let x = sys.input_bits(2);
-        let out = word_to_ring(&mut sys, x, &truth_table, r_mod);
+        let a = sys.constant(1, r_mod);
+        let b = sys.constant(0, r_mod);
+        let out = word_to_ring(&mut sys, x, &truth_table, a, b);
 
         let mut exec = Exec::new(&sys);
         exec.set(x, Val::from_bits(input, 2));
