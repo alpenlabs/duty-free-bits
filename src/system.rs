@@ -145,7 +145,11 @@ impl System {
         assert_eq!(self.modulus(x), self.modulus(y));
         let m = self.modulus(x);
         // join complexity in bits
-        self.join_complexity += (m as f64).log2().ceil() as usize;
+        self.join_complexity += if m <= 1 {
+            0
+        } else {
+            (m as u128 - 1).ilog2() as usize + 1
+        };
         let g = Gate {
             typ: GateType::Join,
             param: 0,

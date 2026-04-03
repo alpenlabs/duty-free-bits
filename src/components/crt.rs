@@ -54,19 +54,15 @@ impl CrtParams {
         }
 
         // Chunk the n-bit input into ceil(lg n)-bit words.
-        let chunk_size = if n <= 1 {
-            1
-        } else {
-            (n as f64).log2().ceil() as u32
-        };
-        let num_chunks = (n as usize + chunk_size as usize - 1) / chunk_size as usize;
+        let chunk_size = if n <= 1 { 1 } else { (n - 1).ilog2() + 1 };
+        let num_chunks = n.div_ceil(chunk_size) as usize;
 
         // 2^ell must exceed the worst-case residue accumulation:
         //   Σ_c coeff_c * w_c  ≤  C * p_max * (2^chunk_size - 1)
         let p_max = *primes.iter().max().unwrap();
         let max_word = (1u64 << chunk_size) - 1;
         let max_sum = (num_chunks as u128) * (p_max as u128) * (max_word as u128);
-        let ell = (max_sum as f64).log2().ceil() as u32 + 1;
+        let ell = (max_sum - 1).ilog2() as u32 + 2;
         assert!(ell < 64, "working modulus 2^{} exceeds u64", ell);
 
         CrtParams {
@@ -102,7 +98,7 @@ pub fn pow2_mod(j: u32, p: u64) -> u64 {
 }
 
 /// Reconstruct x from CRT residues using Garner's mixed-radix algorithm.
-/// Overflow-safe for M up to ~2^126.
+/// Overflow can cause panic for M close to 2^128.
 pub fn crt_reconstruct(residues: &[u64], primes: &[u64]) -> u128 {
     assert_eq!(residues.len(), primes.len());
     let t = primes.len();
@@ -160,6 +156,7 @@ fn mulmod128(a: u128, b: u128, m: u128) -> u128 {
     }
     let (mut a, mut b) = (a % m, b % m);
     let mut result = 0u128;
+    // Russian peasant multiplication algorithm.
     while b > 0 {
         if b & 1 == 1 {
             result = (result + a) % m;
@@ -172,6 +169,7 @@ fn mulmod128(a: u128, b: u128, m: u128) -> u128 {
 
 /// Modular inverse via extended Euclidean algorithm.
 fn mod_inverse(a: u128, m: u128) -> u128 {
+    assert!(m <= i128::MAX as u128, "m too large for i128 arithmetic");
     if m == 1 {
         return 0;
     }

@@ -1,6 +1,8 @@
+use crate::components::affine::build_s_aff;
 use crate::components::convert::{
     arith_ohe_to_word, bin_to_word, hot_to_ring, word_to_hot, word_to_ring,
 };
+use crate::components::crt::{CrtParams, crt_reconstruct};
 use crate::components::ohe::{ohe, ohe_scale};
 use crate::exec::Exec;
 use crate::system::System;
@@ -1010,4 +1012,62 @@ fn exec_does_not_mutate_system() {
     // System's own values should still be undefined for inputs
     assert!(sys.values[x.wid].is_none());
     assert!(sys.values[y.wid].is_none());
+}
+
+// ==================== S_{aff-Z_M} ====================
+
+#[test]
+fn test_s_aff_s3_primorial_10() {
+    // M = 2·3·5·7·11·13·17·19·23·29, S=3, random (a, b, x)
+    let primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29];
+    let params = CrtParams::from_primes(&primes, 20);
+    assert_eq!(params.primorial(), 6469693230);
+
+    let n = params.n;
+    let mut rng = rng();
+
+    let m = params.primorial();
+    let max_x = 1u64 << n;
+
+    for _ in 0..SAMPLES {
+        let a_vals: Vec<u64> = (0..3).map(|_| rng.random_range(0..m as u64)).collect();
+        let b_vals: Vec<u64> = (0..3).map(|_| rng.random_range(0..m as u64)).collect();
+        let x: u64 = rng.random_range(0..max_x);
+
+        let a_residues: Vec<Vec<u64>> = params
+            .primes
+            .iter()
+            .map(|&pi| a_vals.iter().map(|&a| a % pi).collect())
+            .collect();
+        let b_residues: Vec<Vec<u64>> = params
+            .primes
+            .iter()
+            .map(|&pi| b_vals.iter().map(|&b| b % pi).collect())
+            .collect();
+
+        let mut sys = System::new();
+        let bits: Vec<Wire> = (0..n).map(|_| sys.input(2)).collect();
+        let result = build_s_aff(&mut sys, &bits, &params, &a_residues, &b_residues);
+
+        let mut exec = Exec::new(&sys);
+        for j in 0..n {
+            exec.set(bits[j as usize], Val::new((x >> j) & 1, 2));
+        }
+        exec.run();
+
+        for s in 0..3 {
+            let residues: Vec<u64> = result
+                .outputs
+                .iter()
+                .map(|prime_outs| exec.get(prime_outs[s]).v)
+                .collect();
+            let reconstructed = crt_reconstruct(&residues, &params.primes);
+            let expected = ((a_vals[s] as u128) * (x as u128) + (b_vals[s] as u128)) % m;
+            assert_eq!(
+                reconstructed, expected,
+                "S={s}, a={}, b={}, x={x}: got {reconstructed}, expected {expected} (mod M={m})",
+                a_vals[s], b_vals[s],
+            );
+        }
+    }
 }
