@@ -1,9 +1,9 @@
-/// CRT parameters and reconstruction for evaluating affine maps over a primorial.
-///
-/// Given coprime moduli p_1, ..., p_T with primorial M = Π p_i, this module
-/// computes the chunking and working-modulus parameters needed to build
-/// an affine switch system, and provides CRT reconstruction via Garner's
-/// algorithm.
+//! CRT parameters and reconstruction for evaluating affine maps over a primorial.
+//!
+//! Given coprime moduli p_1, ..., p_T with primorial M = Π p_i, this module
+//! computes the chunking and working-modulus parameters needed to build
+//! an affine switch system, and provides CRT reconstruction via Garner's
+//! algorithm.
 
 /// Compute gcd of two values.
 fn gcd(mut a: u64, mut b: u64) -> u64 {
@@ -62,7 +62,7 @@ impl CrtParams {
         let p_max = *primes.iter().max().unwrap();
         let max_word = (1u64 << chunk_size) - 1;
         let max_sum = (num_chunks as u128) * (p_max as u128) * (max_word as u128);
-        let ell = (max_sum - 1).ilog2() as u32 + 2;
+        let ell = (max_sum - 1).ilog2() + 2;
         assert!(ell < 64, "working modulus 2^{} exceeds u64", ell);
 
         CrtParams {
@@ -124,8 +124,8 @@ pub fn crt_reconstruct(residues: &[u64], primes: &[u64]) -> u128 {
 
         // c_i = (r_i - temp) · (p_0·...·p_{i-1})^{-1}  mod p_i
         let mut full_prod = 1u128;
-        for j in 0..i {
-            full_prod = mulmod128(full_prod, primes[j] as u128, p_i);
+        for &p in primes.iter().take(i) {
+            full_prod = mulmod128(full_prod, p as u128, p_i);
         }
         let inv = mod_inverse(full_prod, p_i);
         let diff = (p_i + residues[i] as u128 - temp) % p_i;
@@ -216,7 +216,7 @@ mod tests {
         // num_chunks = ceil(8 / 3) = 3
         assert_eq!(params.num_chunks, 3);
         // ell must be large enough and < 64
-        assert!(params.ell >= params.chunk_size + 1);
+        assert!(params.ell > params.chunk_size);
         assert!(params.ell < 64);
     }
 
