@@ -95,15 +95,19 @@ pub fn bin_to_word(sys: &mut System, bits: &[Wire], k: u32) -> Wire {
     result
 }
 
-/// Evaluate an arbitrary function g on a one-hot encoding.
-/// Given binary OHE h of x, computes g(x) in Z_{r_mod}.
-/// Join width: lg|r_mod| bits.
-pub fn hot_to_ring(sys: &mut System, h: &[Wire], truth_table: &[u64], r_mod: u64) -> Wire {
+/// Evaluate an arbitrary function g on a one-hot encoding, scale by a, add b.
+/// Given binary OHE h of x, computes a · g(x) + b in ring R.
+///
+/// Join width: lg|R| bits.
+pub fn hot_to_ring(sys: &mut System, h: &[Wire], truth_table: &[u64], a: Wire, b: Wire) -> Wire {
+    let r_mod = sys.modulus(a);
+    assert_eq!(sys.modulus(b), r_mod);
     assert_eq!(h.len(), truth_table.len());
 
-    let one = sys.constant(1, r_mod);
-    let sh = ohe_scale(sys, h, one);
+    // scale_hot with a: sh_x = a (the hot entry), sh_i = 0 for i ≠ x
+    let sh = ohe_scale(sys, h, a);
 
+    // Σ_i g(i) · sh_i = g(x) · a, then add b
     let mut result = sys.constant(0, r_mod);
     for (i, &sh_i) in sh.iter().enumerate() {
         let gi = truth_table[i] % r_mod;
@@ -112,14 +116,14 @@ pub fn hot_to_ring(sys: &mut System, h: &[Wire], truth_table: &[u64], r_mod: u64
             result = sys.add(result, term);
         }
     }
+    result = sys.add(result, b);
+
     result
 }
 
-/// word_to_ring: given a word x ∈ Z_{2^k}, evaluate g(x) in Z_{r_mod}.
+/// word_to_ring: given a word x ∈ Z_{2^k}, evaluate a · g(x) + b in ring R.
 /// Composes word_to_hot with hot_to_ring.
-///
-/// g: truth table of g: Z_{2^k} → Z_{r_mod}
-pub fn word_to_ring(sys: &mut System, x: Wire, truth_table: &[u64], r_mod: u64) -> Wire {
+pub fn word_to_ring(sys: &mut System, x: Wire, truth_table: &[u64], a: Wire, b: Wire) -> Wire {
     let m = sys.modulus(x);
     assert!(m.is_power_of_two());
     let k = m.ilog2();
@@ -128,12 +132,11 @@ pub fn word_to_ring(sys: &mut System, x: Wire, truth_table: &[u64], r_mod: u64) 
     let hot = word_to_hot(sys, x);
 
     // Extract binary OHE from the arithmetic one-hot vector.
-    // hot[i] is 0 or 1 in Z_{2^k}; mod 2 gives binary indicators.
     let mut bin_hot = Vec::with_capacity(hot.len());
     for &h in &hot {
         let b_i = sys.mod2k(h, 1);
         bin_hot.push(b_i);
     }
 
-    hot_to_ring(sys, &bin_hot, truth_table, r_mod)
+    hot_to_ring(sys, &bin_hot, truth_table, a, b)
 }
