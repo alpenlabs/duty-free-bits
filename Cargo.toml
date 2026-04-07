@@ -29,7 +29,7 @@ clippy.too_long_first_doc_paragraph = "warn"
 [features]
 
 [dev-dependencies]
-rand = "0.9"
+rand = "0.10"
 
 [profile.release]
 opt-level = "z"   # Optimized for size, use 3 for speed
