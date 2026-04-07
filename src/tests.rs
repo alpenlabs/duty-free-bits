@@ -1,6 +1,8 @@
+use crate::components::affine::build_s_aff;
 use crate::components::convert::{
     arith_ohe_to_word, bin_to_word, hot_to_ring, word_to_hot, word_to_ring,
 };
+use crate::components::crt::{CrtParams, crt_reconstruct};
 use crate::components::ohe::{ohe, ohe_scale};
 use crate::exec::Exec;
 use crate::system::System;
@@ -762,7 +764,7 @@ fn test_bin_to_word_all_values_2bit() {
 #[test]
 fn test_hot_to_ring() {
     // Identity function via truth table on 2-bit OHE
-    // g(x) = x, r_mod = 8
+    // g(x) = x, a=1, b=0, r_mod = 8 → computes 1·x + 0 = x
     let truth_table = vec![0, 1, 2, 3];
     let r_mod = 8u64;
 
@@ -771,7 +773,9 @@ fn test_hot_to_ring() {
         let b0 = sys.input(2);
         let b1 = sys.input(2);
         let h = ohe(&mut sys, &[b0, b1]);
-        let out = hot_to_ring(&mut sys, &h, &truth_table, r_mod);
+        let a = sys.constant(1, r_mod);
+        let b = sys.constant(0, r_mod);
+        let out = hot_to_ring(&mut sys, &h, &truth_table, a, b);
 
         let mut exec = Exec::new(&sys);
         exec.set(b0, Val::new(input & 1, 2));
@@ -788,14 +792,16 @@ fn test_hot_to_ring() {
 
 #[test]
 fn word_to_ring_square() {
-    // g(x) = x^2 mod 32, evaluated over a 3-bit input (Z_8 → Z_32)
+    // g(x) = x^2 mod 32, a=1, b=0 → computes x^2 mod 32
     let truth_table: Vec<u64> = (0u64..8).map(|x| (x * x) % 32).collect();
     let r_mod = 32u64;
 
     for input in 0u64..8 {
         let mut sys = System::new();
         let x = sys.input_bits(3);
-        let out = word_to_ring(&mut sys, x, &truth_table, r_mod);
+        let a = sys.constant(1, r_mod);
+        let b = sys.constant(0, r_mod);
+        let out = word_to_ring(&mut sys, x, &truth_table, a, b);
 
         let mut exec = Exec::new(&sys);
         exec.set(x, Val::from_bits(input, 3));
@@ -812,20 +818,173 @@ fn word_to_ring_square() {
 
 #[test]
 fn word_to_ring_identity() {
-    // g(x) = x, from Z_4 → Z_8
+    // g(x) = x, a=1, b=0, from Z_4 → Z_8
     let truth_table = vec![0, 1, 2, 3];
     let r_mod = 8u64;
 
     for input in 0..4u64 {
         let mut sys = System::new();
         let x = sys.input_bits(2);
-        let out = word_to_ring(&mut sys, x, &truth_table, r_mod);
+        let a = sys.constant(1, r_mod);
+        let b = sys.constant(0, r_mod);
+        let out = word_to_ring(&mut sys, x, &truth_table, a, b);
 
         let mut exec = Exec::new(&sys);
         exec.set(x, Val::from_bits(input, 2));
         exec.run();
 
         assert_eq!(exec.get(out), Val::new(input, r_mod), "id({input})");
+    }
+}
+
+// ==================== a,b scaling tests ====================
+
+#[test]
+fn test_hot_to_ring_with_scale_and_offset() {
+    // g(x) = x, a=3, b=5, r_mod=16 → computes 3·x + 5 mod 16
+    let truth_table = vec![0, 1, 2, 3];
+    let r_mod = 16u64;
+
+    for input in 0..4u64 {
+        let mut sys = System::new();
+        let b0 = sys.input(2);
+        let b1 = sys.input(2);
+        let h = ohe(&mut sys, &[b0, b1]);
+        let a = sys.constant(3, r_mod);
+        let b = sys.constant(5, r_mod);
+        let out = hot_to_ring(&mut sys, &h, &truth_table, a, b);
+
+        let mut exec = Exec::new(&sys);
+        exec.set(b0, Val::new(input & 1, 2));
+        exec.set(b1, Val::new((input >> 1) & 1, 2));
+        exec.run();
+
+        let expected = (3 * input + 5) % r_mod;
+        assert_eq!(
+            exec.get(out),
+            Val::new(expected, r_mod),
+            "3·{input} + 5 mod {r_mod}"
+        );
+    }
+}
+
+#[test]
+fn test_hot_to_ring_with_random_a_b() {
+    let mut rng = rng();
+    let truth_table = vec![0, 1, 2, 3];
+    let r_mod = 16u64;
+
+    for _ in 0..SAMPLES {
+        let a_val = rng.random_range(0..r_mod);
+        let b_val = rng.random_range(0..r_mod);
+        let input = rng.random_range(0..4u64);
+
+        let mut sys = System::new();
+        let b0 = sys.input(2);
+        let b1 = sys.input(2);
+        let h = ohe(&mut sys, &[b0, b1]);
+        let a = sys.constant(a_val, r_mod);
+        let b = sys.constant(b_val, r_mod);
+        let out = hot_to_ring(&mut sys, &h, &truth_table, a, b);
+
+        let mut exec = Exec::new(&sys);
+        exec.set(b0, Val::new(input & 1, 2));
+        exec.set(b1, Val::new((input >> 1) & 1, 2));
+        exec.run();
+
+        let expected = (a_val * input + b_val) % r_mod;
+        assert_eq!(
+            exec.get(out),
+            Val::new(expected, r_mod),
+            "{a_val}·g({input}) + {b_val} mod {r_mod}"
+        );
+    }
+}
+
+#[test]
+fn test_word_to_ring_with_scale_and_offset() {
+    // g(x) = x^2, a=2, b=1, r_mod=32 → computes 2·x^2 + 1 mod 32
+    let truth_table: Vec<u64> = (0u64..8).map(|x| (x * x) % 32).collect();
+    let r_mod = 32u64;
+
+    for input in 0u64..8 {
+        let mut sys = System::new();
+        let x = sys.input_bits(3);
+        let a = sys.constant(2, r_mod);
+        let b = sys.constant(1, r_mod);
+        let out = word_to_ring(&mut sys, x, &truth_table, a, b);
+
+        let mut exec = Exec::new(&sys);
+        exec.set(x, Val::from_bits(input, 3));
+        exec.run();
+
+        let g = (input * input) % r_mod;
+        let expected = (2 * g + 1) % r_mod;
+        assert_eq!(
+            exec.get(out),
+            Val::new(expected, r_mod),
+            "2·({input}^2) + 1 mod {r_mod}"
+        );
+    }
+}
+
+#[test]
+fn test_word_to_ring_with_random_a_b() {
+    let mut rng = rng();
+    let truth_table: Vec<u64> = (0u64..4).map(|x| (x * x) % 16).collect();
+    let r_mod = 16u64;
+
+    for _ in 0..SAMPLES {
+        let a_val = rng.random_range(0..r_mod);
+        let b_val = rng.random_range(0..r_mod);
+        let input = rng.random_range(0..4u64);
+
+        let mut sys = System::new();
+        let x = sys.input_bits(2);
+        let a = sys.constant(a_val, r_mod);
+        let b = sys.constant(b_val, r_mod);
+        let out = word_to_ring(&mut sys, x, &truth_table, a, b);
+
+        let mut exec = Exec::new(&sys);
+        exec.set(x, Val::from_bits(input, 2));
+        exec.run();
+
+        let g = (input * input) % r_mod;
+        let expected = (a_val * g + b_val) % r_mod;
+        assert_eq!(
+            exec.get(out),
+            Val::new(expected, r_mod),
+            "{a_val}·({input}^2) + {b_val} mod {r_mod}"
+        );
+    }
+}
+
+#[test]
+fn test_word_to_ring_a_zero_returns_b() {
+    // a=0 → result should always be b regardless of input
+    let truth_table = vec![0, 1, 2, 3];
+    let r_mod = 8u64;
+
+    let mut rng = rng();
+    for _ in 0..SAMPLES {
+        let b_val = rng.random_range(0..r_mod);
+        let input = rng.random_range(0..4u64);
+
+        let mut sys = System::new();
+        let x = sys.input_bits(2);
+        let a = sys.constant(0, r_mod);
+        let b = sys.constant(b_val, r_mod);
+        let out = word_to_ring(&mut sys, x, &truth_table, a, b);
+
+        let mut exec = Exec::new(&sys);
+        exec.set(x, Val::from_bits(input, 2));
+        exec.run();
+
+        assert_eq!(
+            exec.get(out),
+            Val::new(b_val, r_mod),
+            "0·g({input}) + {b_val} should be {b_val}"
+        );
     }
 }
 
@@ -853,4 +1012,62 @@ fn exec_does_not_mutate_system() {
     // System's own values should still be undefined for inputs
     assert!(sys.values[x.wid].is_none());
     assert!(sys.values[y.wid].is_none());
+}
+
+// ==================== S_{aff-Z_M} ====================
+
+#[test]
+fn test_s_aff_s3_primorial_10() {
+    // M = 2·3·5·7·11·13·17·19·23·29, S=3, random (a, b, x)
+    let primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29];
+    let params = CrtParams::from_primes(&primes, 20);
+    assert_eq!(params.primorial(), 6469693230);
+
+    let n = params.n;
+    let mut rng = rng();
+
+    let m = params.primorial();
+    let max_x = 1u64 << n;
+
+    for _ in 0..SAMPLES {
+        let a_vals: Vec<u64> = (0..3).map(|_| rng.random_range(0..m as u64)).collect();
+        let b_vals: Vec<u64> = (0..3).map(|_| rng.random_range(0..m as u64)).collect();
+        let x: u64 = rng.random_range(0..max_x);
+
+        let a_residues: Vec<Vec<u64>> = params
+            .primes
+            .iter()
+            .map(|&pi| a_vals.iter().map(|&a| a % pi).collect())
+            .collect();
+        let b_residues: Vec<Vec<u64>> = params
+            .primes
+            .iter()
+            .map(|&pi| b_vals.iter().map(|&b| b % pi).collect())
+            .collect();
+
+        let mut sys = System::new();
+        let bits: Vec<Wire> = (0..n).map(|_| sys.input(2)).collect();
+        let result = build_s_aff(&mut sys, &bits, &params, &a_residues, &b_residues);
+
+        let mut exec = Exec::new(&sys);
+        for j in 0..n {
+            exec.set(bits[j as usize], Val::new((x >> j) & 1, 2));
+        }
+        exec.run();
+
+        for s in 0..3 {
+            let residues: Vec<u64> = result
+                .outputs
+                .iter()
+                .map(|prime_outs| exec.get(prime_outs[s]).v)
+                .collect();
+            let reconstructed = crt_reconstruct(&residues, &params.primes);
+            let expected = ((a_vals[s] as u128) * (x as u128) + (b_vals[s] as u128)) % m;
+            assert_eq!(
+                reconstructed, expected,
+                "S={s}, a={}, b={}, x={x}: got {reconstructed}, expected {expected} (mod M={m})",
+                a_vals[s], b_vals[s],
+            );
+        }
+    }
 }
