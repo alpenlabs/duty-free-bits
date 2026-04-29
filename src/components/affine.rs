@@ -7,12 +7,19 @@
 ///      to a word in Z_{2^ℓ} via `bin_to_word`.
 ///   2. Free accumulation: for each prime p_i, compute r_i ≡ x (mod p_i) in
 ///      Z_{2^ℓ} as a weighted sum of chunk words.
-///   3. Residue evaluation: for each prime, apply `word_to_ring` with the
-///      reduction function g(r) = r mod p_i, scaling by a and offsetting by b.
-use super::convert::{bin_to_word, word_to_ring};
+///   3. Residue evaluation: for each prime, decompose the ℓ-bit residue via
+///      sub-chunk extraction into a length-p_i OHE of r_i mod p_i,
+///      then evaluate a · (r_i mod p_i) + b via `hot_to_ring`.
+use super::convert::{
+    bin_to_word, compute_sub_widths, fold_to_mod_ohe, hot_to_ring, sub_chunk_extract,
+};
 use super::crt::{CrtParams, pow2_mod};
 use crate::system::System;
 use crate::types::*;
+
+/// Maximum sub-chunk width for the sub-chunk extraction optimization.
+/// 2^8 = 256 OHE entries per sub-chunk.
+const MAX_SUB_CHUNK_WIDTH: u32 = 8;
 
 /// Output of the affine switch system: `outputs[i][j]` is the j-th component's
 /// result reduced mod the i-th CRT prime.
@@ -96,24 +103,21 @@ pub fn build_s_aff(
     let ell = params.ell;
     let residue_wires = chunk_and_accumulate(sys, input_bits, params);
 
-    // Step 3: for each prime, evaluate a · (r_i mod p_i) + b via word_to_ring.
+    // Step 3: for each prime, evaluate a · (r_i mod p_i) + b via sub-chunk extraction.
+    let sub_widths = compute_sub_widths(ell, MAX_SUB_CHUNK_WIDTH);
+
     let mut all_outputs = Vec::with_capacity(params.num_primes);
     for (i, &p_i) in params.primes.iter().enumerate() {
-        let table_size = 1usize << ell;
-        // TODO: optimize word_to_ring for specifically computing mod.
-        let truth_table: Vec<u64> = (0..table_size).map(|r| (r as u64) % p_i).collect();
+        // Phase 1 + 2: shared across all S components for this prime.
+        let extraction = sub_chunk_extract(sys, residue_wires[i], &sub_widths);
+        let h_p = fold_to_mod_ohe(sys, &extraction, p_i);
 
+        let identity_table: Vec<u64> = (0..p_i).collect();
         let mut prime_outputs = Vec::with_capacity(s_dim);
         for j in 0..s_dim {
             let a_wire = sys.constant(a_residues[i][j] % p_i, p_i);
             let b_wire = sys.constant(b_residues[i][j] % p_i, p_i);
-            prime_outputs.push(word_to_ring(
-                sys,
-                residue_wires[i],
-                &truth_table,
-                a_wire,
-                b_wire,
-            ));
+            prime_outputs.push(hot_to_ring(sys, &h_p, &identity_table, a_wire, b_wire));
         }
         all_outputs.push(prime_outputs);
     }

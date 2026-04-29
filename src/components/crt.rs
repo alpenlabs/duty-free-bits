@@ -5,6 +5,8 @@
 //! an affine switch system, and provides CRT reconstruction via Garner's
 //! algorithm.
 
+use super::bigint::U576;
+
 /// Compute gcd of two values.
 fn gcd(mut a: u64, mut b: u64) -> u64 {
     while b != 0 {
@@ -76,8 +78,12 @@ impl CrtParams {
     }
 
     /// M = Π p_i
-    pub fn primorial(&self) -> u128 {
-        self.primes.iter().map(|&p| p as u128).product()
+    pub fn primorial(&self) -> U576 {
+        let mut result = U576::ONE;
+        for &p in &self.primes {
+            result = result.mul_u64(p);
+        }
+        result
     }
 }
 
@@ -98,16 +104,16 @@ pub fn pow2_mod(j: u32, p: u64) -> u64 {
 }
 
 /// Reconstruct x from CRT residues using Garner's mixed-radix algorithm.
-/// Overflow can cause panic for M close to 2^128.
-pub fn crt_reconstruct(residues: &[u64], primes: &[u64]) -> u128 {
+pub fn crt_reconstruct(residues: &[u64], primes: &[u64]) -> U576 {
     assert_eq!(residues.len(), primes.len());
     let t = primes.len();
     if t == 0 {
-        return 0;
+        return U576::ZERO;
     }
 
     // Garner's algorithm: find coefficients c_i such that
     //   x = c_0 + c_1·p_0 + c_2·p_0·p_1 + ...
+    // All coefficients are < p_i <= 409, so u128 arithmetic suffices here. TODO: use u16 instead of u128.
     let mut coeffs: Vec<u128> = vec![0; t];
     coeffs[0] = residues[0] as u128;
 
@@ -132,16 +138,13 @@ pub fn crt_reconstruct(residues: &[u64], primes: &[u64]) -> u128 {
         coeffs[i] = mulmod128(diff, inv, p_i);
     }
 
-    // Reconstruct from mixed-radix coefficients
-    let mut result: u128 = coeffs[0];
-    let mut product: u128 = 1;
+    // Reconstruct from mixed-radix coefficients into U576.
+    // coeffs[i] < p_i <= 409, so casting to u64 is safe.
+    let mut result = U576::from_u64(coeffs[0] as u64);
+    let mut product = U576::ONE;
     for i in 1..t {
-        product = product
-            .checked_mul(primes[i - 1] as u128)
-            .expect("primorial overflow (M > u128)");
-        result = result
-            .checked_add(coeffs[i].checked_mul(product).expect("CRT overflow"))
-            .expect("CRT overflow");
+        product = product.mul_u64(primes[i - 1]);
+        result = result + product.mul_u64(coeffs[i] as u64);
     }
     result
 }
@@ -203,7 +206,7 @@ mod tests {
     #[test]
     fn test_from_primes_basic() {
         let params = CrtParams::from_primes(&[2, 3, 5, 7, 11, 13, 17, 19, 23, 29], 10);
-        assert_eq!(params.primorial(), 6469693230);
+        assert_eq!(params.primorial().to_u128(), Some(6469693230));
         assert_eq!(params.num_primes, 10);
         assert_eq!(params.n, 10);
     }
@@ -249,8 +252,14 @@ mod tests {
 
     #[test]
     fn test_primorial() {
-        assert_eq!(CrtParams::from_primes(&[2, 3, 5], 4).primorial(), 30);
-        assert_eq!(CrtParams::from_primes(&[7, 11], 4).primorial(), 77);
+        assert_eq!(
+            CrtParams::from_primes(&[2, 3, 5], 4).primorial().to_u128(),
+            Some(30)
+        );
+        assert_eq!(
+            CrtParams::from_primes(&[7, 11], 4).primorial().to_u128(),
+            Some(77)
+        );
     }
 
     // ==================== pow2_mod ====================
@@ -348,17 +357,17 @@ mod tests {
     #[test]
     fn test_crt_reconstruct_known() {
         // 17 mod {2,3,5} = {1,2,2}
-        assert_eq!(crt_reconstruct(&[1, 2, 2], &[2, 3, 5]), 17);
+        assert_eq!(crt_reconstruct(&[1, 2, 2], &[2, 3, 5]), U576::from_u64(17));
     }
 
     #[test]
     fn test_crt_reconstruct_zero() {
-        assert_eq!(crt_reconstruct(&[0, 0, 0], &[2, 3, 5]), 0);
+        assert_eq!(crt_reconstruct(&[0, 0, 0], &[2, 3, 5]), U576::ZERO);
     }
 
     #[test]
     fn test_crt_reconstruct_single_prime() {
-        assert_eq!(crt_reconstruct(&[3], &[7]), 3);
+        assert_eq!(crt_reconstruct(&[3], &[7]), U576::from_u64(3));
     }
 
     #[test]
@@ -371,7 +380,7 @@ mod tests {
             let residues: Vec<u64> = primes.iter().map(|&p| x % p).collect();
             assert_eq!(
                 crt_reconstruct(&residues, &primes),
-                x as u128,
+                U576::from_u64(x),
                 "CRT roundtrip for {x}"
             );
         }
@@ -387,7 +396,7 @@ mod tests {
             let residues: Vec<u64> = primes.iter().map(|&p| x % p).collect();
             assert_eq!(
                 crt_reconstruct(&residues, &primes),
-                x as u128,
+                U576::from_u64(x),
                 "CRT roundtrip for {x} with 10 primes"
             );
         }
@@ -399,8 +408,52 @@ mod tests {
         let primes = [2u64, 3, 5, 7, 11];
         let residues: Vec<u64> = primes.iter().map(|&p| p - 1).collect();
         let result = crt_reconstruct(&residues, &primes);
-        let m: u128 = primes.iter().map(|&p| p as u128).product();
-        assert_eq!(result, m - 1);
+        let m = CrtParams::from_primes(&primes, 4).primorial();
+        assert_eq!(result, m - U576::ONE);
+    }
+
+    // ==================== 80-prime integration tests ====================
+
+    #[test]
+    fn test_crt_reconstruct_80_primes_roundtrip() {
+        use crate::components::bigint::FIRST_80_PRIMES;
+        let mut rng = rng();
+        // Pick random values that fit in u64 and verify roundtrip.
+        for _ in 0..SAMPLES {
+            let x: u64 = rng.random_range(0..u64::MAX);
+            let residues: Vec<u64> = FIRST_80_PRIMES.iter().map(|&p| x % p).collect();
+            let reconstructed = crt_reconstruct(&residues, &FIRST_80_PRIMES);
+            assert_eq!(
+                reconstructed,
+                U576::from_u64(x),
+                "CRT 80-prime roundtrip for {x}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_crt_reconstruct_80_primes_max() {
+        // All residues = p_i - 1 => x = M - 1
+        use crate::components::bigint::FIRST_80_PRIMES;
+        let residues: Vec<u64> = FIRST_80_PRIMES.iter().map(|&p| p - 1).collect();
+        let result = crt_reconstruct(&residues, &FIRST_80_PRIMES);
+        let params = CrtParams::from_primes(&FIRST_80_PRIMES, 256);
+        let m = params.primorial();
+        assert_eq!(result, m - U576::ONE);
+    }
+
+    #[test]
+    fn test_crt_reconstruct_80_primes_zero() {
+        use crate::components::bigint::FIRST_80_PRIMES;
+        let residues = vec![0u64; 80];
+        assert_eq!(crt_reconstruct(&residues, &FIRST_80_PRIMES), U576::ZERO);
+    }
+
+    #[test]
+    fn test_crt_reconstruct_80_primes_one() {
+        use crate::components::bigint::FIRST_80_PRIMES;
+        let residues: Vec<u64> = FIRST_80_PRIMES.iter().map(|&p| 1 % p).collect();
+        assert_eq!(crt_reconstruct(&residues, &FIRST_80_PRIMES), U576::ONE);
     }
 
     // ==================== gcd ====================
