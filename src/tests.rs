@@ -11,10 +11,52 @@ use crate::components::affine::build_s_aff;
 use crate::components::bigint::{FIRST_80_PRIMES, U576};
 use crate::components::crt::{CrtParams, crt_reconstruct};
 use crate::exec::Exec;
+use crate::garble::label::{CfLabel, LAMBDA};
+use crate::garble::{Label, Program, eval, garble, normalize_delta};
 use crate::system::System;
 use crate::types::*;
 
 use rand::Rng;
+
+/// Sample a uniform CF mask for a power-of-two modulus.
+fn sample_cf_mask<R: Rng>(rng: &mut R, modulus: u64) -> Label {
+    assert!(modulus.is_power_of_two());
+    let coords: Vec<u64> = (0..LAMBDA).map(|_| rng.random_range(0..modulus)).collect();
+    Label::Cf(CfLabel::from_coords(&coords, modulus))
+}
+
+/// Run the full garble→eval round-trip on the given system and check that the
+/// evaluator recovers exactly the `Exec` outputs. Returns the program so the
+/// caller can assert on its size.
+fn garble_eval_roundtrip<R: Rng>(
+    rng: &mut R,
+    sys: &System,
+    input_wires: &[Wire],
+    input_values: &[Val],
+    output_wires: &[Wire],
+    exec_outputs: &[Val],
+) -> Program {
+    let delta: u128 = normalize_delta(rng.random());
+    let input_masks: Vec<Label> = input_wires
+        .iter()
+        .map(|&w| sample_cf_mask(rng, sys.modulus(w)))
+        .collect();
+    let program = garble(sys, input_wires, &input_masks, output_wires, delta);
+    let got = eval(
+        sys,
+        input_wires,
+        input_values,
+        delta,
+        &input_masks,
+        &program,
+        output_wires,
+    );
+    assert_eq!(got.len(), exec_outputs.len());
+    for (i, (g, e)) in got.iter().zip(exec_outputs.iter()).enumerate() {
+        assert_eq!(g, e, "output {} mismatch: got {} expected {}", i, g, e);
+    }
+    program
+}
 
 const SAMPLES: usize = 10;
 const MOD: u64 = 16;
@@ -629,4 +671,287 @@ fn test_s_aff_scaling() {
     let expected = a * x + b;
     assert_eq!(reconstructed, U576::from_u64(expected));
     eprintln!("ok: a*x+b = {expected}");
+}
+
+// ==================== Garble / Eval round-trip tests ====================
+
+#[test]
+fn test_garble_hot_to_ring_minimal() {
+    // The smallest interesting NCF-output round-trip: evaluate identity over Z_3
+    // via a 2-entry binary OHE derived from one Z_2 input.
+    use crate::components::convert::hot_to_ring;
+
+    for b in 0..2u64 {
+        let mut sys = System::new();
+        let bit = sys.input(2);
+        let nbit = sys.not(bit);
+        let h = vec![nbit, bit];
+        let one_z3 = sys.constant(1, 3);
+        let zero_z3 = sys.constant(0, 3);
+        let table = [0u64, 1u64];
+        let out = hot_to_ring(&mut sys, &h, &table, one_z3, zero_z3);
+
+        let mut exec = Exec::new(&sys);
+        exec.set(bit, Val::new(b, 2));
+        exec.run();
+        let expected = exec.get(out);
+        assert_eq!(expected, Val::new(b, 3));
+
+        let mut rng = rng();
+        let _ = garble_eval_roundtrip(
+            &mut rng,
+            &sys,
+            &[bit],
+            &[Val::new(b, 2)],
+            &[out],
+            &[expected],
+        );
+    }
+}
+
+
+#[test]
+fn test_garble_s_aff_s3_primorial_10() {
+    // Mirror test_s_aff_s3_primorial_10 but additionally check garble→eval
+    // recovers the same residues Exec would. Uses FIRST_80_PRIMES[..10] so the
+    // test exercises p=2 as well (affine.rs declares its coefficient constants
+    // NCF, which keeps the output labeled NCF even when the ring is Z_2).
+    let primes: [u64; 10] = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29];
+    let params = CrtParams::from_primes(&primes, 20);
+
+    let n = params.n;
+    let mut rng = rng();
+
+    let m: u128 = params.primes.iter().map(|&p| p as u128).product();
+    let max_x = 1u64 << n;
+
+    for _ in 0..SAMPLES {
+        let a_vals: Vec<u64> = (0..3).map(|_| rng.random_range(0..m as u64)).collect();
+        let b_vals: Vec<u64> = (0..3).map(|_| rng.random_range(0..m as u64)).collect();
+        let x: u64 = rng.random_range(0..max_x);
+
+        let a_residues: Vec<Vec<u64>> = params
+            .primes
+            .iter()
+            .map(|&pi| a_vals.iter().map(|&a| a % pi).collect())
+            .collect();
+        let b_residues: Vec<Vec<u64>> = params
+            .primes
+            .iter()
+            .map(|&pi| b_vals.iter().map(|&b| b % pi).collect())
+            .collect();
+
+        let mut sys = System::new();
+        let bits: Vec<Wire> = (0..n).map(|_| sys.input(2)).collect();
+        let result = build_s_aff(&mut sys, &bits, &params, &a_residues, &b_residues);
+
+        // Flatten outputs as (prime, component) pairs, row-major by prime then s.
+        let mut output_wires: Vec<Wire> = Vec::new();
+        for row in &result.outputs {
+            output_wires.extend(row.iter().copied());
+        }
+
+        // Reference: Exec.
+        let mut exec = Exec::new(&sys);
+        let input_values: Vec<Val> =
+            (0..n).map(|j| Val::new((x >> j) & 1, 2)).collect();
+        for (&w, &v) in bits.iter().zip(input_values.iter()) {
+            exec.set(w, v);
+        }
+        exec.run();
+        let exec_outputs: Vec<Val> = output_wires.iter().map(|&w| exec.get(w)).collect();
+
+        // Round-trip.
+        let program = garble_eval_roundtrip(
+            &mut rng,
+            &sys,
+            &bits,
+            &input_values,
+            &output_wires,
+            &exec_outputs,
+        );
+
+        // Size sanity: program_bits ≥ join_width (the paper's lower bound; output
+        // labels add on top). Exact equality is exercised in
+        // test_garble_program_size_matches_join_width.
+        let join_width_bits: usize = program
+            .total_bits()
+            .saturating_sub(expected_output_bits(&sys, &output_wires));
+        assert!(
+            join_width_bits > 0,
+            "expected non-trivial join width for primorial-10 run"
+        );
+
+        // Reconstruct for each of the 3 components and check against expected.
+        for s in 0..3 {
+            let residues: Vec<u64> = (0..params.num_primes)
+                .map(|i| exec_outputs[i * 3 + s].v)
+                .collect();
+            let reconstructed = crt_reconstruct(&residues, &params.primes);
+            let expected = ((a_vals[s] as u128) * (x as u128) + (b_vals[s] as u128)) % m;
+            assert_eq!(
+                reconstructed.to_u128().unwrap(),
+                expected,
+                "S={s}, a={}, b={}, x={x}",
+                a_vals[s],
+                b_vals[s]
+            );
+        }
+    }
+}
+
+#[test]
+fn test_garble_s_aff_s1_primorial_80() {
+    // Full 80-prime pipeline (includes p=2). Works because affine.rs declares
+    // its coefficient constants NCF, so the Z_2 residue wire is NCF too.
+    let params = CrtParams::from_primes(&FIRST_80_PRIMES, 256);
+    let n = params.n as usize;
+    let m = params.primorial();
+    let mut rng = rng();
+
+    for _ in 0..2 {
+        let a = rand_u576_below(&mut rng, &m);
+        let b = rand_u576_below(&mut rng, &m);
+
+        let a_residues: Vec<Vec<u64>> = params
+            .primes
+            .iter()
+            .map(|&pi| vec![a.mod_u64(pi)])
+            .collect();
+        let b_residues: Vec<Vec<u64>> = params
+            .primes
+            .iter()
+            .map(|&pi| vec![b.mod_u64(pi)])
+            .collect();
+
+        let x_bits: Vec<u64> = (0..n).map(|_| rng.random_range(0..2u64)).collect();
+
+        let mut sys = System::new();
+        let bits: Vec<Wire> = (0..n).map(|_| sys.input(2)).collect();
+        let result = build_s_aff(&mut sys, &bits, &params, &a_residues, &b_residues);
+
+        let output_wires: Vec<Wire> = result
+            .outputs
+            .iter()
+            .map(|row| row[0])
+            .collect();
+
+        // Reference outputs via Exec.
+        let input_values: Vec<Val> =
+            x_bits.iter().map(|&b| Val::new(b, 2)).collect();
+        let mut exec = Exec::new(&sys);
+        for (&w, &v) in bits.iter().zip(input_values.iter()) {
+            exec.set(w, v);
+        }
+        exec.run();
+        let exec_outputs: Vec<Val> = output_wires.iter().map(|&w| exec.get(w)).collect();
+
+        // Round-trip.
+        let _program = garble_eval_roundtrip(
+            &mut rng,
+            &sys,
+            &bits,
+            &input_values,
+            &output_wires,
+            &exec_outputs,
+        );
+
+        // CRT reconstruct the evaluator's residues; compare with direct bignum.
+        let output_residues: Vec<u64> = exec_outputs.iter().map(|v| v.v).collect();
+        let reconstructed = crt_reconstruct(&output_residues, &params.primes);
+        for (t, &p_t) in params.primes.iter().enumerate() {
+            assert_eq!(reconstructed.mod_u64(p_t), output_residues[t]);
+        }
+    }
+}
+
+#[test]
+fn test_garble_program_size_matches_join_width() {
+    // Check Theorem 6.1 size bound exactly: program bits = join_width + sum(output bits).
+    // Uses a 5-prime primorial for speed; includes p=2 since affine.rs declares
+    // coefficient constants NCF, which keeps Z_2 outputs NCF too.
+    let primes = [2, 3, 5, 7, 11];
+    let params = CrtParams::from_primes(&primes, 12);
+    let n = params.n as usize;
+    let mut rng = rng();
+
+    let a_residues: Vec<Vec<u64>> =
+        params.primes.iter().map(|&pi| vec![1u64 % pi]).collect();
+    let b_residues: Vec<Vec<u64>> =
+        params.primes.iter().map(|&pi| vec![0u64 % pi]).collect();
+
+    let mut sys = System::new();
+    let bits: Vec<Wire> = (0..n).map(|_| sys.input(2)).collect();
+    let result = build_s_aff(&mut sys, &bits, &params, &a_residues, &b_residues);
+    let output_wires: Vec<Wire> = result.outputs.iter().map(|row| row[0]).collect();
+
+    // Compute expected program bits:
+    //   cf_join_bits    = LAMBDA * (sum of k over CF join gates)
+    //   ncf_join_bits   = sum of ceil(log2 mod) over NCF join gates
+    //   switch_lsb_bits = 1 per Switch gate (point-and-permute overhead)
+    //   output_bits     = sum of ceil(log2 mod) over NCF output wires
+    let mut cf_join_bits: usize = 0;
+    let mut ncf_join_bits: usize = 0;
+    let mut switch_lsb_bits: usize = 0;
+    for g in &sys.gates {
+        match g.typ {
+            GateType::Join => {
+                let m = sys.modulus(g.in0);
+                if sys.is_cf(g.in0) {
+                    cf_join_bits += LAMBDA * m.trailing_zeros() as usize;
+                } else {
+                    ncf_join_bits += ((m - 1).ilog2() + 1) as usize;
+                }
+            }
+            GateType::Switch => switch_lsb_bits += 1,
+            _ => {}
+        }
+    }
+    let output_bits = expected_output_bits(&sys, &output_wires);
+    let expected_total = cf_join_bits + ncf_join_bits + switch_lsb_bits + output_bits;
+
+    // Run garble (values don't matter for the size check, but we do a full round-trip).
+    let x_bits: Vec<u64> = (0..n).map(|_| rng.random_range(0..2u64)).collect();
+    let input_values: Vec<Val> = x_bits.iter().map(|&b| Val::new(b, 2)).collect();
+    let mut exec = Exec::new(&sys);
+    for (&w, &v) in bits.iter().zip(input_values.iter()) {
+        exec.set(w, v);
+    }
+    exec.run();
+    let exec_outputs: Vec<Val> = output_wires.iter().map(|&w| exec.get(w)).collect();
+    let program = garble_eval_roundtrip(
+        &mut rng,
+        &sys,
+        &bits,
+        &input_values,
+        &output_wires,
+        &exec_outputs,
+    );
+
+    assert_eq!(
+        program.total_bits(),
+        expected_total,
+        "program bits mismatch: got {}, expected {} (cf_join={}, ncf_join={}, switch_lsb={}, output={})",
+        program.total_bits(),
+        expected_total,
+        cf_join_bits,
+        ncf_join_bits,
+        switch_lsb_bits,
+        output_bits
+    );
+}
+
+/// Sum of ceil(log2(modulus)) over the (NCF) output wires.
+fn expected_output_bits(sys: &System, output_wires: &[Wire]) -> usize {
+    output_wires
+        .iter()
+        .map(|&w| {
+            let m = sys.modulus(w);
+            if m <= 1 {
+                0
+            } else {
+                ((m - 1).ilog2() + 1) as usize
+            }
+        })
+        .sum()
 }

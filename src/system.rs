@@ -6,6 +6,15 @@ pub struct System {
     pub(crate) gates: Vec<Gate>,
     pub(crate) values: Vec<Val>,
     pub(crate) subscriptions: Vec<Vec<GateId>>,
+    /// Per-wire control-friendliness flag (parallel to `values`).
+    ///
+    /// The paper distinguishes **control-friendly** wires (whose labels are
+    /// λ-fold to support hash security when used as switch controls) from
+    /// **non-control-friendly** wires (single-element labels). This is a *type*
+    /// annotation fixed at wire allocation time, not a property of the modulus:
+    /// we routinely have CF Z_{2^k} wires and NCF Z_p wires, but the output of
+    /// hot-to-ring style constructions over Z_2 can also legitimately be NCF.
+    pub(crate) is_cf_flags: Vec<bool>,
     /// Total join cost in bits accumulated so far.
     pub join_complexity: usize,
 }
@@ -23,16 +32,36 @@ impl System {
             gates: Vec::new(),
             values: Vec::new(),
             subscriptions: Vec::new(),
+            is_cf_flags: Vec::new(),
             join_complexity: 0,
         }
     }
 
-    /// Allocate a fresh wire in Z_modulus (initially undefined).
-    pub fn alloc_wire(&mut self, modulus: u64) -> Wire {
+    /// Allocate a wire with explicit CF/NCF kind.
+    ///
+    /// CF wires require a power-of-two modulus (they must live in a product of
+    /// integer rings Z_{2^k}). NCF wires can have any finite modulus.
+    pub fn alloc_wire_kind(&mut self, modulus: u64, is_cf: bool) -> Wire {
+        if is_cf {
+            assert!(
+                modulus.is_power_of_two(),
+                "CF wire requires power-of-two modulus (got {})",
+                modulus
+            );
+        }
         let wid = self.values.len();
         self.subscriptions.push(Vec::new());
         self.values.push(Val::none(modulus));
+        self.is_cf_flags.push(is_cf);
         Wire { wid }
+    }
+
+    /// Allocate a fresh wire in Z_modulus (initially undefined).
+    ///
+    /// Defaults: CF iff `modulus` is a power of two. Use [`alloc_wire_kind`] to
+    /// override — e.g. to allocate a NCF Z_{2^k} wire.
+    pub fn alloc_wire(&mut self, modulus: u64) -> Wire {
+        self.alloc_wire_kind(modulus, modulus.is_power_of_two())
     }
 
     fn subscribe(&mut self, w: Wire, gid: GateId) {
@@ -42,6 +71,11 @@ impl System {
     /// Get the modulus for a wire.
     pub fn modulus(&self, x: Wire) -> u64 {
         self.values[x.wid].modulus
+    }
+
+    /// True iff the wire was allocated as control-friendly.
+    pub fn is_cf(&self, x: Wire) -> bool {
+        self.is_cf_flags[x.wid]
     }
 
     /// Get bitlen for a wire in Z_{2^k}. Panics if modulus is not a power of 2.
@@ -67,24 +101,46 @@ impl System {
 
     // --- Wire constructors ---
 
-    /// Create a fresh input wire in Z_modulus.
+    /// Create a fresh input wire in Z_modulus (default kind: CF iff pow2).
     pub fn input(&mut self, modulus: u64) -> Wire {
         self.alloc_wire(modulus)
     }
 
-    /// Convenience: input wire in Z_{2^bl}
+    /// NCF input wire in Z_modulus.
+    pub fn input_ncf(&mut self, modulus: u64) -> Wire {
+        self.alloc_wire_kind(modulus, false)
+    }
+
+    /// Convenience: input wire in Z_{2^bl}.
     pub fn input_bits(&mut self, bl: u32) -> Wire {
         self.input(1u64 << bl)
     }
 
-    /// Create a constant wire holding `n` in Z_modulus.
+    /// Create a constant wire holding `n` in Z_modulus (default kind: CF iff pow2).
     pub fn constant(&mut self, n: u64, modulus: u64) -> Wire {
         let w = self.alloc_wire(modulus);
         self.values[w.wid] = Val::new(n, modulus);
         w
     }
 
-    /// Convenience: constant wire in Z_{2^bl}
+    /// NCF constant wire holding `n` in Z_modulus.
+    pub fn constant_ncf(&mut self, n: u64, modulus: u64) -> Wire {
+        let w = self.alloc_wire_kind(modulus, false);
+        self.values[w.wid] = Val::new(n, modulus);
+        w
+    }
+
+    /// Constant wire holding `n`, with modulus and kind inherited from `reference`.
+    /// Useful inside composite constructions that need a zero (or other literal)
+    /// in the same ring+kind as an external wire — e.g. the `z` in `ohe_scale`.
+    pub fn constant_matching(&mut self, n: u64, reference: Wire) -> Wire {
+        let m = self.modulus(reference);
+        let w = self.alloc_wire_kind(m, self.is_cf(reference));
+        self.values[w.wid] = Val::new(n, m);
+        w
+    }
+
+    /// Convenience: constant wire in Z_{2^bl}.
     pub fn constant_bits(&mut self, n: u64, bl: u32) -> Wire {
         self.constant(n, 1u64 << bl)
     }
@@ -109,7 +165,7 @@ impl System {
     }
 
     fn one_in_one_out(&mut self, typ: GateType, x: Wire, param: u64, out_mod: u64) -> Wire {
-        let out = self.alloc_wire(out_mod);
+        let out = self.alloc_wire_kind(out_mod, self.is_cf(x));
         let g = Gate {
             typ,
             param,
@@ -123,11 +179,12 @@ impl System {
 
     // --- Core gate constructors ---
 
-    /// Switch: data wire x (any ring), control wire s (must be Z_2).
-    /// Output has same modulus as x. If s=0, output=x.
+    /// Switch: data wire x (any ring), control wire s (must be CF Z_2).
+    /// Output inherits x's kind and modulus. If s=0, output=x.
     pub fn switch(&mut self, x: Wire, s: Wire) -> Wire {
         assert_eq!(self.modulus(s), 2, "switch control must be binary (Z_2)");
-        let out = self.alloc_wire(self.modulus(x));
+        assert!(self.is_cf(s), "switch control must be CF");
+        let out = self.alloc_wire_kind(self.modulus(x), self.is_cf(x));
         let g = Gate {
             typ: GateType::Switch,
             param: 0,
@@ -139,12 +196,13 @@ impl System {
         out
     }
 
-    /// Join: constrain x = y. Both must have the same modulus.
-    /// Costs lg|modulus| bits of join complexity.
+    /// Join: constrain x = y. Both must have the same modulus and kind.
+    /// Costs `(λ if CF else 1) · lg|G|` bits of join width in the paper; we
+    /// track the `lg|G|` factor here and leave the λ multiplier to garble-time.
     pub fn join(&mut self, x: Wire, y: Wire) -> Wire {
         assert_eq!(self.modulus(x), self.modulus(y));
+        assert_eq!(self.is_cf(x), self.is_cf(y), "join: kind mismatch");
         let m = self.modulus(x);
-        // join complexity in bits
         self.join_complexity += if m <= 1 {
             0
         } else {
@@ -162,8 +220,10 @@ impl System {
     }
 
     /// SameWire: constrain x = y without join cost (when one side is unconstrained).
+    /// Both must share modulus and kind.
     pub fn same_wire(&mut self, x: Wire, y: Wire) -> Wire {
         assert_eq!(self.modulus(x), self.modulus(y));
+        assert_eq!(self.is_cf(x), self.is_cf(y), "same_wire: kind mismatch");
         let g = Gate {
             typ: GateType::SameWire,
             param: 0,
@@ -175,10 +235,11 @@ impl System {
         x
     }
 
-    /// Addition in the same ring.
+    /// Addition in the same ring; both inputs must share kind.
     pub fn add(&mut self, x: Wire, y: Wire) -> Wire {
         assert_eq!(self.modulus(x), self.modulus(y));
-        let out = self.alloc_wire(self.modulus(x));
+        assert_eq!(self.is_cf(x), self.is_cf(y), "add: kind mismatch");
+        let out = self.alloc_wire_kind(self.modulus(x), self.is_cf(x));
         let g = Gate {
             typ: GateType::Add,
             param: 0,
@@ -190,10 +251,11 @@ impl System {
         out
     }
 
-    /// Subtraction in the same ring.
+    /// Subtraction in the same ring; both inputs must share kind.
     pub fn sub(&mut self, x: Wire, y: Wire) -> Wire {
         assert_eq!(self.modulus(x), self.modulus(y));
-        let out = self.alloc_wire(self.modulus(x));
+        assert_eq!(self.is_cf(x), self.is_cf(y), "sub: kind mismatch");
+        let out = self.alloc_wire_kind(self.modulus(x), self.is_cf(x));
         let g = Gate {
             typ: GateType::Sub,
             param: 0,
@@ -205,12 +267,12 @@ impl System {
         out
     }
 
-    /// Scalar multiplication by constant s (mod wire's modulus).
+    /// Scalar multiplication by constant s (mod wire's modulus). Output inherits kind.
     pub fn mul(&mut self, s: u64, x: Wire) -> Wire {
         self.one_in_one_out(GateType::Mul, x, s, self.modulus(x))
     }
 
-    /// Modular reduction: x mod 2^k. Input must be in Z_{2^n} with k ≤ n.
+    /// Modular reduction: x mod 2^k. Input must be in Z_{2^n} with k ≤ n. Output inherits kind.
     pub fn mod2k(&mut self, x: Wire, k: u32) -> Wire {
         let m = self.modulus(x);
         assert!(m.is_power_of_two());
@@ -218,7 +280,7 @@ impl System {
         self.one_in_one_out(GateType::Mod2k, x, k as u64, 1u64 << k)
     }
 
-    /// Division by 2^k. Input must be in Z_{2^{k+c}}, output in Z_{2^c}.
+    /// Division by 2^k. Input in Z_{2^{k+c}}, output in Z_{2^c}. Output inherits kind.
     pub fn div2k(&mut self, x: Wire, k: u32) -> Wire {
         let m = self.modulus(x);
         assert!(m.is_power_of_two());
