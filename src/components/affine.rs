@@ -115,8 +115,11 @@ pub fn build_s_aff(
         let identity_table: Vec<u64> = (0..p_i).collect();
         let mut prime_outputs = Vec::with_capacity(s_dim);
         for j in 0..s_dim {
-            let a_wire = sys.constant(a_residues[i][j] % p_i, p_i);
-            let b_wire = sys.constant(b_residues[i][j] % p_i, p_i);
+            // Force NCF for the coefficient constants so hot_to_ring propagates
+            // NCF all the way to the output — necessary when p_i = 2 (Z_2 is
+            // power-of-two and would otherwise default to CF).
+            let a_wire = sys.constant_ncf(a_residues[i][j] % p_i, p_i);
+            let b_wire = sys.constant_ncf(b_residues[i][j] % p_i, p_i);
             prime_outputs.push(hot_to_ring(sys, &h_p, &identity_table, a_wire, b_wire));
         }
         all_outputs.push(prime_outputs);

@@ -4,6 +4,8 @@
 pub mod components;
 /// Concrete execution (propagation of values) of a system.
 pub mod exec;
+/// Garbling and evaluation.
+pub mod garble;
 /// The constraint system: wire allocation, gate construction, and derived operations.
 pub mod system;
 /// Core types: values, wires, gates, and arithmetic over rings.

@@ -103,13 +103,14 @@ pub fn bin_to_word(sys: &mut System, bits: &[Wire], k: u32) -> Wire {
 pub fn hot_to_ring(sys: &mut System, h: &[Wire], truth_table: &[u64], a: Wire, b: Wire) -> Wire {
     let r_mod = sys.modulus(a);
     assert_eq!(sys.modulus(b), r_mod);
+    assert_eq!(sys.is_cf(a), sys.is_cf(b), "hot_to_ring: a and b must share kind");
     assert_eq!(h.len(), truth_table.len());
 
     // scale_hot with a: sh_x = a (the hot entry), sh_i = 0 for i ≠ x
     let sh = ohe_scale(sys, h, a);
 
-    // Σ_i g(i) · sh_i = g(x) · a, then add b
-    let mut result = sys.constant(0, r_mod);
+    // Σ_i g(i) · sh_i = g(x) · a, then add b. Output kind follows `a`.
+    let mut result = sys.constant_matching(0, a);
     for (i, &sh_i) in sh.iter().enumerate() {
         let gi = truth_table[i] % r_mod;
         if gi > 0 {
