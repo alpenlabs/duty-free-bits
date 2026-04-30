@@ -609,12 +609,12 @@ fn fmt_n(n: usize) -> String {
 /// switch with payload S · ⌈log₂ m⌉ bits and ⌈S · ⌈log₂ m⌉ / λ⌉ hashes.
 ///
 /// Run with:
-///   cargo test --release test_s_aff_80_communication -- --ignored --nocapture
+///   cargo test --release test_s_aff_80_metrics -- --ignored --nocapture
 ///
 /// Roughly 7 minutes wall time, ~6.7 GB peak RSS at S=5120.
 #[test]
 #[ignore]
-fn test_s_aff_80_communication() {
+fn test_s_aff_80_metrics() {
     const LAMBDA: usize = 128;
     // Default: full sweep S ∈ {1, 256, 512, ..., 256·20}. For quick
     // iteration on the output format, set FORMATTING_PREVIEW=1 to run only

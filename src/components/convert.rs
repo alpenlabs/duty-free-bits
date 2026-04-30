@@ -19,7 +19,6 @@ pub fn arith_ohe_to_word(sys: &mut System, h: &[Wire]) -> Wire {
 
 /// Convert a k-bit word x ∈ Z_{2^k} to a 2^k arithmetic one-hot encoding.
 ///
-/// The circular construction from Hea24, Section 4.3.
 /// Output: 2^k wires in Z_{2^k} where entry x = 1, all others = 0.
 /// Join width: 2k-1 bits.
 pub fn word_to_hot(sys: &mut System, x: Wire) -> Vec<Wire> {

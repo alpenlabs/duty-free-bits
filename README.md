@@ -1,32 +1,33 @@
 # Switch System
 
-Rust implementation of the switch system construction from [Duty-Free Bits](https://eprint.iacr.org/2026/476) (DFB), which projectivizes affine garbling schemes over prime fields at cost proportional to input + output labels.
+Reference Rust implementation of a switch system construction for
+affine garbled circuits.
 
-The core construction is a switch system that computes affine maps **a**x + **b** over a CRT-friendly integer ring.
+## Reproducing the cost simulation
 
-## Status
-
-## Build
+The headline communication and hash-count numbers are produced by a
+single test. To reproduce:
 
 ```sh
-cargo build
-cargo test
+cargo test --release test_s_aff_80_metrics -- --ignored --nocapture
 ```
 
-## References
+The test builds the n=256, 80-prime affine switch system independently
+for each S in {1, 256, 512, ..., 256·20}, reads the
+`join_complexity_{cf,ncf}` and `hash_count_{cf,ncf}` counters from the
+`System` struct, and prints a table of communication (in bits and KiB)
+and hash invocations per S. The S=1 build also runs the constructed
+circuit through the `Exec` engine and verifies the output residues
+against a CRT reconstruction, providing end-to-end correctness.
 
-- [KBH26] Khambhati, Bhattacharya, Heath. [Duty-Free Bits](https://eprint.iacr.org/2026/476). 2026.
-- [Hea24] Heath. [Efficient Arithmetic in Garbled Circuits](https://eprint.iacr.org/2024/139). Eurocrypt 2024.
+Wall time: ~7 minutes; peak memory: ~6.7 GB at S=5120.
 
-## Contributing
+## Standard tests
 
-Contributions are generally welcome.
-If you intend to make larger changes please discuss them in an issue
-before opening a PR to avoid duplicate work and architectural mismatches.
+```sh
+cargo test --release
+```
 
-For more information please see [`CONTRIBUTING.md`](/CONTRIBUTING.md).
-
-## License
-
-This work is dual-licensed under MIT and Apache 2.0.
-You can choose between one of them if you use this work.
+Runs 124 unit and integration tests covering the gate primitives,
+one-hot encoding, sub-chunk extraction, CRT reconstruction, and the
+80-prime affine pipeline. Should complete in under 2 seconds.

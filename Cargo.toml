@@ -1,17 +1,12 @@
 [package]
-name = "duty-free-bits"
+name = "switch-system"
 version = "0.1.0"
 edition = "2024"
-authors = [
-  "Nakul Khambhati <nakul@cs.ucla.edu>",
-  "David Heath <daheath@illinois.edu>",
-]
-description = "Switch system construction from Duty-Free Bits"
+description = "Switch system construction for affine garbled circuits"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
-repository = "https://github.com/alpenlabs/duty-free-bits"
 categories = ["cryptography"]
-keywords = ["garbled-circuits", "mpc", "switch-system", "bitvm"]
+keywords = ["garbled-circuits", "mpc", "switch-system"]
 
 [lints]
 rust.missing_debug_implementations = "warn"
