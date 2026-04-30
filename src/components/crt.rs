@@ -193,7 +193,7 @@ fn mod_inverse(a: u128, m: u128) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::Rng;
+    use rand::{Rng, RngExt};
 
     const SAMPLES: usize = 10;
 

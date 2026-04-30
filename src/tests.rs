@@ -14,7 +14,7 @@ use crate::exec::Exec;
 use crate::system::System;
 use crate::types::*;
 
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 const SAMPLES: usize = 10;
 const MOD: u64 = 16;

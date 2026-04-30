@@ -181,7 +181,7 @@ pub fn val_div2k(x: Val, k: u32) -> Val {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::Rng;
+    use rand::{Rng, RngExt};
 
     const SAMPLES: usize = 10;
     const MOD: u64 = 16;
