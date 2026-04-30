@@ -43,7 +43,7 @@ pub fn ohe(sys: &mut System, x: &[Wire]) -> Vec<Wire> {
 mod tests {
     use super::*;
     use crate::exec::Exec;
-    use rand::Rng;
+    use rand::{Rng, RngExt};
 
     const SAMPLES: usize = 10;
     const MOD: u64 = 16;

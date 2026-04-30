@@ -292,7 +292,7 @@ pub fn word_to_ring_mod(
 mod tests {
     use super::*;
     use crate::exec::Exec;
-    use rand::Rng;
+    use rand::{Rng, RngExt};
 
     const SAMPLES: usize = 10;
 
