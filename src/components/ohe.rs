@@ -1,13 +1,12 @@
-use crate::system::System;
+use crate::system::{LAMBDA_BITS, System};
 use crate::types::*;
 
 /// Scale a one-hot encoding h by a scalar s.
 /// h entries are binary (Z_2), s is in some integer ring R.
 /// Output: vector in R where the hot entry equals s, all others 0.
-/// Join width: lg|R| bits.
+/// Join width: lg|R| bits. Output wires inherit s's CF flag.
 pub fn ohe_scale(sys: &mut System, h: &[Wire], s: Wire) -> Vec<Wire> {
-    let m = sys.modulus(s);
-    let z = sys.constant(0, m);
+    let z = sys.constant_like(0, s);
     let mut out = Vec::with_capacity(h.len());
 
     let mut acc = z;
@@ -19,6 +18,52 @@ pub fn ohe_scale(sys: &mut System, h: &[Wire], s: Wire) -> Vec<Wire> {
     sys.join(acc, s);
 
     out
+}
+
+/// Bulk version of [`ohe_scale`]: scales the same OHE `h` by a vector of S
+/// scalars simultaneously. Returns a |h| × S matrix where `out[i][j]` is
+/// `h[i] ? scalars[j] : 0`.
+///
+/// Hash-cost rebate (NCF only). Naively this would emit |h| · S NCF switches,
+/// costing |h| · S hashes. Because the S switches that share a given OHE
+/// entry h[i] also share the same control label, they can be packed into a
+/// single bulk switch whose payload is S · lg|R| bits, costing
+/// ⌈S · lg|R| / λ⌉ hashes. Total bulk cost: |h| · ⌈S · lg|R| / λ⌉ hashes.
+/// The wires/gates are still emitted (so Exec works) but the
+/// `hash_count_ncf` counter is corrected to reflect the packed total.
+///
+/// CF scalars get no packing benefit: per-switch cost is already k hashes
+/// (one per payload bit), so naive = bulk.
+pub fn ohe_scale_bulk(sys: &mut System, h: &[Wire], scalars: &[Wire]) -> Vec<Vec<Wire>> {
+    let s_dim = scalars.len();
+    if s_dim == 0 {
+        return (0..h.len()).map(|_| Vec::new()).collect();
+    }
+    let modulus = sys.modulus(scalars[0]);
+    let cf = sys.is_cf(scalars[0]);
+    for &s in scalars {
+        assert_eq!(sys.modulus(s), modulus, "ohe_scale_bulk: modulus mismatch");
+        assert_eq!(sys.is_cf(s), cf, "ohe_scale_bulk: CF/NCF mismatch");
+    }
+
+    let h0_ncf = sys.hash_count_ncf;
+    let cols: Vec<Vec<Wire>> = scalars.iter().map(|&s| ohe_scale(sys, h, s)).collect();
+
+    if !cf {
+        let added = sys.hash_count_ncf - h0_ncf;
+        let lg_m = if modulus <= 1 {
+            0
+        } else {
+            (modulus as u128 - 1).ilog2() as usize + 1
+        };
+        let bulk_total = h.len() * (s_dim * lg_m).div_ceil(LAMBDA_BITS);
+        sys.hash_count_ncf = sys.hash_count_ncf - added + bulk_total;
+    }
+
+    // Transpose cols (S × |h|) into row-major (|h| × S).
+    (0..h.len())
+        .map(|i| cols.iter().map(|col| col[i]).collect())
+        .collect()
 }
 
 /// Build a binary one-hot encoding from binary wires x[0..n].

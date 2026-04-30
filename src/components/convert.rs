@@ -1,5 +1,5 @@
 use super::crt::pow2_mod;
-use super::ohe::{ohe, ohe_scale};
+use super::ohe::{ohe, ohe_scale, ohe_scale_bulk};
 use crate::system::System;
 use crate::types::*;
 
@@ -103,13 +103,14 @@ pub fn bin_to_word(sys: &mut System, bits: &[Wire], k: u32) -> Wire {
 pub fn hot_to_ring(sys: &mut System, h: &[Wire], truth_table: &[u64], a: Wire, b: Wire) -> Wire {
     let r_mod = sys.modulus(a);
     assert_eq!(sys.modulus(b), r_mod);
+    assert_eq!(sys.is_cf(a), sys.is_cf(b), "hot_to_ring: a and b must share CF");
     assert_eq!(h.len(), truth_table.len());
 
     // scale_hot with a: sh_x = a (the hot entry), sh_i = 0 for i ≠ x
     let sh = ohe_scale(sys, h, a);
 
     // Σ_i g(i) · sh_i = g(x) · a, then add b
-    let mut result = sys.constant(0, r_mod);
+    let mut result = sys.constant_like(0, a);
     for (i, &sh_i) in sh.iter().enumerate() {
         let gi = truth_table[i] % r_mod;
         if gi > 0 {
@@ -120,6 +121,54 @@ pub fn hot_to_ring(sys: &mut System, h: &[Wire], truth_table: &[u64], a: Wire, b
     result = sys.add(result, b);
 
     result
+}
+
+/// Bulk version of [`hot_to_ring`]: evaluates S affine maps a_j · g(x) + b_j
+/// in ring R from a single OHE of x, sharing one bulk `ohe_scale_bulk` call
+/// across all S outputs (NCF hash packing applies).
+///
+/// Equivalent to calling `hot_to_ring` S times, but with packed NCF switch
+/// hash accounting: total hashes = |h| · ⌈S · lg|R| / λ⌉ instead of |h| · S.
+pub fn hot_to_ring_bulk(
+    sys: &mut System,
+    h: &[Wire],
+    truth_table: &[u64],
+    a_vec: &[Wire],
+    b_vec: &[Wire],
+) -> Vec<Wire> {
+    assert_eq!(a_vec.len(), b_vec.len());
+    let s_dim = a_vec.len();
+    if s_dim == 0 {
+        return Vec::new();
+    }
+    let r_mod = sys.modulus(a_vec[0]);
+    assert_eq!(h.len(), truth_table.len());
+    for j in 0..s_dim {
+        assert_eq!(sys.modulus(a_vec[j]), r_mod);
+        assert_eq!(sys.modulus(b_vec[j]), r_mod);
+        assert_eq!(
+            sys.is_cf(a_vec[j]),
+            sys.is_cf(b_vec[j]),
+            "hot_to_ring_bulk: a_j and b_j must share CF"
+        );
+    }
+
+    let sh_matrix = ohe_scale_bulk(sys, h, a_vec);
+
+    let mut results = Vec::with_capacity(s_dim);
+    for j in 0..s_dim {
+        let mut result = sys.constant_like(0, a_vec[j]);
+        for (i, row) in sh_matrix.iter().enumerate() {
+            let gi = truth_table[i] % r_mod;
+            if gi > 0 {
+                let term = sys.mul(gi, row[j]);
+                result = sys.add(result, term);
+            }
+        }
+        result = sys.add(result, b_vec[j]);
+        results.push(result);
+    }
+    results
 }
 
 /// word_to_ring: given a word x ∈ Z_{2^k}, evaluate a · g(x) + b in ring R.

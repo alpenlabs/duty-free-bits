@@ -507,7 +507,7 @@ fn test_s_aff_s3_primorial_10() {
 
 #[test]
 fn test_s_aff_s1_primorial_80() {
-    // Full 80-prime CRT pipeline with target parameters: n=256, ell=23.
+    // Full 80-prime CRT pipeline with target parameters: n=256, ell=22.
     // Coefficients a, b are random elements of Z_M (M ≈ 2^553), x is 256 bits.
     let params = CrtParams::from_primes(&FIRST_80_PRIMES, 256);
     let n = params.n as usize;
@@ -577,56 +577,217 @@ fn test_s_aff_s1_primorial_80() {
     }
 }
 
+/// Format an integer with thousands separators.
+fn fmt_n(n: usize) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(b as char);
+    }
+    out
+}
+
+/// Reproduces the simulated communication and hash-count costs reported in
+/// the Embryo paper. For each S in {1, 256, 512, ..., 256·20}, builds a
+/// fresh n=256, 80-prime affine switch system with S affine components, then
+/// reads the counters that have been accumulated during construction:
+/// `sys.{join_complexity,hash_count}_{cf,ncf}`. The S=1 build is run through
+/// the Exec engine and its output residues are checked against a CRT
+/// reconstruction, to verify end-to-end correctness.
+///
+/// Cost model (per-wire CF flag is set by the circuit builder):
+///   - join,  CF payload Z_{2^k}: k · λ bits of communication
+///   - join, NCF payload mod m:   ⌈log₂ m⌉ bits of communication
+///   - switch,  CF payload k bits: k hash invocations
+///   - switch, NCF payload P bits: ⌈P / λ⌉ hash invocations
+/// NCF switch packing: when S separate NCF switches share the same OHE-entry
+/// control bit (as in the affine output stage), they combine into one bulk
+/// switch with payload S · ⌈log₂ m⌉ bits and ⌈S · ⌈log₂ m⌉ / λ⌉ hashes.
+///
+/// Run with:
+///   cargo test --release test_s_aff_80_communication -- --ignored --nocapture
+///
+/// Roughly 7 minutes wall time, ~6.7 GB peak RSS at S=5120.
 #[test]
 #[ignore]
-fn test_s_aff_scaling() {
-    // Run with: N=12 /usr/bin/time -l cargo test --release test_s_aff_scaling -- --ignored --nocapture
-    let n: u32 = std::env::var("N")
-        .unwrap_or_else(|_| "8".into())
-        .parse()
-        .expect("N must be a u32");
+fn test_s_aff_80_communication() {
+    const LAMBDA: usize = 128;
+    // Default: full sweep S ∈ {1, 256, 512, ..., 256·20}. For quick
+    // iteration on the output format, set FORMATTING_PREVIEW=1 to run only
+    // S ∈ {1, 5·256, 7·256} (the Embryo-highlight subset).
+    let preview = std::env::var("FORMATTING_PREVIEW").is_ok();
+    let report_s: Vec<usize> = if preview {
+        vec![1, 256 * 5, 256 * 7]
+    } else {
+        std::iter::once(1)
+            .chain((1..=20).map(|k| 256 * k))
+            .collect()
+    };
 
-    let params = CrtParams::from_primes(&FIRST_80_PRIMES, n);
-    eprintln!(
-        "n={n}, ell={}, chunk_size={}, num_chunks={}",
-        params.ell, params.chunk_size, params.num_chunks
-    );
-    eprintln!("table_size = 2^{} = {}", params.ell, 1u64 << params.ell);
-
+    let params = CrtParams::from_primes(&FIRST_80_PRIMES, 256);
+    let n = params.n as usize;
+    let m = params.primorial();
     let mut rng = rng();
-    let max_x = 1u64 << n;
-    let a: u64 = rng.random_range(0..1u64 << 48);
-    let b: u64 = rng.random_range(0..1u64 << 48);
-    let x: u64 = rng.random_range(0..max_x);
 
-    let a_residues: Vec<Vec<u64>> = params.primes.iter().map(|&pi| vec![a % pi]).collect();
-    let b_residues: Vec<Vec<u64>> = params.primes.iter().map(|&pi| vec![b % pi]).collect();
-
-    let mut sys = System::new();
-    let bits: Vec<Wire> = (0..n).map(|_| sys.input(2)).collect();
-
-    eprintln!("building switch system...");
-    let result = build_s_aff(&mut sys, &bits, &params, &a_residues, &b_residues);
-    eprintln!(
-        "system built: {} wires, {} gates",
-        sys.num_wires(),
-        sys.num_gates()
-    );
-
-    eprintln!("executing...");
-    let mut exec = Exec::new(&sys);
-    for j in 0..n {
-        exec.set(bits[j as usize], Val::new((x >> j) & 1, 2));
-    }
-    exec.run();
-
-    let residues: Vec<u64> = result
-        .outputs
+    let lg_p_sum: usize = params
+        .primes
         .iter()
-        .map(|prime_outs| exec.get(prime_outs[0]).v)
-        .collect();
-    let reconstructed = crt_reconstruct(&residues, &params.primes);
-    let expected = a * x + b;
-    assert_eq!(reconstructed, U576::from_u64(expected));
-    eprintln!("ok: a*x+b = {expected}");
+        .map(|&p| (p as u128 - 1).ilog2() as usize + 1)
+        .sum();
+    let p_sum: u64 = params.primes.iter().sum();
+
+    eprintln!();
+    eprintln!("================================================================");
+    eprintln!("  Embryo: simulated communication & computation cost");
+    eprintln!("================================================================");
+    eprintln!(
+        "  parameters: n = {} input bits, T = {} primes (p_max = {})",
+        params.n,
+        params.num_primes,
+        params.primes.last().unwrap()
+    );
+    eprintln!(
+        "              ell = {} (working modulus), chunk_size = {}, λ = {}",
+        params.ell, params.chunk_size, LAMBDA
+    );
+    eprintln!(
+        "              Σ ⌈log₂ p_i⌉ = {} bits,  Σ p_i = {}",
+        lg_p_sum, p_sum
+    );
+    eprintln!();
+    eprintln!("Building S=1 (full Exec, e2e correctness verified)...");
+    let s1_counts = {
+        let t0 = std::time::Instant::now();
+        let a = rand_u576_below(&mut rng, &m);
+        let b = rand_u576_below(&mut rng, &m);
+        let a_residues: Vec<Vec<u64>> = params
+            .primes
+            .iter()
+            .map(|&pi| vec![a.mod_u64(pi)])
+            .collect();
+        let b_residues: Vec<Vec<u64>> = params
+            .primes
+            .iter()
+            .map(|&pi| vec![b.mod_u64(pi)])
+            .collect();
+        let x_bits: Vec<u64> = (0..n).map(|_| rng.random_range(0..2u64)).collect();
+
+        let mut sys = System::new();
+        let bits: Vec<Wire> = (0..n).map(|_| sys.input(2)).collect();
+        let result = build_s_aff(&mut sys, &bits, &params, &a_residues, &b_residues);
+
+        let mut exec = Exec::new(&sys);
+        for j in 0..n {
+            exec.set(bits[j], Val::new(x_bits[j], 2));
+        }
+        exec.run();
+        let output_residues: Vec<u64> = result
+            .outputs
+            .iter()
+            .map(|prime_outs| exec.get(prime_outs[0]).v)
+            .collect();
+        for (t, &p_t) in params.primes.iter().enumerate() {
+            let mut x_mod_p = 0u64;
+            let mut pow2 = 1u64;
+            for &bit in &x_bits {
+                x_mod_p = (x_mod_p + bit * pow2) % p_t;
+                pow2 = (pow2 * 2) % p_t;
+            }
+            let expected = (a_residues[t][0] * x_mod_p + b_residues[t][0]) % p_t;
+            assert_eq!(output_residues[t], expected, "prime {p_t}");
+        }
+        let reconstructed = crt_reconstruct(&output_residues, &params.primes);
+        for (t, &p_t) in params.primes.iter().enumerate() {
+            assert_eq!(reconstructed.mod_u64(p_t), output_residues[t]);
+        }
+        eprintln!("  S=    1 ok ({:.1}s)", t0.elapsed().as_secs_f64());
+        (
+            sys.join_complexity_cf,
+            sys.join_complexity_ncf,
+            sys.hash_count_cf,
+            sys.hash_count_ncf,
+        )
+    };
+
+    // For S>1, build a fresh full System and read the counters.
+    // Residue values don't affect counts, so we pass 0s.
+    let mut results: Vec<(usize, usize, usize, usize, usize)> =
+        Vec::with_capacity(report_s.len());
+    for &s in &report_s {
+        let (jcf, jncf, hcf, hncf) = if s == 1 {
+            s1_counts
+        } else {
+            let t0 = std::time::Instant::now();
+            let a_residues: Vec<Vec<u64>> = params.primes.iter().map(|_| vec![0u64; s]).collect();
+            let b_residues: Vec<Vec<u64>> = params.primes.iter().map(|_| vec![0u64; s]).collect();
+            let mut sys = System::new();
+            let bits: Vec<Wire> = (0..n).map(|_| sys.input(2)).collect();
+            let _ = build_s_aff(&mut sys, &bits, &params, &a_residues, &b_residues);
+            eprintln!("  S={s:>5} ok ({:.1}s)", t0.elapsed().as_secs_f64());
+            (
+                sys.join_complexity_cf,
+                sys.join_complexity_ncf,
+                sys.hash_count_cf,
+                sys.hash_count_ncf,
+            )
+        };
+        results.push((s, jcf, jncf, hcf, hncf));
+    }
+
+    eprintln!();
+    eprintln!("Cost table (one row per independent build of build_s_aff):");
+    eprintln!();
+    let header = format!(
+        "  {:>5}  {:>10}  {:>14}  {:>14}  {:>14}  {:>14}",
+        "S", "Comm KiB", "Comm bits", "CF hashes", "NCF hashes", "Total hashes"
+    );
+    eprintln!("{header}");
+    eprintln!("  {}", "-".repeat(header.len() - 2));
+    for (s, jcf, jncf, hcf, hncf) in &results {
+        let comm_bits = jcf * LAMBDA + jncf;
+        let kib = comm_bits as f64 / 8.0 / 1024.0;
+        let hashes = hcf + hncf;
+        eprintln!(
+            "  {s:>5}  {kib:>10.2}  {:>14}  {:>14}  {:>14}  {:>14}",
+            fmt_n(comm_bits),
+            fmt_n(*hcf),
+            fmt_n(*hncf),
+            fmt_n(hashes),
+        );
+    }
+
+    eprintln!();
+    eprintln!("Highlights (paper scenarios at n=256):");
+    let lookup = |s: usize| {
+        results
+            .iter()
+            .find(|(rs, ..)| *rs == s)
+            .copied()
+            .map(|(_, jcf, jncf, hcf, hncf)| (jcf * LAMBDA + jncf, hcf + hncf))
+    };
+    let print_row = |label: &str, s_label: &str, comm_bits: usize, hashes: usize| {
+        let kib = comm_bits as f64 / 8.0 / 1024.0;
+        let hashes_m = hashes as f64 / 1.0e6;
+        eprintln!(
+            "  {label:<36}  {s_label:<18}  comm = {kib:>7.2} KiB    hashes = {hashes_m:>5.2} M"
+        );
+    };
+    if let Some((c, h)) = lookup(1) {
+        print_row("One-time CRT conversion", "S = 1", c, h);
+    }
+    // Embryo scalar mul: D = 12 components split across x (5) and y (7),
+    // each with its own CRT conversion + IT-GS bulk. Total = sum of two
+    // independent builds at S=5·256 and S=7·256.
+    if let (Some((c_x, h_x)), Some((c_y, h_y))) = (lookup(5 * 256), lookup(7 * 256)) {
+        print_row(
+            "Embryo scalar mul (5·256 + 7·256)",
+            "S = 1280 + 1792",
+            c_x + c_y,
+            h_x + h_y,
+        );
+    }
 }

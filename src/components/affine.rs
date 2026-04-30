@@ -11,7 +11,7 @@
 ///      sub-chunk extraction into a length-p_i OHE of r_i mod p_i,
 ///      then evaluate a · (r_i mod p_i) + b via `hot_to_ring`.
 use super::convert::{
-    bin_to_word, compute_sub_widths, fold_to_mod_ohe, hot_to_ring, sub_chunk_extract,
+    bin_to_word, compute_sub_widths, fold_to_mod_ohe, hot_to_ring_bulk, sub_chunk_extract,
 };
 use super::crt::{CrtParams, pow2_mod};
 use crate::system::System;
@@ -113,12 +113,16 @@ pub fn build_s_aff(
         let h_p = fold_to_mod_ohe(sys, &extraction, p_i);
 
         let identity_table: Vec<u64> = (0..p_i).collect();
-        let mut prime_outputs = Vec::with_capacity(s_dim);
-        for j in 0..s_dim {
-            let a_wire = sys.constant(a_residues[i][j] % p_i, p_i);
-            let b_wire = sys.constant(b_residues[i][j] % p_i, p_i);
-            prime_outputs.push(hot_to_ring(sys, &h_p, &identity_table, a_wire, b_wire));
-        }
+        // CRT residue scalars are NCF — even when p_i = 2 (the role is a
+        // residue, not a control bit). Use the bulk variant so the S NCF
+        // switches sharing each OHE entry are counted as one λ-packed switch.
+        let a_wires: Vec<Wire> = (0..s_dim)
+            .map(|j| sys.constant_ncf(a_residues[i][j] % p_i, p_i))
+            .collect();
+        let b_wires: Vec<Wire> = (0..s_dim)
+            .map(|j| sys.constant_ncf(b_residues[i][j] % p_i, p_i))
+            .collect();
+        let prime_outputs = hot_to_ring_bulk(sys, &h_p, &identity_table, &a_wires, &b_wires);
         all_outputs.push(prime_outputs);
     }
 
