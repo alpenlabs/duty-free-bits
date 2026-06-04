@@ -5,6 +5,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// Higher-level circuit components built on the core system.
 pub mod components;
+/// Correlation-robust hash (CCRH) core + nonce discipline — the comp-GC/IT-GC bridge.
+pub mod crypto;
 /// Concrete execution (propagation of values) of a system.
 pub mod exec;
 /// Garbling and evaluation.

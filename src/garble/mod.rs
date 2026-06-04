@@ -10,11 +10,6 @@
 //! Labels live in [`label`]: CF labels are bit-packed to `λ·k` bits so the
 //! per-wire memory cost tracks the paper's bound exactly.
 
-/// aarch64-specific intrinsics (NEON + AES) used by the CCRH.
-#[cfg(target_arch = "aarch64")]
-pub mod aarch64;
-/// Portable software-AES CCRND backend (used off-aarch64; byte-identical to NEON).
-pub mod portable;
 /// Evaluator: decode labels through gates.
 pub mod evaluator;
 /// Garbler: build masks, program, and input encoding.
