@@ -1,3 +1,11 @@
+// Crate lints (kept in source so the modern `[lints]` Cargo table doesn't trip
+// the editor's stale schema). The `rust_2018_idioms` group is denied first so a
+// later specific lint can still override it.
+#![deny(rust_2018_idioms)]
+#![deny(unused_crate_dependencies, unused_must_use)]
+#![warn(missing_debug_implementations, unreachable_pub, missing_docs)]
+#![warn(rustdoc::all)]
+#![warn(clippy::too_long_first_doc_paragraph)]
 //! Switch system framework for garbled arithmetic circuits.
 //!
 //! Layered to mirror the protocol — a computational GC composed with an
