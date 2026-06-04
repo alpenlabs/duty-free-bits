@@ -1,4 +1,10 @@
-//! System-bypass kernel for the per-prime body batch.
+//! Information-theoretic GC: the per-prime body batch.
+//!
+//! This is Phase 3 of the construction (paper §6.3): given the computational
+//! GC's CF binary one-hot `h_p` of `x mod p_i`, it delivers `a·x + b mod p_i`
+//! using `H(h_p[k])` as one-time pads. The masking of the secret `(a, b)` is
+//! information-theoretic — single NCF Z_p residues, no λ blowup — which is why
+//! it is implemented directly here rather than through the general switch engine.
 //!
 //! A body batch is one `hot_to_ring_bulk(h_p, identity, a, b)` from
 //! [`crate::components::convert`], which expands into `ohe_scale_bulk` followed

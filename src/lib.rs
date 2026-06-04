@@ -11,6 +11,8 @@ pub mod crypto;
 pub mod exec;
 /// Garbling and evaluation.
 pub mod garble;
+/// Information-theoretic GC: the per-prime body (scale-hot + hot-to-ring over NCF shares).
+pub mod it_gc;
 /// The constraint system: wire allocation, gate construction, and derived operations.
 pub mod system;
 /// Core types: values, wires, gates, and arithmetic over rings.
