@@ -20,20 +20,24 @@
 //!   * [`hash_bulk`] — one wide H output for a switch group; sliced via
 //!     [`extract_ncf`] across NCF members.
 //!
-//! Implementation lives in [`crate::garble::aarch64`] (gobble-derived).
-//! This module currently only supports aarch64 (Apple Silicon). x86_64 is
-//! intentionally not supported.
+//! The AES backend is selected by target: aarch64 uses NEON/AES-NI
+//! ([`crate::garble::aarch64`], gobble-derived); other targets use a portable
+//! software AES ([`crate::garble::portable`]) that is byte-identical to it. Both
+//! present the same `[u8; 16]`-block surface (`expand_key` + `ccrnd`).
 
 use std::sync::OnceLock;
 
-use super::aarch64::{
-    Aes128RoundKeys, bytes_to_block, ccrnd_with_round_keys, expand_aes128_key, u128_to_block,
-};
+#[cfg(target_arch = "aarch64")]
+use super::aarch64 as backend;
+#[cfg(not(target_arch = "aarch64"))]
+use super::portable as backend;
+use backend::RoundKeys;
+
 use super::label::{self, CfLabel, LAMBDA, Label, NcfLabel};
 use crate::types::GateId;
 
-use std::arch::aarch64::uint8x16_t;
-use std::mem::transmute;
+/// A 128-bit CCRH block.
+type Block = [u8; 16];
 
 /// Fixed AES-128 key (public permutation key for the CCRH). Bytes from the
 /// fractional part of the golden ratio — a "nothing-up-my-sleeve" constant.
@@ -49,15 +53,13 @@ const CCRH_PUBLIC_S: [u8; 16] = [
 ];
 
 /// Process-global pre-expanded round keys (computed once on first use).
-fn round_keys() -> &'static Aes128RoundKeys {
-    static C: OnceLock<Aes128RoundKeys> = OnceLock::new();
-    C.get_or_init(|| unsafe { expand_aes128_key(&CCRH_KEY) })
+fn round_keys() -> &'static RoundKeys {
+    static C: OnceLock<RoundKeys> = OnceLock::new();
+    C.get_or_init(|| backend::expand_key(&CCRH_KEY))
 }
 
-fn public_s_block() -> uint8x16_t {
-    // OnceLock<uint8x16_t> isn't trivially Sync, so just transmute the
-    // constant on each access; it's a single load.
-    unsafe { bytes_to_block(CCRH_PUBLIC_S) }
+fn public_s_block() -> Block {
+    CCRH_PUBLIC_S
 }
 
 /// `⌈log₂ modulus⌉` (number of bits needed to represent values < modulus).
@@ -69,12 +71,12 @@ pub fn lg_modulus(modulus: u64) -> usize {
     }
 }
 
-/// Compress a label down to a 128-bit register suitable as CCRND's `x` input.
+/// Compress a label down to a 128-bit block suitable as CCRND's `x` input.
 ///
 /// In our protocol switch ctrls are always CF Z_2, so the input is exactly
-/// 128 bits and we just transmute the bit-packed storage. (Wider inputs are
-/// folded by XOR'ing 16-byte chunks; in practice we never call H on those.)
-fn label_to_block(l: &Label) -> uint8x16_t {
+/// 128 bits and we just copy the bit-packed storage. (Wider inputs are folded
+/// by XOR'ing 16-byte chunks; in practice we never call H on those.)
+fn label_to_block(l: &Label) -> Block {
     match l {
         Label::Cf(c) => {
             let raw = c.raw_bits();
@@ -83,7 +85,7 @@ fn label_to_block(l: &Label) -> uint8x16_t {
                 let mut bytes = [0u8; 16];
                 bytes[0..8].copy_from_slice(&raw[0].to_le_bytes());
                 bytes[8..16].copy_from_slice(&raw[1].to_le_bytes());
-                unsafe { bytes_to_block(bytes) }
+                bytes
             } else {
                 // Wider CF: XOR-fold the raw words into one 16-byte block.
                 // Not used by switches today, but defined to be deterministic.
@@ -95,14 +97,14 @@ fn label_to_block(l: &Label) -> uint8x16_t {
                         acc[lane + b] ^= bytes[b];
                     }
                 }
-                unsafe { bytes_to_block(acc) }
+                acc
             }
         }
         Label::Ncf(n) => {
             let mut bytes = [0u8; 16];
             bytes[0..8].copy_from_slice(&n.rep.to_le_bytes());
             bytes[8..16].copy_from_slice(&n.modulus.to_le_bytes());
-            unsafe { bytes_to_block(bytes) }
+            bytes
         }
     }
 }
@@ -112,16 +114,15 @@ fn label_to_block(l: &Label) -> uint8x16_t {
 /// Writes pseudorandom bytes derived from `(seed_block, domain)` into `output`.
 /// Each 16-byte chunk uses a tweak with `domain` in the low 64 bits and a
 /// per-block counter in the high 64 bits — distinct counters never collide.
-fn expand(seed: uint8x16_t, domain: u64, output: &mut [u8]) {
+fn expand(seed: Block, domain: u64, output: &mut [u8]) {
     let keys = round_keys();
     let public_s = public_s_block();
     let mut counter: u64 = 0;
     let mut written = 0;
     while written < output.len() {
         let tweak_bytes: u128 = (domain as u128) | ((counter as u128) << 64);
-        let tweak = unsafe { u128_to_block(tweak_bytes) };
-        let h = unsafe { ccrnd_with_round_keys(seed, tweak, keys, public_s) };
-        let h_bytes: [u8; 16] = unsafe { transmute(h) };
+        let tweak = tweak_bytes.to_le_bytes();
+        let h_bytes = backend::ccrnd(seed, tweak, keys, public_s);
         let take = (output.len() - written).min(16);
         output[written..written + take].copy_from_slice(&h_bytes[..take]);
         written += take;
@@ -217,6 +218,32 @@ mod tests {
         let a = hash_solo(&s, 17, true, 1 << 10);
         let b = hash_solo(&s, 17, true, 1 << 10);
         assert_eq!(a, b);
+    }
+
+    /// The portable software backend must be byte-identical to the NEON/AES-NI
+    /// backend — otherwise the off-aarch64 build runs *different* crypto and the
+    /// shared CCRH tests would not transfer. Verifiable only where both exist.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_portable_backend_matches_neon() {
+        use super::super::{aarch64, portable};
+        let rk_neon = aarch64::expand_key(&CCRH_KEY);
+        let rk_soft = portable::expand_key(&CCRH_KEY);
+        let s = CCRH_PUBLIC_S;
+        for i in 0..128u64 {
+            let mut seed = [0u8; 16];
+            seed[0..8].copy_from_slice(&i.to_le_bytes());
+            seed[8] = 0xa5;
+            seed[15] = (i as u8).wrapping_mul(31);
+            let mut tweak = [0u8; 16];
+            tweak[0..8].copy_from_slice(&(i.wrapping_mul(7).wrapping_add(1)).to_le_bytes());
+            tweak[8..16].copy_from_slice(&((1u64 << 63) | i).to_le_bytes());
+            assert_eq!(
+                aarch64::ccrnd(seed, tweak, &rk_neon, s),
+                portable::ccrnd(seed, tweak, &rk_soft, s),
+                "portable vs NEON mismatch at i={i}",
+            );
+        }
     }
 
     #[test]
