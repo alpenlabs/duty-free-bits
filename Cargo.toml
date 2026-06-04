@@ -34,7 +34,7 @@ rand = "0.9"
 smallvec = "1.13"
 
 [profile.release]
-opt-level = "z"   # Optimized for size (set to 3 for speed; raises peak RSS)
+opt-level = 3     # Compute-bound CCRH/modular kernel: ~2.9x faster than "z"
 lto = true        # Enable Link Time Optimization
 codegen-units = 1 # Reduced to increase optimizations
 panic = "abort"   # Abort on panic
