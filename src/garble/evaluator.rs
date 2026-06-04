@@ -3,15 +3,17 @@
 //! Each wire's evaluator label ultimately takes the form `X + x·Δ_R` (CF) or
 //! `X + x` (NCF), where `X` is the garbler's mask. Labels are derived in *any*
 //! order the graph permits — forward through affine gates, backward too, and
-//! through switches only when the ctrl LSB tells us `ctrl = 0`. This is what
-//! allows patterns like `ohe_scale`'s "junk sh_i labels, join fixes the sum,
-//! backward add recovers individual sh_i" to work.
+//! through switches only when `ctrl = 0`. The control is taken from the
+//! cleartext wire `values` (the evaluator knows `x`, so it computes them itself —
+//! paper §3.3: switches reveal nothing). This is what allows patterns like
+//! `ohe_scale`'s "junk sh_i labels, join fixes the sum, backward add recovers
+//! individual sh_i" to work.
 
 use super::hash;
 use super::label::{self, Label};
-use super::program::{GateMaterial, Program};
+use super::program::Program;
 use crate::system::System;
-use crate::types::{GateId, GateType, Wire};
+use crate::types::{GateId, GateType, Val, Wire};
 
 /// Lazy cache for per-group bulk-hash outputs (mirrors the garbler's cache).
 type BulkCache = Vec<Option<Vec<u8>>>;
@@ -44,23 +46,27 @@ fn switch_hash(
 
 /// Evaluate a garbled system at the label level.
 ///
-/// Takes the evaluator's labels for inputs (already including value·Δ_R) and
-/// returns the labels of the requested output wires. No mask-subtraction or
-/// value decoding — the caller is responsible for converting labels back to
-/// values when (and if) needed. This is the form used by [`Pipeline`] for
-/// streaming garble+eval, where each phase's outputs are carry-forward labels
-/// that get re-seeded into the next phase.
+/// Takes the evaluator's labels for inputs (already including value·Δ_R) plus the
+/// cleartext `values` of every wire (from running [`Exec`] on the evaluator's
+/// known input `x`), and returns the labels of the requested output wires. The
+/// cleartext values supply switch controls — nothing is revealed by the garbler.
+/// No mask-subtraction or value decoding here; the caller converts labels back to
+/// values when needed. This is the form used by [`Pipeline`] for streaming
+/// garble+eval.
 ///
+/// [`Exec`]: crate::exec::Exec
 /// [`Pipeline`]: crate::garble::pipeline::Pipeline
 pub fn eval_with_labels(
     system: &System,
     input_wires: &[Wire],
     input_labels: &[Label],
+    values: &[Val],
     delta: u128,
     program: &Program,
     output_wires: &[Wire],
 ) -> Vec<Label> {
     assert_eq!(input_wires.len(), input_labels.len());
+    assert_eq!(values.len(), system.num_wires(), "values must cover all wires");
     assert_eq!(delta & 1, 1, "Δ must have low bit 1");
 
     let mut labels: Vec<Option<Label>> = vec![None; system.num_wires()];
@@ -91,7 +97,7 @@ pub fn eval_with_labels(
     // Propagate.
     let mut bulk_cache: BulkCache = vec![None; system.num_switch_groups()];
     while let Some(gid) = queue.pop() {
-        fire_gate(system, gid, &mut labels, program, &mut queue, &mut bulk_cache);
+        fire_gate(system, gid, &mut labels, values, program, &mut queue, &mut bulk_cache);
     }
 
     // Pull out labels for the requested outputs.
@@ -109,6 +115,7 @@ fn fire_gate(
     system: &System,
     gid: GateId,
     labels: &mut [Option<Label>],
+    values: &[Val],
     program: &Program,
     queue: &mut Vec<GateId>,
     bulk_cache: &mut BulkCache,
@@ -178,26 +185,18 @@ fn fire_gate(
             }
         }
         GateType::Switch => {
-            // Need ctrl label to decrypt ctrl, plus ctrl lsb from program.
-            let Some(ctrl_label) = lin1 else { return; };
-            let lsb_garbler = match program.material(gid) {
-                Some(GateMaterial::SwitchLsb(b)) => *b,
-                _ => panic!("missing switch lsb for gate {}", gid),
-            };
-            let ctrl_value = match &ctrl_label {
-                Label::Cf(c) => {
-                    assert_eq!(c.modulus(), 2, "switch ctrl must be Z_2");
-                    let lsb_eval = (c.get(0) & 1) == 1;
-                    (lsb_eval ^ lsb_garbler) as u64
-                }
-                Label::Ncf(_) => panic!("switch ctrl must be CF"),
-            };
-            if ctrl_value != 0 {
+            // The control value is known in cleartext (the evaluator knows `x`):
+            // the switch fires iff ctrl = 0. Nothing is revealed by the garbler.
+            let ctrl = values[g.in1.wid];
+            debug_assert!(!ctrl.is_none(), "switch {gid}: ctrl value undefined");
+            if ctrl.v != 0 {
                 // Switch does not fire: no label propagation.
                 return;
             }
-            // ctrl = 0: propagate in either direction via H. For grouped
-            // switches, H is sliced from a single wide bulk call.
+            // ctrl = 0: we still need the ctrl *label* to form H. Wait for it.
+            let Some(ctrl_label) = lin1 else { return; };
+            // Propagate in either direction via H. For grouped switches, H is
+            // sliced from a single wide bulk call.
             let h = switch_hash(system, gid, &ctrl_label, bulk_cache);
             // Forward: out = in0 + H.
             if let Some(din) = &lin0 {
@@ -209,10 +208,10 @@ fn fire_gate(
             }
         }
         GateType::Join => {
-            let diff = match program.material(gid) {
-                Some(GateMaterial::JoinDiff(d)) => d.clone(),
-                _ => panic!("missing join diff for gate {}", gid),
-            };
+            let diff = program
+                .join_diff(gid)
+                .unwrap_or_else(|| panic!("missing join diff for gate {}", gid))
+                .clone();
             // diff = X_in0 - X_in1, so label_in0 = label_in1 + diff
             // and label_in1 = label_in0 - diff.
             if let Some(a) = &lin0 {

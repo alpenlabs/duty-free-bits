@@ -17,11 +17,12 @@
 //! * `Join`: does not propagate masks (both sides are independently determined).
 //! * `SameWire`: symmetric copy.
 //!
-//! Δ is sampled with low bit forced to 1 (point-and-permute); the evaluator
-//! uses it to recover ctrl values from label LSBs.
+//! Δ is the global Free-XOR offset; its low bit is forced to 1 so that `Δ_R(2)`
+//! is nonzero and CF Z_2 labels distinguish 0 from 1.
 //!
-//! A final pass over gates in creation order emits per-gate material
-//! (switch LSBs, join diffs) and appends the declared output masks.
+//! A final pass over gates in creation order emits the join diffs (the only
+//! switch-system communication — switches reveal nothing) and appends the
+//! declared output masks.
 
 use super::hash;
 use super::label::{self, Label, NcfLabel};
@@ -59,7 +60,8 @@ fn switch_hash(
     }
 }
 
-/// Ensure δ's low bit is 1 so the point-and-permute trick works.
+/// Force Δ's low bit to 1, so `Δ_R(2)` is nonzero (CF Z_2 labels must separate
+/// value 0 from value 1).
 pub fn normalize_delta(delta: u128) -> u128 {
     delta | 1
 }
@@ -122,33 +124,24 @@ pub fn garble(
         propagate_gate(system, gid, &mut masks, &mut queue, &mut bulk_cache);
     }
 
-    // Second pass: emit per-gate material and output masks in deterministic order.
+    // Second pass: emit join diffs (the only switch-system communication) and
+    // output masks in deterministic order. Switches emit nothing — the evaluator
+    // derives every control from cleartext `x` (paper §3.3).
     let mut program = Program::with_num_gates(system.num_gates());
     for (gid, g) in system.gates.iter().enumerate() {
-        match g.typ {
-            GateType::Switch => {
-                let ctrl = masks[g.in1.wid]
-                    .as_ref()
-                    .unwrap_or_else(|| panic!("switch gate {}: ctrl mask unresolved", gid));
-                program.set_switch_lsb(gid, cf_lsb(ctrl));
-            }
-            GateType::Join => {
-                let a = masks[g.in0.wid]
-                    .as_ref()
-                    .unwrap_or_else(|| panic!("join gate {}: in0 mask unresolved", gid));
-                let b = masks[g.in1.wid]
-                    .as_ref()
-                    .unwrap_or_else(|| panic!("join gate {}: in1 mask unresolved", gid));
-                program.set_join_diff(gid, label::sub(a, b));
-            }
-            _ => {}
+        if matches!(g.typ, GateType::Join) {
+            let a = masks[g.in0.wid]
+                .as_ref()
+                .unwrap_or_else(|| panic!("join gate {}: in0 mask unresolved", gid));
+            let b = masks[g.in1.wid]
+                .as_ref()
+                .unwrap_or_else(|| panic!("join gate {}: in1 mask unresolved", gid));
+            program.set_join_diff(gid, label::sub(a, b));
         }
     }
 
-    // Output masks are emitted regardless of CF/NCF — the streaming pipeline
-    // carries CF chunk-word masks across phase boundaries, while the standard
-    // value-decoding `eval` rejects CF outputs at decode time. Mask emission
-    // itself is kind-neutral.
+    // Output masks: the streaming pipeline carries CF chunk-word masks across
+    // phase boundaries; emission is kind-neutral.
     for &w in output_wires {
         let m = masks[w.wid]
             .clone()
@@ -266,13 +259,5 @@ fn try_set(
         );
         masks[w.wid] = Some(new_mask);
         queue.extend_from_slice(&system.subscriptions[w.wid]);
-    }
-}
-
-/// Low bit of a CF label's coord 0 (for point-and-permute).
-fn cf_lsb(l: &Label) -> bool {
-    match l {
-        Label::Cf(c) => (c.get(0) & 1) == 1,
-        Label::Ncf(_) => panic!("cf_lsb: NCF label"),
     }
 }

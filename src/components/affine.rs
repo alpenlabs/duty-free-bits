@@ -29,30 +29,26 @@ const MAX_SUB_CHUNK_WIDTH: u32 = 8;
 ///
 /// Splitting the S components into batches keeps each phase's working set small.
 /// 128 fills a full λ-bit CCRH block (so packing isn't wasted) while keeping
-/// per-phase peak wires far below the all-at-once path.
+/// per-phase peak wires low.
 const RESIDUE_BATCH_SIZE: usize = 128;
 
-/// Streaming garble + eval of [`build_s_aff`].
-///
-/// Drives the same algorithm as `build_s_aff` but as a sequence of independent
-/// phases via a [`Pipeline`]:
+/// Garble + evaluate the affine maps as a sequence of independent phases via a
+/// [`Pipeline`]:
 ///
 /// * **One phase per chunk** for `bin_to_word`. Carry: the chunk word `w_c`.
 /// * **Per prime, a header phase** that builds `r_i`, runs `sub_chunk_extract`,
 ///   and folds to a length-`p_i` OHE `h_p`. Carry: the `p_i` entries of `h_p`.
 /// * **Per prime, body sub-phases** (one per `RESIDUE_BATCH_SIZE`-batch of S),
 ///   each consuming `h_p` + a batch of `(a, b)` coefficients and producing
-///   that batch's decoded outputs.
+///   that batch's decoded outputs (via [`crate::it_gc`]).
 ///
 /// After each sub-phase the System (gates, masks, labels, program) is dropped —
-/// only the small carry-forward `(mask, label)` set survives. The cross-phase
-/// invariant `label = mask + value · Δ_R(modulus)` is carried in [`CarryItem`],
-/// so outputs are bit-identical to the all-at-once path.
+/// only the small carry-forward set survives, satisfying
+/// `label = mask + value · Δ_R(modulus)` across boundaries.
 ///
 /// `x_bits` are the cleartext input bits, known to the evaluator in the
-/// privacy-preserving switch-private/data-public setting. They're used to
-/// derive `hot_i = x mod p_i` directly, sparing the body kernel from
-/// per-switch point-and-permute LSB emission.
+/// privacy-preserving switch-private/data-public setting. They derive
+/// `hot_i = x mod p_i` directly for the body kernel; switches reveal nothing.
 ///
 /// `input_bit_ids` are carry ids for the n input bits (seed them with
 /// [`Pipeline::seed_input_cf_value`]).
@@ -112,8 +108,8 @@ pub fn build_s_aff_streaming(
     //
     // The header builds the OHE `h_p` on the System path (so its masks/labels are
     // pseudorandom under the real CCRH); the body batches then run on the kernel.
-    // Because the evaluator knows `x_bits`, it derives `hot_i = x mod p_i`
-    // directly and the body never emits a per-switch ctrl LSB.
+    // The evaluator knows `x_bits`, so it derives `hot_i = x mod p_i` and every
+    // switch control itself — no switch reveals anything (header or body).
     let sub_widths = compute_sub_widths(ell, MAX_SUB_CHUNK_WIDTH);
     let mut all_outputs: Vec<Vec<u64>> = Vec::with_capacity(params.num_primes);
 
@@ -196,7 +192,7 @@ pub fn build_s_aff_streaming(
                 body_batch_garble(p_i, &h_p_masks, &a_batch, &b_batch, &identity_table, nonce_base);
             let garble_secs = t_garble.elapsed().as_secs_f64();
             // Evaluator kernel: consumes the garbler's join diffs, using the same
-            // nonce base. `hot_i` comes from cleartext `x_bits`, so no ctrl LSB.
+            // nonce base. `hot_i` comes from cleartext `x_bits`; no reveal.
             let t_eval = std::time::Instant::now();
             let result_labels = body_batch_eval(
                 p_i,

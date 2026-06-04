@@ -6,10 +6,9 @@
 //! information-theoretic — single NCF Z_p residues, no λ blowup — which is why
 //! it is implemented directly here rather than through the general switch engine.
 //!
-//! A body batch is one `hot_to_ring_bulk(h_p, identity, a, b)` from
-//! [`crate::components::convert`], which expands into `ohe_scale_bulk` followed
-//! by a ring readout. Written as the protocol's gates, for OHE position `i` and
-//! batch member `j`:
+//! A body batch is a bulk `scale-hot` (Lemma 6.2) followed by a ring readout
+//! (Lemma 6.1). Written as the protocol's gates, for OHE position `i` and batch
+//! member `j`:
 //!
 //!   * **switch** `o_{i,j} = H(h_p[i]) + z`, with the data input `z = 0`. This
 //!     is the scaled OHE share: it equals `a_j` at the hot position and `0`
@@ -50,8 +49,8 @@ pub struct BatchCost {
 /// Garbler-side output of one body batch, length `B` (one entry per member).
 ///
 /// The evaluator knows `x` in cleartext (switch-private / data-public), so it
-/// can locate every switch's hot position itself. We therefore skip the usual
-/// point-and-permute ctrl-LSB reveal and emit only the join diffs.
+/// locates every switch's hot position itself; the garbler emits only the join
+/// diffs (switches reveal nothing — paper §3.3).
 #[derive(Debug)]
 pub struct BodyBatchGarbleOutput {
     /// Join diff per batch member (NCF Z_p rep).
@@ -126,9 +125,9 @@ fn batch_cost(p_i: u64, b: usize) -> BatchCost {
 /// same gates [`body_batch_garble`] runs on masks.
 ///
 /// `hot = x mod p_i` is supplied directly: the evaluator knows `x` in cleartext,
-/// so there is no point-and-permute reconstruction. `b_batch` is present for
-/// symmetry — b_j is a public constant whose label is 0, so its values are
-/// unused. Returns one label per batch member.
+/// so the control is never revealed. `b_batch` is present for symmetry — b_j is a
+/// public constant whose label is 0, so its values are unused. Returns one label
+/// per batch member.
 pub fn body_batch_eval(
     p_i: u64,
     hot: usize,

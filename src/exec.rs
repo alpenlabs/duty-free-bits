@@ -22,6 +22,12 @@ impl<'a> Exec<'a> {
         self.values[w.wid]
     }
 
+    /// All wire values (indexed by wire id) — used by the evaluator to read
+    /// switch controls in cleartext.
+    pub fn values(&self) -> &[Val] {
+        &self.values
+    }
+
     /// Set a wire's value (must be currently undefined).
     pub fn set(&mut self, w: Wire, v: Val) {
         assert!(self.values[w.wid].is_none(), "wire {} already set", w.wid);
