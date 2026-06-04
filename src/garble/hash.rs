@@ -1,66 +1,19 @@
-//! Correlation-robust hash (CCRH) used by switch gates.
+//! Label-aware CCRH facade for switch gates.
 //!
-//! Instantiated using the CCRND construction from §5 of
-//! <https://eprint.iacr.org/2019/074.pdf>:
-//!
-//!   H(x, t) = AES_K( σ(x ⊕ public_s ⊕ t) ) ⊕ σ(x ⊕ public_s ⊕ t)
-//!
-//! with a fixed AES key (treated as a public permutation) and a fixed
-//! `public_s`. σ is the linear orthomorphism `(L||R) → (L⊕R)||L`. Each
-//! call is one AES-128 block + a few NEON XORs + one shuffle ≈ 5-10 ns
-//! on Apple Silicon.
-//!
-//! For multi-block outputs (CF labels of `λ·k` bits, or wide bulk hashes)
-//! we use AES-CTR-style expansion: each block uses a `(domain, counter)`
-//! tweak so blocks are independent.
-//!
-//! Public surface:
+//! Wraps the `Label`-free CCRH core ([`crate::crypto`]) with the label↔block
+//! encoding and the per-output sizing the garbler/evaluator need:
 //!
 //!   * [`hash_solo`] — one switch's H output, sized for its output wire.
 //!   * [`hash_bulk`] — one wide H output for a switch group; sliced via
 //!     [`extract_ncf`] across NCF members.
 //!
-//! The AES backend is selected by target: aarch64 uses NEON/AES-NI
-//! ([`crate::garble::aarch64`], gobble-derived); other targets use a portable
-//! software AES ([`crate::garble::portable`]) that is byte-identical to it. Both
-//! present the same `[u8; 16]`-block surface (`expand_key` + `ccrnd`).
-
-use std::sync::OnceLock;
-
-#[cfg(target_arch = "aarch64")]
-use super::aarch64 as backend;
-#[cfg(not(target_arch = "aarch64"))]
-use super::portable as backend;
-use backend::RoundKeys;
+//! Switch controls are always CF Z_2, so the hash seed is exactly 128 bits.
+//! The `nonce` passed to the core is the gate id (solo) or the group id with the
+//! bulk flag set; the caller guarantees freshness (see [`crate::crypto::nonce`]).
 
 use super::label::{self, CfLabel, LAMBDA, Label, NcfLabel};
+use crate::crypto::{Block, expand};
 use crate::types::GateId;
-
-/// A 128-bit CCRH block.
-type Block = [u8; 16];
-
-/// Fixed AES-128 key (public permutation key for the CCRH). Bytes from the
-/// fractional part of the golden ratio — a "nothing-up-my-sleeve" constant.
-const CCRH_KEY: [u8; 16] = [
-    0x9e, 0x37, 0x79, 0xb9, 0x7f, 0x4a, 0x7c, 0x15,
-    0xf3, 0x9c, 0xc0, 0x60, 0x5c, 0xed, 0xc8, 0x34,
-];
-
-/// Fixed `public_s` (CCRND's tweakable-PRF public string).
-const CCRH_PUBLIC_S: [u8; 16] = [
-    0xa0, 0x9e, 0x66, 0x7f, 0x3b, 0xcc, 0x90, 0x8b,
-    0xb6, 0x7a, 0xe8, 0x58, 0x4c, 0xaa, 0x73, 0xb2,
-];
-
-/// Process-global pre-expanded round keys (computed once on first use).
-fn round_keys() -> &'static RoundKeys {
-    static C: OnceLock<RoundKeys> = OnceLock::new();
-    C.get_or_init(|| backend::expand_key(&CCRH_KEY))
-}
-
-fn public_s_block() -> Block {
-    CCRH_PUBLIC_S
-}
 
 /// `⌈log₂ modulus⌉` (number of bits needed to represent values < modulus).
 pub fn lg_modulus(modulus: u64) -> usize {
@@ -106,27 +59,6 @@ fn label_to_block(l: &Label) -> Block {
             bytes[8..16].copy_from_slice(&n.modulus.to_le_bytes());
             bytes
         }
-    }
-}
-
-/// AES-CTR expansion under MMO-equivalent CCRND.
-///
-/// Writes pseudorandom bytes derived from `(seed_block, domain)` into `output`.
-/// Each 16-byte chunk uses a tweak with `domain` in the low 64 bits and a
-/// per-block counter in the high 64 bits — distinct counters never collide.
-fn expand(seed: Block, domain: u64, output: &mut [u8]) {
-    let keys = round_keys();
-    let public_s = public_s_block();
-    let mut counter: u64 = 0;
-    let mut written = 0;
-    while written < output.len() {
-        let tweak_bytes: u128 = (domain as u128) | ((counter as u128) << 64);
-        let tweak = tweak_bytes.to_le_bytes();
-        let h_bytes = backend::ccrnd(seed, tweak, keys, public_s);
-        let take = (output.len() - written).min(16);
-        output[written..written + take].copy_from_slice(&h_bytes[..take]);
-        written += take;
-        counter += 1;
     }
 }
 
@@ -218,32 +150,6 @@ mod tests {
         let a = hash_solo(&s, 17, true, 1 << 10);
         let b = hash_solo(&s, 17, true, 1 << 10);
         assert_eq!(a, b);
-    }
-
-    /// The portable software backend must be byte-identical to the NEON/AES-NI
-    /// backend — otherwise the off-aarch64 build runs *different* crypto and the
-    /// shared CCRH tests would not transfer. Verifiable only where both exist.
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn test_portable_backend_matches_neon() {
-        use super::super::{aarch64, portable};
-        let rk_neon = aarch64::expand_key(&CCRH_KEY);
-        let rk_soft = portable::expand_key(&CCRH_KEY);
-        let s = CCRH_PUBLIC_S;
-        for i in 0..128u64 {
-            let mut seed = [0u8; 16];
-            seed[0..8].copy_from_slice(&i.to_le_bytes());
-            seed[8] = 0xa5;
-            seed[15] = (i as u8).wrapping_mul(31);
-            let mut tweak = [0u8; 16];
-            tweak[0..8].copy_from_slice(&(i.wrapping_mul(7).wrapping_add(1)).to_le_bytes());
-            tweak[8..16].copy_from_slice(&((1u64 << 63) | i).to_le_bytes());
-            assert_eq!(
-                aarch64::ccrnd(seed, tweak, &rk_neon, s),
-                portable::ccrnd(seed, tweak, &rk_soft, s),
-                "portable vs NEON mismatch at i={i}",
-            );
-        }
     }
 
     #[test]
