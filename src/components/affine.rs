@@ -10,7 +10,7 @@
 ///   3. Residue evaluation: for each prime, decompose the ℓ-bit residue via
 ///      sub-chunk extraction into a length-p_i OHE of r_i mod p_i,
 ///      then evaluate a · (r_i mod p_i) + b via `hot_to_ring`.
-use super::affine_kernel::{body_batch_eval, body_batch_garble};
+use crate::it_gc::{body_batch_eval, body_batch_garble};
 use super::convert::{
     bin_to_word, compute_sub_widths, fold_to_mod_ohe, hot_to_ring_bulk, sub_chunk_extract,
 };
