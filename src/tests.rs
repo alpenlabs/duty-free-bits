@@ -86,6 +86,80 @@ fn rand_u576_below(rng: &mut impl Rng, bound: &U576) -> U576 {
     }
 }
 
+/// Differential check: cleartext `Exec`, all-at-once garble→eval, and the
+/// streaming pipeline must all decode `a_j·x + b_j (mod p_i)` to the same value
+/// for every prime/component. Used by the Gate-1 sweep to cover S across the
+/// 128-batch boundary and varied hot positions.
+fn assert_s_aff_equivalent(
+    params: &CrtParams,
+    a_vals: &[u64],
+    b_vals: &[u64],
+    x: u64,
+    rng: &mut impl Rng,
+) {
+    let n = params.n as usize;
+    let s_dim = a_vals.len();
+    let a_residues: Vec<Vec<u64>> = params
+        .primes
+        .iter()
+        .map(|&pi| a_vals.iter().map(|&a| a % pi).collect())
+        .collect();
+    let b_residues: Vec<Vec<u64>> = params
+        .primes
+        .iter()
+        .map(|&pi| b_vals.iter().map(|&b| b % pi).collect())
+        .collect();
+    let input_bits: Vec<u64> = (0..n).map(|j| (x >> j) & 1).collect();
+
+    // (a) all-at-once garble→eval, anchored to cleartext Exec.
+    let mut sys = System::new();
+    let bit_wires: Vec<Wire> = (0..n).map(|_| sys.input(2)).collect();
+    let result = build_s_aff(&mut sys, &bit_wires, params, &a_residues, &b_residues);
+    let output_wires: Vec<Wire> = result.outputs.iter().flatten().copied().collect();
+    let input_values: Vec<Val> = input_bits.iter().map(|&b| Val::new(b, 2)).collect();
+    let mut exec = Exec::new(&sys);
+    for (&w, &v) in bit_wires.iter().zip(&input_values) {
+        exec.set(w, v);
+    }
+    exec.run();
+    let exec_outputs: Vec<Val> = output_wires.iter().map(|&w| exec.get(w)).collect();
+    let delta = normalize_delta(rng.random());
+    let input_masks: Vec<Label> = bit_wires.iter().map(|_| sample_cf_mask(rng, 2)).collect();
+    let program = garble(&sys, &bit_wires, &input_masks, &output_wires, delta);
+    let aao = eval(
+        &sys,
+        &bit_wires,
+        &input_values,
+        delta,
+        &input_masks,
+        &program,
+        &output_wires,
+    );
+    assert_eq!(aao, exec_outputs, "all-at-once != Exec (S={s_dim}, x={x})");
+    drop(sys);
+
+    // (b) streaming pipeline.
+    let mut pipeline = Pipeline::new(rng);
+    let bit_ids: Vec<_> = input_bits
+        .iter()
+        .map(|&b| pipeline.seed_input_cf_value(rng, 2, b))
+        .collect();
+    let outputs =
+        build_s_aff_streaming(&mut pipeline, &bit_ids, &input_bits, params, &a_residues, &b_residues);
+    let streaming_flat: Vec<u64> = outputs.iter().flatten().copied().collect();
+    assert_eq!(
+        streaming_flat.len(),
+        exec_outputs.len(),
+        "streaming output count mismatch (S={s_dim})"
+    );
+    for (i, (got, expected)) in streaming_flat.iter().zip(&exec_outputs).enumerate() {
+        assert_eq!(
+            *got, expected.v,
+            "streaming != Exec at output[{i}] (S={s_dim}, x={x})"
+        );
+    }
+}
+
 // ==================== System gate tests (via Exec) ====================
 
 #[test]
@@ -1373,6 +1447,28 @@ fn test_streaming_s_aff_matches_all_at_once() {
                 "stream-vs-all-at-once mismatch at output[{i}]: got {got}, expected {}",
                 expected.v
             );
+        }
+    }
+}
+
+#[test]
+fn test_streaming_differential_sweep() {
+    // Gate-1 safety net. The fixture above only used S=3, which never crosses
+    // the RESIDUE_BATCH_SIZE=128 body-batch boundary — the exact path the nonce
+    // advance touches. Sweep S around 128 and several x, asserting Exec ==
+    // all-at-once == streaming each time.
+    let primes: [u64; 10] = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29];
+    let params = CrtParams::from_primes(&primes, 16);
+    let n = params.n as usize;
+    let mut rng = rng();
+    let m: u128 = params.primes.iter().map(|&p| p as u128).product();
+
+    for s_dim in [1usize, 127, 128, 129, 256] {
+        for _ in 0..2 {
+            let a_vals: Vec<u64> = (0..s_dim).map(|_| rng.random_range(0..m as u64)).collect();
+            let b_vals: Vec<u64> = (0..s_dim).map(|_| rng.random_range(0..m as u64)).collect();
+            let x: u64 = rng.random_range(0..(1u64 << n));
+            assert_s_aff_equivalent(&params, &a_vals, &b_vals, x, &mut rng);
         }
     }
 }

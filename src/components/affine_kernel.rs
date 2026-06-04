@@ -367,4 +367,42 @@ mod tests {
             "distinct nonces must break the two-time-pad leak (leaked {leaked_positions}/{b})"
         );
     }
+
+    /// Generalize the leak check to the real streaming pattern: K consecutive
+    /// batches of one prime (same `h_p` seed) with the driver's nonce scheme
+    /// (`base += p_i` per batch). No pair of batches may share a pad, so the
+    /// two-time-pad relation must be broken for every pair.
+    #[test]
+    fn test_streaming_nonce_scheme_no_pad_reuse() {
+        let p_i = 31u64;
+        let p = p_i as usize;
+        let b = 5usize;
+        let k = 4usize;
+        let mut rng = rand::rng();
+        let truth: Vec<u64> = (0..p_i).collect();
+        let h_p_masks: Vec<Label> = (0..p).map(|_| rand_cf2_label(&mut rng)).collect();
+        let zeros = vec![0u64; b];
+
+        let mut batches: Vec<(Vec<u64>, Vec<u64>)> = Vec::new();
+        for batch in 0..k {
+            let a: Vec<u64> = (0..b).map(|_| rng.random_range(0..p_i)).collect();
+            let base = batch * p; // matches affine.rs `group_id_base += p_i`
+            let g = body_batch_garble(p_i, &h_p_masks, &a, &zeros, &truth, base);
+            batches.push((a, g.join_diffs));
+        }
+        for u in 0..k {
+            for v in (u + 1)..k {
+                let leaked = (0..b)
+                    .filter(|&j| {
+                        mod_sub(batches[u].1[j], batches[v].1[j], p_i)
+                            == mod_sub(batches[u].0[j], batches[v].0[j], p_i)
+                    })
+                    .count();
+                assert!(
+                    leaked < b,
+                    "pad reuse between batch {u} and {v} (leaked {leaked}/{b})"
+                );
+            }
+        }
+    }
 }

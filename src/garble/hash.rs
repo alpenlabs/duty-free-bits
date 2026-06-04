@@ -254,6 +254,25 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    /// Golden vectors pinning the full CCRH pipeline (label→block, domain
+    /// encoding, AES-CTR expansion, NCF bit extraction) byte-for-byte. R1
+    /// refactors hash.rs behind a `Ccrh` trait; these must not change.
+    #[test]
+    fn test_ccrh_golden_vectors() {
+        let coords: Vec<u64> = (0..LAMBDA).map(|i| ((i * 7 + 3) % 5 == 0) as u64).collect();
+        let ctrl = Label::Cf(CfLabel::from_coords(&coords, 2));
+
+        match hash_solo(&ctrl, 42, false, 31) {
+            Label::Ncf(n) => assert_eq!((n.rep, n.modulus), (20, 31), "hash_solo NCF golden"),
+            _ => panic!("expected NCF"),
+        }
+        assert_eq!(
+            hash_bulk(&ctrl, 7, 80),
+            [175, 72, 194, 184, 45, 188, 159, 234, 245, 163],
+            "hash_bulk golden"
+        );
+    }
+
     #[test]
     fn test_solo_ctrl_changes_output() {
         let mut r = rand::rng();
