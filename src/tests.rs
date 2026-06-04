@@ -341,7 +341,41 @@ fn test_join_complexity() {
     let x = sys.input(8);
     let y = sys.input(8);
     sys.join(x, y);
-    assert_eq!(sys.join_complexity, 3); // log2(8) = 3
+    assert_eq!(sys.cost().join_complexity(), 3); // log2(8) = 3
+}
+
+#[test]
+fn test_cost_fold() {
+    let mut sys = System::new();
+    let ctrl = sys.input(2);
+
+    // CF switch on Z_16 (k = 4): 4 hashes.
+    let cf = sys.input(16);
+    sys.switch(cf, ctrl);
+
+    // Two NCF switches on Z_5.
+    let g_a = sys.num_gates();
+    let na = sys.constant_ncf(0, 5);
+    let a = sys.switch(na, ctrl);
+    let g_b = sys.num_gates();
+    let nb = sys.constant_ncf(0, 5);
+    let b = sys.switch(nb, ctrl);
+
+    // CF join on Z_8 (3 bits) and NCF join on Z_5 (3 bits).
+    let (x, y) = (sys.input(8), sys.input(8));
+    sys.join(x, y);
+    sys.join(a, b);
+
+    // Solo: the two NCF switches cost 1 each.
+    let c = sys.cost();
+    assert_eq!(c.hash_count_cf, 4);
+    assert_eq!(c.hash_count_ncf, 2);
+    assert_eq!(c.join_complexity_cf, 3);
+    assert_eq!(c.join_complexity_ncf, 3);
+
+    // Grouping the two NCF switches packs them: ⌈2·3 / 128⌉ = 1 hash, no double-count.
+    sys.register_ncf_switch_group(ctrl, vec![g_a, g_b]);
+    assert_eq!(sys.cost().hash_count_ncf, 1);
 }
 
 #[test]
@@ -557,16 +591,23 @@ fn test_s_aff_scaling() {
             "          totals: {} wires, {} gates, {} switch groups",
             pipeline.total_wires, pipeline.total_gates, pipeline.total_switch_groups,
         );
+        // Real garbler->evaluator communication = the join width (switches reveal
+        // nothing). CF joins pay λ per lg|G| bit, NCF joins pay 1.
+        let comm_bits =
+            crate::label::LAMBDA * pipeline.join_complexity_cf + pipeline.join_complexity_ncf;
         eprintln!(
-            "          program: {} bits ({:.2} MB)",
-            pipeline.total_program_bits,
-            pipeline.total_program_bits as f64 / 8.0 / 1024.0 / 1024.0,
-        );
-        eprintln!(
-            "          join: total {} bits (cf {}, ncf {})  hash: cf {}, ncf {}",
-            pipeline.join_complexity_cf + pipeline.join_complexity_ncf,
+            "          communication (join width): {} bits ({:.2} MB)  [cf {}·λ + ncf {}]",
+            comm_bits,
+            comm_bits as f64 / 8.0 / 1024.0 / 1024.0,
             pipeline.join_complexity_cf,
             pipeline.join_complexity_ncf,
+        );
+        // Internal garbled material handled across all phases (join diffs + the
+        // per-phase carry masks, which are NOT sent — they are the garbler's state).
+        eprintln!(
+            "          internal material: {} bits ({:.2} MB)   hash: cf {}, ncf {}",
+            pipeline.total_program_bits,
+            pipeline.total_program_bits as f64 / 8.0 / 1024.0 / 1024.0,
             pipeline.hash_count_cf,
             pipeline.hash_count_ncf,
         );
