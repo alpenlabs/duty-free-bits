@@ -14,10 +14,10 @@
 //! [`build_s_aff_streaming`] runs these phase-by-phase via a [`Pipeline`],
 //! dropping intermediate state at each boundary.
 
-use super::convert::{bin_to_word, compute_sub_widths, fold_to_mod_ohe, sub_chunk_extract};
-use super::crt::{CrtParams, pow2_mod};
+use crate::comp_gc::convert::{bin_to_word, compute_sub_widths, fold_to_mod_ohe, sub_chunk_extract};
+use crate::crt::{CrtParams, pow2_mod};
 use crate::crypto::nonce;
-use crate::garble::{CarryId, Pipeline};
+use crate::pipeline::{CarryId, Pipeline};
 use crate::it_gc::{body_batch_eval, body_batch_garble};
 use crate::types::*;
 
@@ -53,7 +53,7 @@ const RESIDUE_BATCH_SIZE: usize = 128;
 /// `input_bit_ids` are carry ids for the n input bits (seed them with
 /// [`Pipeline::seed_input_cf_value`]).
 ///
-/// [`CarryItem`]: crate::garble::CarryItem
+/// [`CarryItem`]: crate::pipeline::CarryItem
 pub fn build_s_aff_streaming(
     pipeline: &mut Pipeline,
     input_bit_ids: &[CarryId],

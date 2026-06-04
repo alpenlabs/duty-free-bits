@@ -2,16 +2,16 @@
 //!
 //! Unit tests for individual modules live in their respective `#[cfg(test)]` blocks:
 //! - `types.rs`: Val arithmetic
-//! - `components/ohe.rs`: one-hot encoding
-//! - `components/convert.rs`: bin_to_word, sub-chunk extraction, mod-OHE folding
-//! - `components/crt.rs`: CRT parameters and reconstruction
-//! - `components/bigint.rs`: U576 arithmetic
+//! - `comp_gc/ohe.rs`: one-hot encoding
+//! - `comp_gc/convert.rs`: bin_to_word, sub-chunk extraction, mod-OHE folding
+//! - `crt/mod.rs`: CRT parameters and reconstruction
+//! - `crt/bigint.rs`: U576 arithmetic
 
-use crate::components::affine::build_s_aff_streaming;
-use crate::components::bigint::{FIRST_80_PRIMES, U576};
-use crate::components::crt::{CrtParams, crt_reconstruct};
+use crate::affine::build_s_aff_streaming;
+use crate::crt::bigint::{FIRST_80_PRIMES, U576};
+use crate::crt::{CrtParams, crt_reconstruct};
 use crate::exec::Exec;
-use crate::garble::Pipeline;
+use crate::pipeline::Pipeline;
 use crate::system::System;
 use crate::types::*;
 

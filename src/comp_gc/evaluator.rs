@@ -9,8 +9,8 @@
 //! `ohe_scale`'s "junk sh_i labels, join fixes the sum, backward add recovers
 //! individual sh_i" to work.
 
-use super::hash;
-use super::label::{self, Label};
+use crate::hash;
+use crate::label::{self, Label};
 use super::program::Program;
 use crate::system::System;
 use crate::types::{GateId, GateType, Val, Wire};
@@ -55,7 +55,7 @@ fn switch_hash(
 /// garble+eval.
 ///
 /// [`Exec`]: crate::exec::Exec
-/// [`Pipeline`]: crate::garble::pipeline::Pipeline
+/// [`Pipeline`]: crate::pipeline::Pipeline
 pub fn eval_with_labels(
     system: &System,
     input_wires: &[Wire],
