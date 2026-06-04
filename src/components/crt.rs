@@ -60,11 +60,13 @@ impl CrtParams {
         let num_chunks = n.div_ceil(chunk_size) as usize;
 
         // 2^ell must exceed the worst-case residue accumulation:
-        //   Σ_c coeff_c * w_c  ≤  C * p_max * (2^chunk_size - 1)
+        //   Σ_c coeff_c * w_c  ≤  C * p_max * (2^chunk_size - 1).
+        // For any max_sum ≥ 1, ⌊log₂ max_sum⌋ + 1 is the smallest ell
+        // with 2^ell > max_sum (handles the power-of-2 case correctly).
         let p_max = *primes.iter().max().unwrap();
         let max_word = (1u64 << chunk_size) - 1;
         let max_sum = (num_chunks as u128) * (p_max as u128) * (max_word as u128);
-        let ell = (max_sum - 1).ilog2() + 2;
+        let ell = max_sum.ilog2() + 1;
         assert!(ell < 64, "working modulus 2^{} exceeds u64", ell);
 
         CrtParams {

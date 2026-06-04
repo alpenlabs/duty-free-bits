@@ -1,5 +1,8 @@
 //! Switch system framework for garbled arithmetic circuits.
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Higher-level circuit components built on the core system.
 pub mod components;
 /// Concrete execution (propagation of values) of a system.
