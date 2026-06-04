@@ -12,40 +12,27 @@ pub struct Wire {
     pub wid: usize,
 }
 
-/// Gate types supported by the switch system.
+/// A gate in the switch system. Each variant names exactly the wires (and scalar
+/// parameters) it uses — there are no dummy wires or overloaded fields.
 #[derive(Clone, Copy, Debug)]
-pub enum GateType {
-    /// y := x when ctrl=0.
-    Switch,
-    /// x = y (costs communication).
-    Join,
-    /// x = y (free when one side is unconstrained).
-    SameWire,
-    /// out = in0 + in1.
-    Add,
-    /// out = in0 - in1.
-    Sub,
-    /// out = param * in0.
-    Mul,
-    /// out = in0 mod 2^param.
-    Mod2k,
-    /// out = in0 / 2^param (requires low bits = 0).
-    Div2k,
-}
-
-/// A gate in the switch system.
-#[derive(Clone, Copy, Debug)]
-pub struct Gate {
-    /// The operation this gate performs.
-    pub typ: GateType,
-    /// Scalar parameter (used by Mul, Mod2k, Div2k).
-    pub param: u64,
-    /// First input wire.
-    pub in0: Wire,
-    /// Second input wire (control wire for Switch).
-    pub in1: Wire,
-    /// Output wire.
-    pub out: Wire,
+#[allow(missing_docs)] // field roles are clear from names + the variant docs
+pub enum Gate {
+    /// `out := data` when `ctrl = 0` (ctrl is CF Z_2); open (no constraint) when ctrl = 1.
+    Switch { data: Wire, ctrl: Wire, out: Wire },
+    /// Constrain `a = b` (costs join-width communication).
+    Join { a: Wire, b: Wire },
+    /// Constrain `a = b` for free (when one side is unconstrained).
+    SameWire { a: Wire, b: Wire },
+    /// `out := in0 + in1`.
+    Add { in0: Wire, in1: Wire, out: Wire },
+    /// `out := in0 - in1`.
+    Sub { in0: Wire, in1: Wire, out: Wire },
+    /// `out := scalar · in0`.
+    Mul { in0: Wire, scalar: u64, out: Wire },
+    /// `out := in0 mod 2^k`.
+    Mod2k { in0: Wire, k: u32, out: Wire },
+    /// `out := in0 / 2^k` (requires the low `k` bits of `in0` to be zero).
+    Div2k { in0: Wire, k: u32, out: Wire },
 }
 
 /// A value in Z_modulus. Write-once: starts undefined, transitions to defined exactly once.

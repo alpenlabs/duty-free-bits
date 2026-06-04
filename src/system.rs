@@ -1,12 +1,5 @@
+use crate::label::LAMBDA;
 use crate::types::*;
-
-/// Security parameter, in bits.
-///
-/// A single λ-bit CCRH invocation is counted as one "hash" in the hash
-/// counters; a CF label on Z_{2^k} stores λ coordinates of k bits, so it costs
-/// k hashes. NCF labels in Z_p (p ≤ 409 in our setting) fit in fewer than λ
-/// bits, so an NCF switch fits in one hash.
-pub const LAMBDA_BITS: usize = crate::label::LAMBDA;
 
 /// The constraint system: holds wires, gates, and propagation queue.
 #[derive(Debug)]
@@ -172,17 +165,21 @@ impl System {
         }
 
         let modulus = {
-            let g0 = self.gates[members[0]];
-            assert!(matches!(g0.typ, GateType::Switch), "group member must be a Switch");
-            assert!(!self.is_cf(g0.out), "switch group is NCF-only");
-            self.modulus(g0.out)
+            let out = match self.gates[members[0]] {
+                Gate::Switch { out, .. } => out,
+                _ => panic!("switch group member must be a Switch"),
+            };
+            assert!(!self.is_cf(out), "switch group is NCF-only");
+            self.modulus(out)
         };
         for &gid in &members {
-            let g = self.gates[gid];
-            assert!(matches!(g.typ, GateType::Switch), "group member must be a Switch");
-            assert!(!self.is_cf(g.out), "switch group is NCF-only");
-            assert_eq!(self.modulus(g.out), modulus, "group member moduli mismatch");
-            assert_eq!(g.in1.wid, ctrl.wid, "group member control mismatch");
+            let (gate_ctrl, out) = match self.gates[gid] {
+                Gate::Switch { ctrl, out, .. } => (ctrl, out),
+                _ => panic!("switch group member must be a Switch"),
+            };
+            assert!(!self.is_cf(out), "switch group is NCF-only");
+            assert_eq!(self.modulus(out), modulus, "group member moduli mismatch");
+            assert_eq!(gate_ctrl.wid, ctrl.wid, "group member control mismatch");
             assert!(self.gate_to_group[gid].is_none(), "gate {gid} already grouped");
         }
 
@@ -198,7 +195,7 @@ impl System {
         } else {
             ((modulus - 1).ilog2() + 1) as usize
         };
-        let bulk = (s * lg_m).div_ceil(LAMBDA_BITS);
+        let bulk = (s * lg_m).div_ceil(LAMBDA);
         self.hash_count_ncf -= s;
         self.hash_count_ncf += bulk;
 
@@ -276,31 +273,28 @@ impl System {
     fn add_gate(&mut self, g: Gate) {
         let gid = self.gates.len();
         self.gates.push(g);
-
-        self.subscribe(g.in0, gid);
-        match g.typ {
-            GateType::Switch | GateType::Add | GateType::Sub => {
-                self.subscribe(g.in1, gid);
-                self.subscribe(g.out, gid);
+        // Subscribe the gate to the wires it reads, so it wakes when they change.
+        // One-input gates (Mul/Mod2k/Div2k) are forward-only and subscribe only
+        // `in0`; the others subscribe every wire they touch.
+        match g {
+            Gate::Switch { data, ctrl, out } => {
+                self.subscribe(data, gid);
+                self.subscribe(ctrl, gid);
+                self.subscribe(out, gid);
             }
-            GateType::Join | GateType::SameWire => {
-                self.subscribe(g.in1, gid);
+            Gate::Add { in0, in1, out } | Gate::Sub { in0, in1, out } => {
+                self.subscribe(in0, gid);
+                self.subscribe(in1, gid);
+                self.subscribe(out, gid);
             }
-            GateType::Mul | GateType::Mod2k | GateType::Div2k => {}
+            Gate::Join { a, b } | Gate::SameWire { a, b } => {
+                self.subscribe(a, gid);
+                self.subscribe(b, gid);
+            }
+            Gate::Mul { in0, .. } | Gate::Mod2k { in0, .. } | Gate::Div2k { in0, .. } => {
+                self.subscribe(in0, gid);
+            }
         }
-    }
-
-    fn one_in_one_out(&mut self, typ: GateType, x: Wire, param: u64, out_mod: u64) -> Wire {
-        let out = self.alloc_wire_kind(out_mod, self.is_cf(x));
-        let g = Gate {
-            typ,
-            param,
-            in0: x,
-            in1: Wire { wid: 0 },
-            out,
-        };
-        self.add_gate(g);
-        out
     }
 
     // --- Core gate constructors ---
@@ -322,14 +316,7 @@ impl System {
         } else {
             self.hash_count_ncf += 1;
         }
-        let g = Gate {
-            typ: GateType::Switch,
-            param: 0,
-            in0: x,
-            in1: s,
-            out,
-        };
-        self.add_gate(g);
+        self.add_gate(Gate::Switch { data: x, ctrl: s, out });
         out
     }
 
@@ -354,14 +341,7 @@ impl System {
         } else {
             self.join_complexity_ncf += bits;
         }
-        let g = Gate {
-            typ: GateType::Join,
-            param: 0,
-            in0: x,
-            in1: y,
-            out: Wire { wid: 0 },
-        };
-        self.add_gate(g);
+        self.add_gate(Gate::Join { a: x, b: y });
         x
     }
 
@@ -370,14 +350,7 @@ impl System {
     pub fn same_wire(&mut self, x: Wire, y: Wire) -> Wire {
         assert_eq!(self.modulus(x), self.modulus(y));
         assert_eq!(self.is_cf(x), self.is_cf(y), "same_wire: kind mismatch");
-        let g = Gate {
-            typ: GateType::SameWire,
-            param: 0,
-            in0: x,
-            in1: y,
-            out: Wire { wid: 0 },
-        };
-        self.add_gate(g);
+        self.add_gate(Gate::SameWire { a: x, b: y });
         x
     }
 
@@ -386,14 +359,7 @@ impl System {
         assert_eq!(self.modulus(x), self.modulus(y));
         assert_eq!(self.is_cf(x), self.is_cf(y), "add: kind mismatch");
         let out = self.alloc_wire_kind(self.modulus(x), self.is_cf(x));
-        let g = Gate {
-            typ: GateType::Add,
-            param: 0,
-            in0: x,
-            in1: y,
-            out,
-        };
-        self.add_gate(g);
+        self.add_gate(Gate::Add { in0: x, in1: y, out });
         out
     }
 
@@ -402,20 +368,15 @@ impl System {
         assert_eq!(self.modulus(x), self.modulus(y));
         assert_eq!(self.is_cf(x), self.is_cf(y), "sub: kind mismatch");
         let out = self.alloc_wire_kind(self.modulus(x), self.is_cf(x));
-        let g = Gate {
-            typ: GateType::Sub,
-            param: 0,
-            in0: x,
-            in1: y,
-            out,
-        };
-        self.add_gate(g);
+        self.add_gate(Gate::Sub { in0: x, in1: y, out });
         out
     }
 
     /// Scalar multiplication by constant s (mod wire's modulus). Output inherits kind.
     pub fn mul(&mut self, s: u64, x: Wire) -> Wire {
-        self.one_in_one_out(GateType::Mul, x, s, self.modulus(x))
+        let out = self.alloc_wire_kind(self.modulus(x), self.is_cf(x));
+        self.add_gate(Gate::Mul { in0: x, scalar: s, out });
+        out
     }
 
     /// Modular reduction: x mod 2^k. Input must be in Z_{2^n} with k ≤ n. Output inherits kind.
@@ -423,7 +384,9 @@ impl System {
         let m = self.modulus(x);
         assert!(m.is_power_of_two());
         assert!(k <= m.ilog2());
-        self.one_in_one_out(GateType::Mod2k, x, k as u64, 1u64 << k)
+        let out = self.alloc_wire_kind(1u64 << k, self.is_cf(x));
+        self.add_gate(Gate::Mod2k { in0: x, k, out });
+        out
     }
 
     /// Division by 2^k. Input in Z_{2^{k+c}}, output in Z_{2^c}. Output inherits kind.
@@ -431,7 +394,9 @@ impl System {
         let m = self.modulus(x);
         assert!(m.is_power_of_two());
         assert!(k < m.ilog2());
-        self.one_in_one_out(GateType::Div2k, x, k as u64, m >> k)
+        let out = self.alloc_wire_kind(m >> k, self.is_cf(x));
+        self.add_gate(Gate::Div2k { in0: x, k, out });
+        out
     }
 
     // --- Derived operations ---

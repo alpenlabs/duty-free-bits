@@ -28,7 +28,7 @@ use crate::hash;
 use crate::label::{self, Label, NcfLabel};
 use super::program::Program;
 use crate::system::System;
-use crate::types::{GateId, GateType, Wire};
+use crate::types::{Gate, GateId, Wire};
 
 /// Lazy cache for per-group bulk-hash outputs. `bulk_cache[group_idx]` is
 /// computed on first use and reused for every member of that group.
@@ -42,7 +42,6 @@ fn switch_hash(
     ctrl_mask: &Label,
     bulk_cache: &mut BulkCache,
 ) -> Label {
-    let g = system.gates[gid];
     if let Some((group_idx, member_idx)) = system.gate_group(gid) {
         let group = system.switch_group(group_idx);
         let lg_m = hash::lg_modulus(group.modulus);
@@ -56,7 +55,10 @@ fn switch_hash(
         let wide = bulk_cache[group_idx].as_ref().unwrap();
         hash::extract_ncf(wide, member_idx, group.modulus)
     } else {
-        hash::hash_solo(ctrl_mask, gid, system.is_cf(g.out), system.modulus(g.out))
+        let Gate::Switch { out, .. } = system.gates[gid] else {
+            unreachable!("switch_hash on non-switch gate {gid}");
+        };
+        hash::hash_solo(ctrl_mask, gid, system.is_cf(out), system.modulus(out))
     }
 }
 
@@ -128,14 +130,14 @@ pub fn garble(
     // output masks in deterministic order. Switches emit nothing — the evaluator
     // derives every control from cleartext `x` (paper §3.3).
     let mut program = Program::with_num_gates(system.num_gates());
-    for (gid, g) in system.gates.iter().enumerate() {
-        if matches!(g.typ, GateType::Join) {
-            let a = masks[g.in0.wid]
+    for (gid, &g) in system.gates.iter().enumerate() {
+        if let Gate::Join { a: aw, b: bw } = g {
+            let a = masks[aw.wid]
                 .as_ref()
-                .unwrap_or_else(|| panic!("join gate {}: in0 mask unresolved", gid));
-            let b = masks[g.in1.wid]
+                .unwrap_or_else(|| panic!("join gate {}: a-side mask unresolved", gid));
+            let b = masks[bw.wid]
                 .as_ref()
-                .unwrap_or_else(|| panic!("join gate {}: in1 mask unresolved", gid));
+                .unwrap_or_else(|| panic!("join gate {}: b-side mask unresolved", gid));
             program.set_join_diff(gid, label::sub(a, b));
         }
     }
@@ -159,85 +161,74 @@ fn propagate_gate(
     queue: &mut Vec<GateId>,
     bulk_cache: &mut BulkCache,
 ) {
-    let g = system.gates[gid];
-    let min0 = masks[g.in0.wid].clone();
-    let min1 = masks[g.in1.wid].clone();
-    let mout = match g.typ {
-        GateType::Add
-        | GateType::Sub
-        | GateType::Mul
-        | GateType::Mod2k
-        | GateType::Div2k
-        | GateType::Switch => masks[g.out.wid].clone(),
-        _ => None,
-    };
-
-    match g.typ {
-        GateType::Add => {
+    match system.gates[gid] {
+        Gate::Add { in0, in1, out } => {
             // out = in0 + in1  ⇔  in0 = out - in1  ⇔  in1 = out - in0
-            if let (Some(a), Some(b)) = (&min0, &min1) {
-                try_set(masks, g.out, label::add(a, b), queue, system);
+            let (m0, m1, mo) = (masks[in0.wid].clone(), masks[in1.wid].clone(), masks[out.wid].clone());
+            if let (Some(a), Some(b)) = (&m0, &m1) {
+                try_set(masks, out, label::add(a, b), queue, system);
             }
-            if let (Some(o), Some(b)) = (&mout, &min1) {
-                try_set(masks, g.in0, label::sub(o, b), queue, system);
+            if let (Some(o), Some(b)) = (&mo, &m1) {
+                try_set(masks, in0, label::sub(o, b), queue, system);
             }
-            if let (Some(a), Some(o)) = (&min0, &mout) {
-                try_set(masks, g.in1, label::sub(o, a), queue, system);
+            if let (Some(a), Some(o)) = (&m0, &mo) {
+                try_set(masks, in1, label::sub(o, a), queue, system);
             }
         }
-        GateType::Sub => {
+        Gate::Sub { in0, in1, out } => {
             // out = in0 - in1  ⇔  in0 = out + in1  ⇔  in1 = in0 - out
-            if let (Some(a), Some(b)) = (&min0, &min1) {
-                try_set(masks, g.out, label::sub(a, b), queue, system);
+            let (m0, m1, mo) = (masks[in0.wid].clone(), masks[in1.wid].clone(), masks[out.wid].clone());
+            if let (Some(a), Some(b)) = (&m0, &m1) {
+                try_set(masks, out, label::sub(a, b), queue, system);
             }
-            if let (Some(o), Some(b)) = (&mout, &min1) {
-                try_set(masks, g.in0, label::add(o, b), queue, system);
+            if let (Some(o), Some(b)) = (&mo, &m1) {
+                try_set(masks, in0, label::add(o, b), queue, system);
             }
-            if let (Some(a), Some(o)) = (&min0, &mout) {
-                try_set(masks, g.in1, label::sub(a, o), queue, system);
+            if let (Some(a), Some(o)) = (&m0, &mo) {
+                try_set(masks, in1, label::sub(a, o), queue, system);
             }
         }
-        GateType::Mul => {
+        Gate::Mul { in0, scalar, out } => {
             // X_out = s · X_in. When s = 0 this is 0 regardless of X_in, so the
             // gate is fireable without its input being masked.
-            if g.param == 0 {
-                try_set(masks, g.out, Label::zero(system.is_cf(g.out), system.modulus(g.out)), queue, system);
-            } else if let Some(a) = &min0 {
-                try_set(masks, g.out, label::scalar_mul(g.param, a), queue, system);
+            if scalar == 0 {
+                try_set(masks, out, Label::zero(system.is_cf(out), system.modulus(out)), queue, system);
+            } else if let Some(a) = masks[in0.wid].clone() {
+                try_set(masks, out, label::scalar_mul(scalar, &a), queue, system);
             }
         }
-        GateType::Mod2k => {
-            if let Some(a) = &min0 {
-                try_set(masks, g.out, label::mod2k(a, g.param as u32), queue, system);
+        Gate::Mod2k { in0, k, out } => {
+            if let Some(a) = masks[in0.wid].clone() {
+                try_set(masks, out, label::mod2k(&a, k), queue, system);
             }
         }
-        GateType::Div2k => {
-            if let Some(a) = &min0 {
-                try_set(masks, g.out, label::div2k(a, g.param as u32), queue, system);
+        Gate::Div2k { in0, k, out } => {
+            if let Some(a) = masks[in0.wid].clone() {
+                try_set(masks, out, label::div2k(&a, k), queue, system);
             }
         }
-        GateType::Switch => {
+        Gate::Switch { data, ctrl, out } => {
             // out = H(ctrl, gid) + data  ⇔  data = out - H(ctrl, gid).
             // For grouped switches, H is sliced from a single wide bulk call.
-            if let Some(ctrl) = &min1 {
-                let h = switch_hash(system, gid, ctrl, bulk_cache);
-                if let Some(data) = &min0 {
-                    try_set(masks, g.out, label::add(&h, data), queue, system);
+            if let Some(c) = masks[ctrl.wid].clone() {
+                let h = switch_hash(system, gid, &c, bulk_cache);
+                if let Some(d) = masks[data.wid].clone() {
+                    try_set(masks, out, label::add(&h, &d), queue, system);
                 }
-                if let Some(o) = &mout {
-                    try_set(masks, g.in0, label::sub(o, &h), queue, system);
+                if let Some(o) = masks[out.wid].clone() {
+                    try_set(masks, data, label::sub(&o, &h), queue, system);
                 }
             }
         }
-        GateType::Join => {
-            // No mask propagation; join diff is emitted in the final pass.
+        Gate::Join { .. } => {
+            // No mask propagation; the join diff is emitted in the final pass.
         }
-        GateType::SameWire => {
-            if let Some(a) = &min0 {
-                try_set(masks, g.in1, a.clone(), queue, system);
+        Gate::SameWire { a, b } => {
+            if let Some(ma) = masks[a.wid].clone() {
+                try_set(masks, b, ma, queue, system);
             }
-            if let Some(b) = &min1 {
-                try_set(masks, g.in0, b.clone(), queue, system);
+            if let Some(mb) = masks[b.wid].clone() {
+                try_set(masks, a, mb, queue, system);
             }
         }
     }
