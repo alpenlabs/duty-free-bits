@@ -1,3 +1,12 @@
+//! Bit ↔ word ↔ one-hot conversions (paper §6.2): the computational-GC
+//! sub-circuits that turn the binary input into the per-prime CRT one-hot the
+//! IT-GC body consumes.
+//!
+//! The pipeline composes these: `bin_to_word` packs bits into a ring word,
+//! `word_to_hot_with_bits` expands a word to its one-hot, `sub_chunk_extract`
+//! splits a wide word into narrower sub-chunks, and `fold_to_mod_ohe` reduces a
+//! one-hot modulo a prime. All build on the primitives in [`super::ohe`].
+
 use crate::crt::pow2_mod;
 use super::ohe::{ohe, ohe_scale};
 use crate::system::System;
