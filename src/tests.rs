@@ -1472,3 +1472,44 @@ fn test_streaming_differential_sweep() {
         }
     }
 }
+
+#[test]
+fn test_kernel_cost_matches_gate_path() {
+    // The it_gc kernel hand-derives its BatchCost (program bits, NCF join width,
+    // NCF hash count). Cross-check that derivation against the independent gate-
+    // path accounting (`hot_to_ring_bulk` over NCF for the same S=b), so the two
+    // can't silently diverge — they coincide today only because the formulas
+    // match, not by construction. A single batch (b ≤ 128) maps to one NCF group.
+    use crate::components::convert::hot_to_ring_bulk;
+    use crate::it_gc::body_batch_garble;
+    let mut rng = rng();
+    for &p_i in &[3u64, 31, 257] {
+        let p = p_i as usize;
+        let identity: Vec<u64> = (0..p_i).collect();
+        for &b in &[2usize, 64, 128] {
+            // Gate path: one NCF group per OHE position over b members.
+            let mut sys = System::new();
+            let h_p: Vec<Wire> = (0..p).map(|_| sys.input(2)).collect();
+            let a_wires: Vec<Wire> =
+                (0..b).map(|_| sys.constant_ncf(rng.random_range(0..p_i), p_i)).collect();
+            let b_wires: Vec<Wire> =
+                (0..b).map(|_| sys.constant_ncf(rng.random_range(0..p_i), p_i)).collect();
+            let _ = hot_to_ring_bulk(&mut sys, &h_p, &identity, &a_wires, &b_wires);
+
+            // Kernel cost for the same (p_i, b).
+            let h_p_masks: Vec<Label> = (0..p).map(|_| sample_cf_mask(&mut rng, 2)).collect();
+            let a_batch: Vec<u64> = (0..b).map(|_| rng.random_range(0..p_i)).collect();
+            let b_batch: Vec<u64> = (0..b).map(|_| rng.random_range(0..p_i)).collect();
+            let g = body_batch_garble(p_i, &h_p_masks, &a_batch, &b_batch, &identity, 0);
+
+            assert_eq!(
+                g.cost.hash_count_ncf, sys.hash_count_ncf,
+                "NCF hash count: kernel vs gate path (p={p_i}, b={b})"
+            );
+            assert_eq!(
+                g.cost.join_complexity_ncf, sys.join_complexity_ncf,
+                "NCF join width: kernel vs gate path (p={p_i}, b={b})"
+            );
+        }
+    }
+}
