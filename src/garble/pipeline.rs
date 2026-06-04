@@ -63,22 +63,7 @@ pub struct PhaseStats {
     pub program_bits: usize,
 }
 
-/// Cost of one externally-garbled batch, recorded via
-/// [`Pipeline::record_kernel_batch`].
-///
-/// The System-bypass body kernel garbles outside [`Pipeline::run_phase`], so it
-/// reports its own program/hash footprint through this struct rather than having
-/// the caller re-derive the formulas. Keeping the numbers next to the gates that
-/// incur them is what stops the two from drifting.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct BatchCost {
-    /// Program bits the garbler emitted for the batch.
-    pub program_bits: usize,
-    /// NCF join width, in bits.
-    pub join_complexity_ncf: usize,
-    /// NCF CCRH block invocations.
-    pub hash_count_ncf: usize,
-}
+use crate::it_gc::BatchCost;
 
 /// Streaming garble + eval orchestrator.
 ///

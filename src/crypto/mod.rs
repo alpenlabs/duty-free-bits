@@ -54,9 +54,10 @@ fn round_keys() -> &'static RoundKeys {
     C.get_or_init(|| backend::expand_key(&CCRH_KEY))
 }
 
-/// AES-CTR expansion under CCRND: fill `output` with pseudorandom bytes derived
-/// from `(seed, nonce)`. Each 16-byte block uses a tweak with `nonce` in the low
-/// 64 bits and a per-block counter in the high 64 bits, so blocks never collide.
+/// AES-CTR expansion under CCRND: fill `output` from `(seed, nonce)`.
+///
+/// Each 16-byte block uses a tweak with `nonce` in the low 64 bits and a per-block
+/// counter in the high 64 bits, so blocks never collide.
 pub fn expand(seed: Block, nonce: u64, output: &mut [u8]) {
     let keys = round_keys();
     let mut counter: u64 = 0;
