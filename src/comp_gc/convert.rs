@@ -1,4 +1,4 @@
-use super::crt::pow2_mod;
+use crate::crt::pow2_mod;
 use super::ohe::{ohe, ohe_scale};
 use crate::system::System;
 use crate::types::*;

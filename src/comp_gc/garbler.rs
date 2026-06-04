@@ -24,8 +24,8 @@
 //! switch-system communication — switches reveal nothing) and appends the
 //! declared output masks.
 
-use super::hash;
-use super::label::{self, Label, NcfLabel};
+use crate::hash;
+use crate::label::{self, Label, NcfLabel};
 use super::program::Program;
 use crate::system::System;
 use crate::types::{GateId, GateType, Wire};

@@ -9,7 +9,7 @@
 //!
 //! `total_bits()` is exactly the paper's `join_width(S) + |Gout|`.
 
-use super::label::Label;
+use crate::label::Label;
 use crate::types::GateId;
 
 /// Garbled program.
@@ -87,7 +87,7 @@ pub fn label_bits(l: &Label) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::super::label::{CfLabel, Label, NcfLabel};
+    use crate::label::{CfLabel, Label, NcfLabel};
     use super::*;
 
     #[test]

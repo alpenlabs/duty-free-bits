@@ -13,25 +13,28 @@
 //! * [`label`] — CF (computational, λ-fold) and NCF (IT, single element) labels. Leaf.
 //! * [`crypto`] — the Label-free CCRH core + nonce discipline (the bridge). Leaf.
 //! * [`hash`] — the label-aware CCRH facade over `crypto`.
-//! * [`system`] + [`garble`] + [`components::ohe`]/[`components::convert`] — the
-//!   computational Yao GC engine (Phase 1: `bin(x)` → one-hot CRT).
+//! * [`system`] + [`comp_gc`] (with builders [`comp_gc::ohe`]/[`comp_gc::convert`])
+//!   — the computational Yao GC engine (Phase 1: `bin(x)` → one-hot CRT).
 //! * [`it_gc`] — the information-theoretic GC (Phase 3: one-hot → `a·x+b`).
-//! * [`components::affine`] — composes the two via the streaming [`garble::Pipeline`].
+//! * [`affine`] — composes the two via the streaming [`pipeline::Pipeline`].
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-/// Higher-level circuit components (builders + the affine composition).
-pub mod components;
+/// The S_aff affine-map driver (composes comp_gc + it_gc via the pipeline).
+pub mod affine;
+
+/// Computational Yao GC over the gate System (Phase 1: bin(x) -> OHE-CRT).
+pub mod comp_gc;
+
+/// CRT parameters, reconstruction, and big-integer math (leaf).
+pub mod crt;
 
 /// CCRH core + nonce discipline (the bridge).
 pub mod crypto;
 
 /// Concrete cleartext execution of a system.
 pub mod exec;
-
-/// Garbling and evaluation (the computational GC engine).
-pub mod garble;
 
 /// Label-aware CCRH facade.
 pub mod hash;
@@ -41,6 +44,9 @@ pub mod it_gc;
 
 /// CF and NCF garbled-circuit labels.
 pub mod label;
+
+/// Streaming garble+eval orchestration.
+pub mod pipeline;
 
 /// The constraint system: wires, gates, derived operations.
 pub mod system;

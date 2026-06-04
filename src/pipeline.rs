@@ -18,9 +18,9 @@
 //! global and the invariant `label = mask + value · Δ_R(modulus)` holds across
 //! phase boundaries.
 
-use super::evaluator::eval_with_labels;
-use super::garbler::{garble, normalize_delta};
-use super::label::{self, CfLabel, LAMBDA, Label};
+use crate::comp_gc::eval_with_labels;
+use crate::comp_gc::{garble, normalize_delta};
+use crate::label::{self, CfLabel, LAMBDA, Label};
 use crate::exec::Exec;
 use crate::system::System;
 use crate::types::{Val, Wire};
