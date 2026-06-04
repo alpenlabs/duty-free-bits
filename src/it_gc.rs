@@ -30,9 +30,22 @@
 //! runs them on the evaluator's labels and consumes it. The two can run in
 //! separate processes.
 
-use crate::garble::hash;
-use crate::garble::{BatchCost, Label};
-use crate::system::LAMBDA_BITS;
+use crate::hash;
+use crate::label::{LAMBDA, Label};
+
+/// Cost of one IT-GC body batch (garbled-material footprint, for telemetry).
+///
+/// The streaming pipeline aggregates it via `Pipeline::record_kernel_batch`. It_gc
+/// owns it so the cost lives next to the gates that incur it and can't drift.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BatchCost {
+    /// Program bits the garbler emitted for the batch (the join diffs).
+    pub program_bits: usize,
+    /// NCF join width, in bits.
+    pub join_complexity_ncf: usize,
+    /// NCF CCRH block invocations.
+    pub hash_count_ncf: usize,
+}
 
 /// Garbler-side output of one body batch, length `B` (one entry per member).
 ///
@@ -105,7 +118,7 @@ fn batch_cost(p_i: u64, b: usize) -> BatchCost {
     BatchCost {
         program_bits: join_bits,
         join_complexity_ncf: join_bits,
-        hash_count_ncf: p_i as usize * join_bits.div_ceil(LAMBDA_BITS),
+        hash_count_ncf: p_i as usize * join_bits.div_ceil(LAMBDA),
     }
 }
 
@@ -205,17 +218,20 @@ fn mod_sub(a: u64, b: u64, p: u64) -> u64 {
 
 #[inline(always)]
 fn mod_mul(a: u64, b: u64, p: u64) -> u64 {
+    // `a, b < p`, so the product fits u64 iff `p ≤ 2^32`. At the concrete params
+    // (primes ≤ 409) this holds with enormous margin; the assert pins it.
+    debug_assert!(p <= (1u64 << 32), "NCF modulus {p} exceeds the u64 fast-path bound");
     (a * b) % p
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::garble::label::CfLabel;
+    use crate::label::CfLabel;
     use rand::Rng;
 
     fn rand_cf2_label<R: Rng>(rng: &mut R) -> Label {
-        let coords: Vec<u64> = (0..crate::garble::label::LAMBDA)
+        let coords: Vec<u64> = (0..crate::label::LAMBDA)
             .map(|_| rng.random_range(0..2u64))
             .collect();
         Label::Cf(CfLabel::from_coords(&coords, 2))

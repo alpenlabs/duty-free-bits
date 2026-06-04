@@ -149,11 +149,15 @@ Dependency DAG (no upward edges): `ring → {cost, crypto} → {comp_gc, it_gc} 
   by role; the affine arms (Add/Sub/Mul/Mod2k/Div2k = homomorphism/subgroup gates) are shared by one helper.
 - **comp_gc and it_gc** are separate schemes (computational vs IT), not one engine with a flag.
 - **The evaluator derives ALL switch controls from its cleartext `x`, in BOTH phases** — this is a uniform
-  global property, NOT a comp_gc/it_gc asymmetry. (Corrects v1/v2's mistaken "it_gc-only" framing.) Neither
-  scheme uses point-and-permute or emits a switch LSB; both evaluators run cleartext control propagation (like
-  `Exec`) alongside label propagation. The only garbled communication is join widths (+ output decode). The
-  comp_gc evaluator therefore needs the cleartext phase inputs (threaded from `x`), not just labels — a real
-  change from today's `eval_with_labels`, validated against `Exec`.
+  global property, NOT a comp_gc/it_gc asymmetry. (Corrects v1/v2's mistaken "it_gc-only" framing.) In the
+  *target* design neither scheme uses point-and-permute or emits a switch LSB; both evaluators run cleartext
+  control propagation (like `Exec`) alongside label propagation, so the only garbled communication is join
+  widths (+ output decode).
+  **Implementation status:** `it_gc` already does this (it takes `hot` from `x` and emits only join diffs). The
+  comp_gc gate engine does NOT yet — it still emits one point-and-permute ctrl LSB per switch (`garbler.rs`
+  `set_switch_lsb`). Those LSBs are *secure and correct* (a revealed LSB is a random mask bit, and the evaluator
+  already knows `x`), just not communication-optimal (~2.5M of 4.1M program bits at scale). Eliminating them is
+  the deferred "zero switch communication" optimization — see the Progress section.
 
 ## 6. Correctness / test strategy (the safety net — landed FIRST, against current code)
 

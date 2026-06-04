@@ -11,8 +11,8 @@
 //! The `nonce` passed to the core is the gate id (solo) or the group id with the
 //! bulk flag set; the caller guarantees freshness (see [`crate::crypto::nonce`]).
 
-use super::label::{self, CfLabel, LAMBDA, Label, NcfLabel};
 use crate::crypto::{Block, expand};
+use crate::label::{self, CfLabel, LAMBDA, Label, NcfLabel};
 use crate::types::GateId;
 
 /// `⌈log₂ modulus⌉` (number of bits needed to represent values < modulus).
@@ -69,6 +69,8 @@ pub fn hash_solo(ctrl_mask: &Label, gid: GateId, out_is_cf: bool, out_modulus: u
         "ctrl mask must be CF Z_2"
     );
     let seed = label_to_block(ctrl_mask);
+    // Bit 63 is the solo/bulk domain flag, so the nonce must leave it clear.
+    debug_assert!((gid as u64) < (1u64 << 63), "switch gid uses the bulk-domain bit");
     let domain = gid as u64; // solo: bit 63 = 0.
     if out_is_cf {
         let k = out_modulus.trailing_zeros() as usize;
@@ -105,6 +107,8 @@ pub fn hash_bulk(ctrl_mask: &Label, group_id: usize, total_bits: usize) -> Vec<u
     );
     let seed = label_to_block(ctrl_mask);
     // Bulk: set bit 63 of the domain to disambiguate from solo.
+    // Below the solo/bulk flag bit, so distinct group ids stay in the bulk domain.
+    debug_assert!((group_id as u64) < (1u64 << 63), "group id uses the bulk-domain bit");
     let domain = (group_id as u64) | (1u64 << 63);
     let mut out = vec![0u8; total_bits.div_ceil(8)];
     expand(seed, domain, &mut out);

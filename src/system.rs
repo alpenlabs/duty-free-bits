@@ -6,7 +6,7 @@ use crate::types::*;
 /// counters; a CF label on Z_{2^k} stores λ coordinates of k bits, so it costs
 /// k hashes. NCF labels in Z_p (p ≤ 409 in our setting) fit in fewer than λ
 /// bits, so an NCF switch fits in one hash.
-pub const LAMBDA_BITS: usize = 128;
+pub const LAMBDA_BITS: usize = crate::label::LAMBDA;
 
 /// The constraint system: holds wires, gates, and propagation queue.
 #[derive(Debug)]

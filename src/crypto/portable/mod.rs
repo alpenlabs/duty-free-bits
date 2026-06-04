@@ -54,8 +54,9 @@ pub fn expand_key(key: &[u8; 16]) -> RoundKeys {
             }
             t[0] ^= RCON[i / 4 - 1];
         }
-        for j in 0..4 {
-            w[i][j] = w[i - 4][j] ^ t[j];
+        let prev = w[i - 4];
+        for (wj, (pj, tj)) in w[i].iter_mut().zip(prev.iter().zip(t.iter())) {
+            *wj = pj ^ tj;
         }
     }
     let mut rk = [[0u8; 16]; 11];

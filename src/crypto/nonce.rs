@@ -36,10 +36,11 @@ impl NonceAllocator {
     }
 }
 
-/// Precompute disjoint windows for independent items (e.g. the per-prime bodies,
-/// which run in parallel): `bases[i]` is the start of a window of `sizes[i]`
-/// nonces, laid out contiguously from `start`. Returned bases never overlap, so
-/// each item can draw its nonces without coordination.
+/// Precompute disjoint nonce windows for independent items.
+///
+/// E.g. the per-prime bodies, which may run in parallel: `bases[i]` is the start
+/// of a window of `sizes[i]` nonces, laid out contiguously from `start`. Returned
+/// bases never overlap, so each item can draw its nonces without coordination.
 pub fn windows(start: u64, sizes: &[u64]) -> Vec<u64> {
     let mut bases = Vec::with_capacity(sizes.len());
     let mut next = start;

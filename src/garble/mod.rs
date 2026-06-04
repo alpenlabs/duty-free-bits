@@ -14,17 +14,19 @@
 pub mod evaluator;
 /// Garbler: build masks, program, and input encoding.
 pub mod garbler;
-/// Correlation-robust hash (CCRND from Eprint 2019/074).
-pub mod hash;
-/// Label types (CF bit-packed + NCF single element).
-pub mod label;
 /// Streaming garble + eval pipeline.
 pub mod pipeline;
 /// Garbled program encoding.
 pub mod program;
 
+// `label` (leaf) and `hash` (facade) now live at the crate root; re-export here
+// so existing `garble::label` / `garble::hash` / `garble::Label` paths keep working.
+pub use crate::hash;
+pub use crate::label;
+
+pub use crate::label::{LAMBDA, Label};
+pub use crate::it_gc::BatchCost;
 pub use evaluator::{eval, eval_with_labels};
 pub use garbler::{garble, normalize_delta};
-pub use label::{LAMBDA, Label};
-pub use pipeline::{BatchCost, CarryId, CarryItem, PhaseStats, Pipeline, sample_cf_mask};
+pub use pipeline::{CarryId, CarryItem, PhaseStats, Pipeline, sample_cf_mask};
 pub use program::Program;
