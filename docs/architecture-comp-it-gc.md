@@ -1,7 +1,23 @@
 # Architecture: Computational GC ∘ Information-Theoretic GC (v2)
 
-Status: **in progress** (branch `feat/comp-it-gc`). Incorporates the
-systems / cryptography / software / audit plan reviews of v1.
+Status: **core separation delivered** (branch `feat/comp-it-gc`); R4 (zero switch
+communication) and R6 (parallelism) deferred. Incorporates the systems /
+cryptography / software / audit plan reviews of v1 and the two implementation
+review rounds (both final lenses: "ship it").
+
+> **As-built vs the v2 plan below.** Sections 2–7 are the *original plan*; the
+> landed implementation intentionally diverges where the plan was over-scoped for
+> a 7.5k-LoC research crate. Concretely: the leaf modules are crate-root
+> `label.rs` + `hash.rs` (not a `ring/` package); there is **no `NcfShare`
+> newtype** (NCF stays `NcfLabel` / raw `u64` with a `≤2^32` debug-assert in the
+> kernel mul); the CCRH core is a **free-fn `crypto::expand`**, not a `Ccrh`
+> trait (the cfg-selected backend is the seam, and `&dyn` was rejected for perf);
+> cost stays `it_gc::BatchCost` (cross-checked against the gate path) rather than
+> a unified `Cost` fold; and **no `comp_gc/` namespace** was built — the
+> computational engine stays in `system.rs` + `garble/` + `components/{ohe,convert}`
+> and is documented as such (the churn wasn't worth it). The dependency story the
+> plan cared about *is* delivered: `it_gc` depends only on `crate::{label, hash}`,
+> not on the comp-GC engine.
 
 ## Progress
 

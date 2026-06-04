@@ -14,7 +14,7 @@
 //!
 //! This module is **`Label`-free**: it operates on `[u8; 16]` blocks only. The
 //! `Label`↔block facade (`hash_solo` / `hash_bulk` / `extract_ncf`) lives in
-//! [`crate::garble::hash`]. The AES backend is target-selected: aarch64 uses
+//! [`crate::hash`]. The AES backend is target-selected: aarch64 uses
 //! NEON/AES-NI; other targets use a portable software AES that is byte-identical.
 
 /// aarch64 NEON/AES-NI backend.
