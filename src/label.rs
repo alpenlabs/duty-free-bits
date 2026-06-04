@@ -359,6 +359,9 @@ pub fn scalar_mul(s: u64, x: &Label) -> Label {
             // (mul-by-coeff with coeff=1 in chunk accumulation, identity truth
             // tables in hot_to_ring_bulk).
             let m = a.modulus;
+            // Binding precondition for the single-u64 product below (matches
+            // `it_gc::mod_mul`): with m ≤ 2^32 and rep < m, s_mod·rep < 2^64.
+            debug_assert!(m <= (1u64 << 32), "NCF scalar_mul modulus {} exceeds 2^32", m);
             let s_mod = if s < m { s } else { s % m };
             if s_mod == 0 {
                 return Label::Ncf(NcfLabel { rep: 0, modulus: m });

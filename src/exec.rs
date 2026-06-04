@@ -1,3 +1,11 @@
+//! Cleartext execution of a [`System`] — the ground-truth semantics.
+//!
+//! `Exec` propagates concrete wire values through the gates (forward and
+//! backward) to fixpoint. It is used two production-relevant ways: the evaluator
+//! runs it on its known input `x` to read switch controls in cleartext (no
+//! reveal — see [`crate::comp_gc::evaluator`]), and the tests use it as the
+//! correctness oracle.
+
 use crate::system::System;
 use crate::types::*;
 
