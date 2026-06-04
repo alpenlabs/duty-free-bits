@@ -33,6 +33,12 @@ existing general gate engine acting as a reference oracle (§6).
 - **Garbler/Evaluator asymmetry** (App. A): Δ appears **only** in the switch output —
   `Y=H(S⊕Δ,gid)+X+(y−x)Δ` (CF) or `+(y−x)` (NCF). Joins: garbler appends `X−Y`,
   evaluator subtracts. Homomorphism/subgroup/pair gates are symmetric `φ`.
+- **Zero switch communication** (§3.3): every switch control is inferrable from the
+  evaluator's cleartext `x` (in BOTH phases), so switches reveal nothing — **no
+  point-and-permute LSB**. The garbled program is exactly the join material (+ output
+  masks for final decode). *The current general engine emits one redundant ctrl LSB per
+  switch (`program.rs:48`); the comp_gc rework removes it by deriving controls from `x`,
+  exactly as `Exec` does — bringing communication to the paper's join-width.*
 - **S_aff stages** (§6.3, App. B): Phase 1 `bin-to-word` (Lemma 6.3, all CF) → free CRT
   accumulation (homomorphism gates, no join width) → sub-chunk extract + fold to a
   length-`p_i` **binary OHE `h_p`** (App. B, CF) → Phase 3 `scale-hot` (Lemma 6.2) +
@@ -119,9 +125,12 @@ Dependency DAG (no upward edges): `ring → {cost, crypto} → {comp_gc, it_gc} 
 - **Garbler vs evaluator** stay two functions *within each module* (App. A asymmetry). Only Switch/Join differ
   by role; the affine arms (Add/Sub/Mul/Mod2k/Div2k = homomorphism/subgroup gates) are shared by one helper.
 - **comp_gc and it_gc** are separate schemes (computational vs IT), not one engine with a flag.
-- **"Evaluator-knows-control" is an it_gc-only, typed, non-defaultable capability**: it_gc's body API *requires*
-  `hot` and emits no ctrl LSB; comp_gc's switch API has no `hot` and an enforced invariant that it **always**
-  emits a ctrl LSB. The relaxation cannot leak into Phase 1, where control privacy is needed.
+- **The evaluator derives ALL switch controls from its cleartext `x`, in BOTH phases** — this is a uniform
+  global property, NOT a comp_gc/it_gc asymmetry. (Corrects v1/v2's mistaken "it_gc-only" framing.) Neither
+  scheme uses point-and-permute or emits a switch LSB; both evaluators run cleartext control propagation (like
+  `Exec`) alongside label propagation. The only garbled communication is join widths (+ output decode). The
+  comp_gc evaluator therefore needs the cleartext phase inputs (threaded from `x`), not just labels — a real
+  change from today's `eval_with_labels`, validated against `Exec`.
 
 ## 6. Correctness / test strategy (the safety net — landed FIRST, against current code)
 
@@ -139,8 +148,12 @@ Dependency DAG (no upward edges): `ring → {cost, crypto} → {comp_gc, it_gc} 
    kernel's per-batch cost equals what the gate-oracle reports for the same sub-circuit (kills the
    `RESIDUE_BATCH_SIZE == λ` coincidence; introduce distinct named constants for the three 128s).
 7. **Production parity** (kept green throughout): `test_streaming_s_aff_matches_all_at_once` + the `N=256 S=1280`
-   scale run — same outputs, same telemetry. Add a **CI-runnable multi-batch variant** (e.g. S≈300) since the
-   current equivalence fixture (S=3) never crosses the 128 boundary and the scale test is `#[ignore]`d.
+   scale run — same **outputs**. Add a **CI-runnable multi-batch variant** (e.g. S≈300) since the current
+   equivalence fixture (S=3) never crosses the 128 boundary and the scale test is `#[ignore]`d.
+8. **Zero switch communication** (paper §3.3): after the comp_gc rework (controls from `x`), assert the garbled
+   program contains **no** switch LSBs — communication = join width (+ output masks). This is a behavior change
+   (program shrinks ~60% at scale) and a paper-faithfulness check; pre-rework the general engine emits one
+   redundant LSB/switch, so this assertion lands *with* the rework, not before it.
 
 ## 7. Migration sequence (reviewer-corrected: net + build FIRST, then stages)
 
@@ -163,7 +176,9 @@ Dependency DAG (no upward edges): `ring → {cost, crypto} → {comp_gc, it_gc} 
 - **R3 — it_gc**: move the kernel to `it_gc/body.rs`, boundary-contract API, nonce windows by value, **explicit
   non-goal: no dependency on comp_gc/system**. Add the it_gc-vs-oracle mask/label differential. Behavior-identical.
 - **R4 — comp_gc**: move System+garbler+evaluator+builders; extract shared `Cost`; share the garbler/evaluator
-  affine arms via one helper. `reference/` keeps the NCF-gate oracle + Exec.
+  affine arms via one helper. **Eliminate point-and-permute**: garbler emits no switch LSB; the evaluator derives
+  every control from cleartext `x` (cleartext propagation in lockstep with labels). Validate against `Exec` +
+  assert program = join width (item 8). `reference/` keeps the NCF-gate oracle + Exec.
 - **R5 — pipeline/affine**: rewire streaming as comp_gc headers → it_gc bodies; **keep `build_s_aff`/`garble`/`eval`
   as public API** (not demoted to oracle). Design the mask+label boundary carry explicitly. Add the three-way sweep.
 - **R6 — parallelism**: per-prime nonce windows + `Send` per-prime state + `par_iter`/`scope` over the 80 primes,
