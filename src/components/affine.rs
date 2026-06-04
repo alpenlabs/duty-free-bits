@@ -15,6 +15,7 @@ use super::convert::{
     bin_to_word, compute_sub_widths, fold_to_mod_ohe, hot_to_ring_bulk, sub_chunk_extract,
 };
 use super::crt::{CrtParams, pow2_mod};
+use crate::crypto::nonce;
 use crate::garble::{CarryId, Pipeline};
 use crate::system::System;
 use crate::types::*;
@@ -226,14 +227,20 @@ pub fn build_s_aff_streaming(
     let sub_widths = compute_sub_widths(ell, MAX_SUB_CHUNK_WIDTH);
     let mut all_outputs: Vec<Vec<u64>> = Vec::with_capacity(params.num_primes);
 
-    // CCRH nonce base for the body switches. Each batch consumes `p_i` distinct
-    // nonces (one per OHE position), so we advance the base by `p_i` after every
-    // batch. This MUST stay globally monotonic: a body switch's pad is
-    // `H(h_p[i], group_id_base + i)`, and reusing a `(seed, nonce)` pair across
-    // batches would reuse the one-time pad masking `a_j` — a two-time-pad break
-    // that leaks differences of the secret coefficients (paper §1.3: the IT
-    // encoding `Σ_i H(L_i^0, nonce) + a` is only hiding when each nonce is fresh).
-    let mut group_id_base = 0usize;
+    // CCRH nonce windows for the body switches. A body switch's pad is
+    // `H(h_p[i], nonce)`; reusing a `(seed, nonce)` pair across batches reuses the
+    // one-time pad masking `a_j` — a two-time-pad break leaking differences of the
+    // secret coefficients (paper §1.3). We give each prime a disjoint window
+    // (`num_batches · p_i` nonces) computed up front, so legality holds by
+    // construction and primes are independent (no shared running counter).
+    let num_batches = s_dim.div_ceil(RESIDUE_BATCH_SIZE);
+    let prime_window_sizes: Vec<u64> = params
+        .primes
+        .iter()
+        .map(|&p| num_batches as u64 * p)
+        .collect();
+    let prime_nonce_bases = nonce::windows(0, &prime_window_sizes);
+
     for (i, &p_i) in params.primes.iter().enumerate() {
         // hot_i = x mod p_i, derived once from x_bits and reused per body batch.
         let hot_i = {
@@ -289,12 +296,14 @@ pub fn build_s_aff_streaming(
             let end = (start + RESIDUE_BATCH_SIZE).min(s_dim);
             let a_batch: Vec<u64> = a_residues[i][start..end].iter().map(|&a| a % p_i).collect();
             let b_batch: Vec<u64> = b_residues[i][start..end].iter().map(|&b| b % p_i).collect();
+            // This batch's fresh nonce block, drawn from the prime's window.
+            let batch_idx = start / RESIDUE_BATCH_SIZE;
+            let nonce_base = prime_nonce_bases[i] as usize + batch_idx * p_i as usize;
 
             // Garbler kernel: emits join diffs, output masks, and the batch cost.
-            // `group_id_base` gives this batch its own fresh block of CCRH nonces.
             let t_garble = std::time::Instant::now();
             let g_out =
-                body_batch_garble(p_i, &h_p_masks, &a_batch, &b_batch, &identity_table, group_id_base);
+                body_batch_garble(p_i, &h_p_masks, &a_batch, &b_batch, &identity_table, nonce_base);
             let garble_secs = t_garble.elapsed().as_secs_f64();
             // Evaluator kernel: consumes the garbler's join diffs, using the same
             // nonce base. `hot_i` comes from cleartext `x_bits`, so no ctrl LSB.
@@ -306,7 +315,7 @@ pub fn build_s_aff_streaming(
                 &g_out.join_diffs,
                 &b_batch,
                 &identity_table,
-                group_id_base,
+                nonce_base,
             );
             let eval_secs = t_eval.elapsed().as_secs_f64();
 
@@ -321,8 +330,6 @@ pub fn build_s_aff_streaming(
             }
 
             pipeline.record_kernel_batch(garble_secs, eval_secs, g_out.cost);
-            // Advance past the `p_i` nonces this batch just consumed.
-            group_id_base += p_i as usize;
             start = end;
         }
 
