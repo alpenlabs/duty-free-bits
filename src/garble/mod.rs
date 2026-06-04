@@ -3,7 +3,8 @@
 //! Entry points:
 //! * [`garbler::garble`] — turn a `System` + input/output wire declarations into
 //!   a garbled program.
-//! * [`evaluator::eval`] — decode the garbled program at the evaluator's input.
+//! * [`evaluator::eval_with_labels`] — propagate evaluator labels through the
+//!   garbled program at the label level.
 //! * [`pipeline::Pipeline`] — streaming garble+eval that processes the
 //!   computation phase by phase, dropping intermediate state at each boundary.
 //!
@@ -26,7 +27,7 @@ pub use crate::label;
 
 pub use crate::label::{LAMBDA, Label};
 pub use crate::it_gc::BatchCost;
-pub use evaluator::{eval, eval_with_labels};
+pub use evaluator::eval_with_labels;
 pub use garbler::{garble, normalize_delta};
 pub use pipeline::{CarryId, CarryItem, PhaseStats, Pipeline, sample_cf_mask};
 pub use program::Program;

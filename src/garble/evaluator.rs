@@ -11,7 +11,7 @@ use super::hash;
 use super::label::{self, Label};
 use super::program::{GateMaterial, Program};
 use crate::system::System;
-use crate::types::{GateId, GateType, Val, Wire};
+use crate::types::{GateId, GateType, Wire};
 
 /// Lazy cache for per-group bulk-hash outputs (mirrors the garbler's cache).
 type BulkCache = Vec<Option<Vec<u8>>>;
@@ -40,57 +40,6 @@ fn switch_hash(
     } else {
         hash::hash_solo(ctrl_label, gid, system.is_cf(g.out), system.modulus(g.out))
     }
-}
-
-/// Evaluate a garbled system, decoding NCF outputs into concrete values.
-///
-/// Thin wrapper around [`eval_with_labels`]: converts (value, mask) inputs to
-/// labels, propagates, then decodes output labels by subtracting their masks
-/// (sourced from `program.output_masks()`).
-pub fn eval(
-    system: &System,
-    input_wires: &[Wire],
-    input_values: &[Val],
-    delta: u128,
-    input_masks: &[Label],
-    program: &Program,
-    output_wires: &[Wire],
-) -> Vec<Val> {
-    assert_eq!(input_wires.len(), input_values.len());
-    assert_eq!(input_wires.len(), input_masks.len());
-
-    // input labels = mask + value · Δ_R(modulus)
-    let input_labels: Vec<Label> = input_values
-        .iter()
-        .zip(input_masks.iter())
-        .map(|(val, mask)| {
-            let d = label::delta_r(delta, val.modulus);
-            let contrib = label::scalar_mul(val.v, &Label::Cf(d));
-            label::add(mask, &contrib)
-        })
-        .collect();
-
-    let output_labels = eval_with_labels(
-        system,
-        input_wires,
-        &input_labels,
-        delta,
-        program,
-        output_wires,
-    );
-
-    output_labels
-        .into_iter()
-        .enumerate()
-        .map(|(i, lbl)| {
-            let out_mask = &program.output_masks()[i];
-            let stripped = label::sub(&lbl, out_mask);
-            match stripped {
-                Label::Ncf(n) => Val::new(n.rep, n.modulus),
-                Label::Cf(_) => panic!("output wire {} must be NCF", output_wires[i].wid),
-            }
-        })
-        .collect()
 }
 
 /// Evaluate a garbled system at the label level.

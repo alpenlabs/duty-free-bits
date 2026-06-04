@@ -1,139 +1,29 @@
-/// Switch system for evaluating affine maps over a primorial ring.
-///
-/// Given an n-bit input x and coefficients (a, b) reduced mod each CRT prime,
-/// computes a·x + b in Z_M (where M = Π p_i) via three steps:
-///
-///   1. Chunk conversion: partition n bits into ⌈n/lg n⌉ chunks, convert each
-///      to a word in Z_{2^ℓ} via `bin_to_word`.
-///   2. Free accumulation: for each prime p_i, compute r_i ≡ x (mod p_i) in
-///      Z_{2^ℓ} as a weighted sum of chunk words.
-///   3. Residue evaluation: for each prime, decompose the ℓ-bit residue via
-///      sub-chunk extraction into a length-p_i OHE of r_i mod p_i,
-///      then evaluate a · (r_i mod p_i) + b via `hot_to_ring`.
-use crate::it_gc::{body_batch_eval, body_batch_garble};
-use super::convert::{
-    bin_to_word, compute_sub_widths, fold_to_mod_ohe, hot_to_ring_bulk, sub_chunk_extract,
-};
+//! Streaming switch system for evaluating affine maps over a primorial ring.
+//!
+//! Given an n-bit input x and coefficients (a, b) reduced mod each CRT prime,
+//! computes a·x + b in Z_M (where M = Π p_i) via three phases:
+//!
+//!   1. Chunk conversion: partition n bits into ⌈n/lg n⌉ chunks, convert each to
+//!      a word in Z_{2^ℓ} via `bin_to_word`.
+//!   2. Free accumulation + fold: for each prime p_i, compute r_i ≡ x (mod p_i),
+//!      sub-chunk-extract, and fold to a length-p_i binary one-hot `h_p` of
+//!      x mod p_i (the computational GC, Phase 1).
+//!   3. Residue evaluation: the information-theoretic GC ([`crate::it_gc`])
+//!      delivers a · (x mod p_i) + b from `h_p` (Phase 3).
+//!
+//! [`build_s_aff_streaming`] runs these phase-by-phase via a [`Pipeline`],
+//! dropping intermediate state at each boundary.
+
+use super::convert::{bin_to_word, compute_sub_widths, fold_to_mod_ohe, sub_chunk_extract};
 use super::crt::{CrtParams, pow2_mod};
 use crate::crypto::nonce;
 use crate::garble::{CarryId, Pipeline};
-use crate::system::System;
+use crate::it_gc::{body_batch_eval, body_batch_garble};
 use crate::types::*;
 
 /// Maximum sub-chunk width for the sub-chunk extraction optimization.
 /// 2^8 = 256 OHE entries per sub-chunk.
 const MAX_SUB_CHUNK_WIDTH: u32 = 8;
-
-/// Output of the affine switch system: `outputs[i][j]` is the j-th component's
-/// result reduced mod the i-th CRT prime.
-#[derive(Debug)]
-pub struct AffineOutput {
-    /// `outputs[i][j]` is a wire in Z_{p_i} for the j-th affine component.
-    pub outputs: Vec<Vec<Wire>>,
-}
-
-/// Chunk the n-bit input and accumulate CRT residues (steps 1–2).
-///
-/// Returns one wire per prime in Z_{2^ℓ}, holding a value ≡ x (mod p_i).
-pub fn chunk_and_accumulate(
-    sys: &mut System,
-    input_bits: &[Wire],
-    params: &CrtParams,
-) -> Vec<Wire> {
-    let n = input_bits.len();
-    assert_eq!(n, params.n as usize);
-
-    let ell = params.ell;
-    let chunk_size = params.chunk_size as usize;
-    let work_mod = 1u64 << ell;
-
-    // Step 1: partition into chunks, convert each to a word in Z_{2^ℓ}.
-    let mut chunks: Vec<Wire> = Vec::with_capacity(params.num_chunks);
-    for c in 0..params.num_chunks {
-        let start = c * chunk_size;
-        let end = (start + chunk_size).min(n);
-        let chunk_bits = &input_bits[start..end];
-
-        if chunk_bits.len() < chunk_size {
-            let mut padded = chunk_bits.to_vec();
-            let zero_bit = sys.constant(0, 2);
-            while padded.len() < chunk_size {
-                padded.push(zero_bit);
-            }
-            chunks.push(bin_to_word(sys, &padded, ell));
-        } else {
-            chunks.push(bin_to_word(sys, chunk_bits, ell));
-        }
-    }
-
-    // Step 2: for each prime, r_i = Σ_c (2^{c·chunk_size} mod p_i) · w_c.
-    let mut residues = Vec::with_capacity(params.num_primes);
-    for &p_i in &params.primes {
-        let mut r_i = sys.constant(0, work_mod);
-        for (c, &w_c) in chunks.iter().enumerate() {
-            let coeff = pow2_mod((c * chunk_size) as u32, p_i);
-            if coeff > 0 {
-                let term = sys.mul(coeff, w_c);
-                r_i = sys.add(r_i, term);
-            }
-        }
-        residues.push(r_i);
-    }
-
-    residues
-}
-
-/// Build the full affine switch system over the primorial ring.
-///
-/// Evaluates S affine maps a_j·x + b_j in Z_M for each component j.
-/// `a_residues[i][j]` and `b_residues[i][j]` are the j-th component's
-/// coefficients reduced mod the i-th CRT prime.
-pub fn build_s_aff(
-    sys: &mut System,
-    input_bits: &[Wire],
-    params: &CrtParams,
-    a_residues: &[Vec<u64>],
-    b_residues: &[Vec<u64>],
-) -> AffineOutput {
-    assert_eq!(a_residues.len(), params.num_primes);
-    assert_eq!(b_residues.len(), params.num_primes);
-    let s_dim = a_residues[0].len();
-    for i in 0..params.num_primes {
-        assert_eq!(a_residues[i].len(), s_dim);
-        assert_eq!(b_residues[i].len(), s_dim);
-    }
-
-    let ell = params.ell;
-    let residue_wires = chunk_and_accumulate(sys, input_bits, params);
-
-    // Step 3: for each prime, evaluate a · (r_i mod p_i) + b via sub-chunk extraction.
-    let sub_widths = compute_sub_widths(ell, MAX_SUB_CHUNK_WIDTH);
-
-    let mut all_outputs = Vec::with_capacity(params.num_primes);
-    for (i, &p_i) in params.primes.iter().enumerate() {
-        // Phase 1 + 2: shared across all S components for this prime.
-        let extraction = sub_chunk_extract(sys, residue_wires[i], &sub_widths);
-        let h_p = fold_to_mod_ohe(sys, &extraction, p_i);
-
-        let identity_table: Vec<u64> = (0..p_i).collect();
-        // Force NCF for the coefficient constants so the pipeline propagates
-        // NCF all the way to the output — necessary when p_i = 2 (Z_2 is
-        // power-of-two and would otherwise default to CF). The bulk variant
-        // packs the S switches sharing each `h_p[k]` into one CCRH call.
-        let a_wires: Vec<Wire> = (0..s_dim)
-            .map(|j| sys.constant_ncf(a_residues[i][j] % p_i, p_i))
-            .collect();
-        let b_wires: Vec<Wire> = (0..s_dim)
-            .map(|j| sys.constant_ncf(b_residues[i][j] % p_i, p_i))
-            .collect();
-        let prime_outputs = hot_to_ring_bulk(sys, &h_p, &identity_table, &a_wires, &b_wires);
-        all_outputs.push(prime_outputs);
-    }
-
-    AffineOutput {
-        outputs: all_outputs,
-    }
-}
 
 /// S-batch size for the streaming residue body.
 ///

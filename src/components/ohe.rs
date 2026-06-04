@@ -24,64 +24,6 @@ pub fn ohe_scale(sys: &mut System, h: &[Wire], s: Wire) -> Vec<Wire> {
     out
 }
 
-/// Bulk version of [`ohe_scale`]: scales the same OHE `h` by `S` scalars
-/// simultaneously. Returns a `|h| × S` matrix where `out[i][j] = h[i] ? scalars[j] : 0`.
-///
-/// All scalars must share modulus and kind. When the scalars are NCF and
-/// `S > 1`, the per-`h[i]` family of `S` switches (which all share the
-/// control wire `h[i]`) is registered as one [`SwitchGroup`]. The garbler/
-/// evaluator then derives all members' hashes from a single wide CCRH call,
-/// rebating the NCF hash count from `|h|·S` to `|h|·⌈S·lg|R| / λ⌉`.
-pub fn ohe_scale_bulk(sys: &mut System, h: &[Wire], scalars: &[Wire]) -> Vec<Vec<Wire>> {
-    let s_dim = scalars.len();
-    if s_dim == 0 {
-        return (0..h.len()).map(|_| Vec::new()).collect();
-    }
-    let modulus = sys.modulus(scalars[0]);
-    let is_cf = sys.is_cf(scalars[0]);
-    for &s in scalars {
-        assert_eq!(sys.modulus(s), modulus, "ohe_scale_bulk: modulus mismatch");
-        assert_eq!(sys.is_cf(s), is_cf, "ohe_scale_bulk: CF/NCF mismatch");
-    }
-
-    // Build S parallel ohe_scales, capturing the per-call switch gate ids.
-    // cols[j][i] is the i-th output wire for scalar j; switch_gids[j][i] is
-    // its switch gate id.
-    let mut cols: Vec<Vec<Wire>> = Vec::with_capacity(s_dim);
-    let mut switch_gids: Vec<Vec<GateId>> = Vec::with_capacity(s_dim);
-    for &s in scalars {
-        let z = sys.constant_matching(0, s);
-        let mut out = Vec::with_capacity(h.len());
-        let mut gids = Vec::with_capacity(h.len());
-        let mut acc = z;
-        for &h_i in h {
-            let pre_gid = sys.num_gates();
-            let o = sys.switch(z, h_i);
-            out.push(o);
-            gids.push(pre_gid);
-            acc = sys.add(acc, o);
-        }
-        sys.join(acc, s);
-        cols.push(out);
-        switch_gids.push(gids);
-    }
-
-    // Register one NCF group per OHE position. Skip when scalars are CF (no
-    // packing benefit — each CF switch already costs k hashes regardless) or
-    // when S=1 (singleton group is just bookkeeping noise; cost is unchanged).
-    if !is_cf && s_dim > 1 {
-        for (i, &h_i) in h.iter().enumerate() {
-            let members: Vec<GateId> = (0..s_dim).map(|j| switch_gids[j][i]).collect();
-            sys.register_ncf_switch_group(h_i, members);
-        }
-    }
-
-    // Transpose cols (S × |h|) into row-major (|h| × S).
-    (0..h.len())
-        .map(|i| (0..s_dim).map(|j| cols[j][i]).collect())
-        .collect()
-}
-
 /// Build a binary one-hot encoding from binary wires x[0..n].
 /// Output: 2^n entries in Z_2.
 /// The OHE entry at index bin^{-1}(x) is 1, all others 0.
