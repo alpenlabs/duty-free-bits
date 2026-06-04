@@ -20,8 +20,6 @@ use std::mem::transmute;
 
 mod expand;
 
-use expand::expand_key;
-
 /// Pre-expanded AES-128 round keys (11 round keys for the standard schedule).
 pub type Aes128RoundKeys = expand::Aes128RoundKeys;
 
@@ -31,7 +29,7 @@ pub type Aes128RoundKeys = expand::Aes128RoundKeys;
 /// CPU must support `aes` target feature.
 #[target_feature(enable = "aes")]
 pub unsafe fn expand_aes128_key(key: &[u8; 16]) -> Aes128RoundKeys {
-    unsafe { expand_key::<16, 11>(key) }
+    unsafe { expand::expand_key::<16, 11>(key) }
 }
 
 /// XOR of two 128-bit values.
@@ -117,6 +115,30 @@ pub unsafe fn ccrnd_with_round_keys(
 #[inline]
 pub unsafe fn bytes_to_block(bytes: [u8; 16]) -> uint8x16_t {
     unsafe { transmute(bytes) }
+}
+
+// --- Backend surface (`[u8; 16]` boundary), shared with the portable backend. ---
+
+/// Pre-expanded AES-128 round keys.
+pub type RoundKeys = Aes128RoundKeys;
+
+/// AES-128 key expansion. Safe wrapper — aarch64-apple targets always carry the
+/// `aes` feature (ARMv8 crypto extensions).
+pub fn expand_key(key: &[u8; 16]) -> RoundKeys {
+    unsafe { expand_aes128_key(key) }
+}
+
+/// CCRND hash on `[u8; 16]` blocks (NEON/AES-NI internally).
+pub fn ccrnd(seed: [u8; 16], tweak: [u8; 16], rk: &RoundKeys, public_s: [u8; 16]) -> [u8; 16] {
+    unsafe {
+        let out = ccrnd_with_round_keys(
+            bytes_to_block(seed),
+            bytes_to_block(tweak),
+            rk,
+            bytes_to_block(public_s),
+        );
+        transmute::<uint8x16_t, [u8; 16]>(out)
+    }
 }
 
 #[cfg(test)]
