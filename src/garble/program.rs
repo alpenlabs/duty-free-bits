@@ -1,33 +1,22 @@
 //! Garbled program encoding.
 //!
-//! The program carries:
-//! * one **switch LSB** per `Switch` gate — the low bit of its control-wire mask.
-//!   With point-and-permute (`Δ` forced to have low bit 1), XORing this with the
-//!   evaluator's ctrl label lsb recovers the ctrl value in the clear.
+//! Switches contribute **zero** communication: the evaluator knows the input `x`
+//! in cleartext, so it derives every switch control itself (paper §3.3) — nothing
+//! is revealed. The program therefore carries only:
 //! * one **join diff** (`X_in0 − X_in1`) per `Join` gate, letting the evaluator
 //!   translate between the two sides' masks.
 //! * one **output mask** per declared NCF output wire.
 //!
-//! `total_bits()` equals the paper's `join_width(S) + |Gout|` plus a negligible
-//! 1-bit-per-switch overhead for ctrl LSBs.
+//! `total_bits()` is exactly the paper's `join_width(S) + |Gout|`.
 
 use super::label::Label;
 use crate::types::GateId;
 
-/// Per-gate material.
-#[derive(Clone, Debug)]
-pub enum GateMaterial {
-    /// Low bit of the control-wire mask for a switch (point-and-permute).
-    SwitchLsb(bool),
-    /// `X_in0 − X_in1` for a join gate.
-    JoinDiff(Label),
-}
-
 /// Garbled program.
 #[derive(Clone, Debug, Default)]
 pub struct Program {
-    /// Material indexed by gate id. `None` for gates that emit nothing.
-    per_gate: Vec<Option<GateMaterial>>,
+    /// Join diff `X_in0 − X_in1` per gate id; `None` for non-join gates.
+    join_diffs: Vec<Option<Label>>,
     /// One mask per declared output wire, in the caller's order.
     output_masks: Vec<Label>,
     /// Accumulated bit count.
@@ -38,32 +27,21 @@ impl Program {
     /// New program sized for `num_gates`.
     pub fn with_num_gates(num_gates: usize) -> Self {
         Self {
-            per_gate: vec![None; num_gates],
+            join_diffs: vec![None; num_gates],
             output_masks: Vec::new(),
             bits: 0,
         }
     }
 
-    /// Record a switch's control LSB.
-    pub fn set_switch_lsb(&mut self, gid: GateId, lsb: bool) {
-        assert!(
-            self.per_gate[gid].is_none(),
-            "per-gate material already set for gate {}",
-            gid
-        );
-        self.per_gate[gid] = Some(GateMaterial::SwitchLsb(lsb));
-        self.bits += 1;
-    }
-
     /// Record a join's mask difference.
     pub fn set_join_diff(&mut self, gid: GateId, diff: Label) {
         assert!(
-            self.per_gate[gid].is_none(),
-            "per-gate material already set for gate {}",
+            self.join_diffs[gid].is_none(),
+            "join diff already set for gate {}",
             gid
         );
         self.bits += label_bits(&diff);
-        self.per_gate[gid] = Some(GateMaterial::JoinDiff(diff));
+        self.join_diffs[gid] = Some(diff);
     }
 
     /// Append an output mask.
@@ -72,9 +50,9 @@ impl Program {
         self.output_masks.push(mask);
     }
 
-    /// Lookup per-gate material for a switch or join.
-    pub fn material(&self, gid: GateId) -> Option<&GateMaterial> {
-        self.per_gate[gid].as_ref()
+    /// The join diff for a join gate (`None` if the gate emitted nothing).
+    pub fn join_diff(&self, gid: GateId) -> Option<&Label> {
+        self.join_diffs[gid].as_ref()
     }
 
     /// Output masks in declaration order.
@@ -120,21 +98,12 @@ mod tests {
     }
 
     #[test]
-    fn test_switch_lsb_one_bit() {
-        let mut p = Program::with_num_gates(3);
-        p.set_switch_lsb(1, true);
-        assert_eq!(p.total_bits(), 1);
-        assert!(matches!(
-            p.material(1),
-            Some(GateMaterial::SwitchLsb(true))
-        ));
-    }
-
-    #[test]
     fn test_join_diff_size() {
         let mut p = Program::with_num_gates(2);
         p.set_join_diff(0, Label::Cf(CfLabel::zero(1 << 22)));
         assert_eq!(p.total_bits(), 128 * 22);
+        assert!(p.join_diff(0).is_some());
+        assert!(p.join_diff(1).is_none());
     }
 
     #[test]

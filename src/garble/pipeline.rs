@@ -1,29 +1,29 @@
 //! Streaming garble + eval pipeline.
 //!
-//! The all-at-once `garble` + `eval` pair holds every wire's mask and label
-//! in memory until the whole computation is done. For large workloads (e.g.
-//! `build_s_aff` at n=256, S=1280) that's tens of millions of wires alive
-//! simultaneously even though almost all are short-lived intermediates.
-//!
-//! `Pipeline` instead executes the computation as a sequence of *phases*:
+//! Garbling the whole computation as one `System` would hold every wire's mask
+//! and label in memory at once — at n=256, S=1280 that is tens of millions of
+//! wires alive simultaneously, almost all short-lived intermediates. `Pipeline`
+//! instead executes the computation as a sequence of *phases*:
 //!
 //! 1. Allocate a fresh `System` for the phase.
-//! 2. Re-bind a small carry-forward set of `(mask, label)` pairs from
+//! 2. Re-bind a small carry-forward set of `(mask, label, value)` triples from
 //!    previous phases as the new System's input wires.
 //! 3. Run the caller's gate-construction closure.
-//! 4. Garble + evaluate the sub-System.
-//! 5. Extract `(mask, label)` for the wires the caller declares as outputs.
+//! 4. Garble + evaluate the sub-System (the evaluator runs a cleartext `Exec`
+//!    pass over the carried values to read switch controls — no reveal).
+//! 5. Extract `(mask, label, value)` for the wires the caller declares as outputs.
 //! 6. Drop the System; only the new carry items survive.
 //!
-//! Peak memory collapses to the largest single phase plus the carry set.
-//! Correctness is unchanged: Δ is global and the invariant
-//! `label = mask + value · Δ_R(modulus)` holds across phase boundaries.
+//! Peak memory collapses to the largest single phase plus the carry set. Δ is
+//! global and the invariant `label = mask + value · Δ_R(modulus)` holds across
+//! phase boundaries.
 
 use super::evaluator::eval_with_labels;
 use super::garbler::{garble, normalize_delta};
 use super::label::{self, CfLabel, LAMBDA, Label};
+use crate::exec::Exec;
 use crate::system::System;
-use crate::types::Wire;
+use crate::types::{Val, Wire};
 use rand::Rng;
 
 /// Identifier for a carry-forward wire in the pipeline.
@@ -32,10 +32,9 @@ pub type CarryId = usize;
 /// One carry-forward wire's state.
 ///
 /// `mask` is the garbler's value for the wire; `label` is the evaluator's.
-/// They satisfy `label = mask + value · Δ_R(modulus)`. When a subsequent
-/// phase allocates an input wire backed by this carry, the new System's
-/// garbler-side mask vector and evaluator-side label vector are seeded with
-/// these.
+/// They satisfy `label = mask + value · Δ_R(modulus)`. `value` is the wire's
+/// cleartext value, known to the evaluator (it knows `x`) — it seeds the next
+/// phase's `Exec` so the evaluator can read switch controls without any reveal.
 #[derive(Clone, Debug)]
 pub struct CarryItem {
     /// Modulus of the wire's ring.
@@ -46,6 +45,8 @@ pub struct CarryItem {
     pub mask: Label,
     /// Evaluator's label (= mask + value · Δ_R).
     pub label: Label,
+    /// Cleartext value of the wire.
+    pub value: u64,
 }
 
 /// Per-phase telemetry.
@@ -73,7 +74,7 @@ use crate::it_gc::BatchCost;
 /// with [`decode_ncf`](Pipeline::decode_ncf).
 #[derive(Debug)]
 pub struct Pipeline {
-    /// Global Δ (low bit forced to 1 for point-and-permute).
+    /// Global Free-XOR Δ (low bit forced to 1; see `normalize_delta`).
     pub delta: u128,
     /// Carry slots; `None` after [`drop_carry`](Pipeline::drop_carry).
     carry: Vec<Option<CarryItem>>,
@@ -156,6 +157,7 @@ impl Pipeline {
             is_cf: true,
             mask,
             label,
+            value,
         })
     }
 
@@ -221,20 +223,30 @@ impl Pipeline {
         let program = garble(&sys, &input_wires, &input_masks, &output_wires, self.delta);
         self.garble_secs += t_garble.elapsed().as_secs_f64();
 
-        // Evaluate.
+        // Evaluate. The evaluator knows x, so it runs a cleartext `Exec` pass to
+        // obtain every switch control (paper §3.3 — no reveal), then propagates
+        // labels. The same pass yields the output wires' cleartext values.
         let input_labels: Vec<Label> = inputs
             .iter()
             .map(|&id| self.carry(id).label.clone())
             .collect();
         let t_eval = std::time::Instant::now();
+        let mut exec = Exec::new(&sys);
+        for (&w, &id) in input_wires.iter().zip(inputs) {
+            let item = self.carry(id);
+            exec.set(w, Val::new(item.value, item.modulus));
+        }
+        exec.run();
         let output_labels = eval_with_labels(
             &sys,
             &input_wires,
             &input_labels,
+            exec.values(),
             self.delta,
             &program,
             &output_wires,
         );
+        let output_values: Vec<u64> = output_wires.iter().map(|&w| exec.get(w).v).collect();
         self.eval_secs += t_eval.elapsed().as_secs_f64();
 
         // Output masks live in the program in declaration order.
@@ -267,12 +279,14 @@ impl Pipeline {
             .iter()
             .zip(output_masks)
             .zip(output_labels)
-            .map(|((&w, mask), label)| {
+            .zip(output_values)
+            .map(|(((&w, mask), label), value)| {
                 self.push_carry(CarryItem {
                     modulus: sys.modulus(w),
                     is_cf: sys.is_cf(w),
                     mask,
                     label,
+                    value,
                 })
             })
             .collect();
