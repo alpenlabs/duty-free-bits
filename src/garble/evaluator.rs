@@ -13,7 +13,40 @@ use super::program::{GateMaterial, Program};
 use crate::system::System;
 use crate::types::{GateId, GateType, Val, Wire};
 
-/// Evaluate a garbled system.
+/// Lazy cache for per-group bulk-hash outputs (mirrors the garbler's cache).
+type BulkCache = Vec<Option<Vec<u8>>>;
+
+/// Resolve the H value for a switch gate, packing across group members
+/// when the gate is registered in a [`SwitchGroup`].
+fn switch_hash(
+    system: &System,
+    gid: GateId,
+    ctrl_label: &Label,
+    bulk_cache: &mut BulkCache,
+) -> Label {
+    let g = system.gates[gid];
+    if let Some((group_idx, member_idx)) = system.gate_group(gid) {
+        let group = system.switch_group(group_idx);
+        let lg_m = hash::lg_modulus(group.modulus);
+        if bulk_cache[group_idx].is_none() {
+            bulk_cache[group_idx] = Some(hash::hash_bulk(
+                ctrl_label,
+                group_idx,
+                group.members.len() * lg_m,
+            ));
+        }
+        let wide = bulk_cache[group_idx].as_ref().unwrap();
+        hash::extract_ncf(wide, member_idx, group.modulus)
+    } else {
+        hash::hash_solo(ctrl_label, gid, system.is_cf(g.out), system.modulus(g.out))
+    }
+}
+
+/// Evaluate a garbled system, decoding NCF outputs into concrete values.
+///
+/// Thin wrapper around [`eval_with_labels`]: converts (value, mask) inputs to
+/// labels, propagates, then decodes output labels by subtracting their masks
+/// (sourced from `program.output_masks()`).
 pub fn eval(
     system: &System,
     input_wires: &[Wire],
@@ -25,6 +58,60 @@ pub fn eval(
 ) -> Vec<Val> {
     assert_eq!(input_wires.len(), input_values.len());
     assert_eq!(input_wires.len(), input_masks.len());
+
+    // input labels = mask + value · Δ_R(modulus)
+    let input_labels: Vec<Label> = input_values
+        .iter()
+        .zip(input_masks.iter())
+        .map(|(val, mask)| {
+            let d = label::delta_r(delta, val.modulus);
+            let contrib = label::scalar_mul(val.v, &Label::Cf(d));
+            label::add(mask, &contrib)
+        })
+        .collect();
+
+    let output_labels = eval_with_labels(
+        system,
+        input_wires,
+        &input_labels,
+        delta,
+        program,
+        output_wires,
+    );
+
+    output_labels
+        .into_iter()
+        .enumerate()
+        .map(|(i, lbl)| {
+            let out_mask = &program.output_masks()[i];
+            let stripped = label::sub(&lbl, out_mask);
+            match stripped {
+                Label::Ncf(n) => Val::new(n.rep, n.modulus),
+                Label::Cf(_) => panic!("output wire {} must be NCF", output_wires[i].wid),
+            }
+        })
+        .collect()
+}
+
+/// Evaluate a garbled system at the label level.
+///
+/// Takes the evaluator's labels for inputs (already including value·Δ_R) and
+/// returns the labels of the requested output wires. No mask-subtraction or
+/// value decoding — the caller is responsible for converting labels back to
+/// values when (and if) needed. This is the form used by [`Pipeline`] for
+/// streaming garble+eval, where each phase's outputs are carry-forward labels
+/// that get re-seeded into the next phase.
+///
+/// [`Pipeline`]: crate::garble::pipeline::Pipeline
+pub fn eval_with_labels(
+    system: &System,
+    input_wires: &[Wire],
+    input_labels: &[Label],
+    delta: u128,
+    program: &Program,
+    output_wires: &[Wire],
+) -> Vec<Label> {
+    assert_eq!(input_wires.len(), input_labels.len());
     assert_eq!(delta & 1, 1, "Δ must have low bit 1");
 
     let mut labels: Vec<Option<Label>> = vec![None; system.num_wires()];
@@ -38,17 +125,10 @@ pub fn eval(
         *slot = Some(Label::zero(system.is_cf_flags[wid], v.modulus));
     }
 
-    // Inputs: label = mask + value · Δ_R.
-    for ((&w, &val), mask) in input_wires
-        .iter()
-        .zip(input_values.iter())
-        .zip(input_masks.iter())
-    {
-        assert_eq!(val.modulus, system.modulus(w));
-        assert!(val.defined);
-        let d = label::delta_r(delta, val.modulus);
-        let contrib = label::scalar_mul(val.v, &Label::Cf(d));
-        labels[w.wid] = Some(label::add(mask, &contrib));
+    // Inputs: caller-provided labels.
+    for (&w, lbl) in input_wires.iter().zip(input_labels.iter()) {
+        assert_eq!(lbl.modulus(), system.modulus(w), "input label modulus mismatch");
+        labels[w.wid] = Some(lbl.clone());
     }
 
     // Seed worklist: every gate subscribed to a currently-labeled wire.
@@ -60,24 +140,20 @@ pub fn eval(
     }
 
     // Propagate.
+    let mut bulk_cache: BulkCache = vec![None; system.num_switch_groups()];
     while let Some(gid) = queue.pop() {
-        fire_gate(system, gid, &mut labels, program, &mut queue);
+        fire_gate(system, gid, &mut labels, program, &mut queue, &mut bulk_cache);
     }
 
-    // Decode outputs.
-    let mut out = Vec::with_capacity(output_wires.len());
-    for (i, &w) in output_wires.iter().enumerate() {
-        let out_mask = &program.output_masks()[i];
-        let lbl = labels[w.wid]
-            .clone()
-            .unwrap_or_else(|| panic!("no label on output wire {}", w.wid));
-        let stripped = label::sub(&lbl, out_mask);
-        match stripped {
-            Label::Ncf(n) => out.push(Val::new(n.rep, n.modulus)),
-            Label::Cf(_) => panic!("output wire {} must be NCF", w.wid),
-        }
-    }
-    out
+    // Pull out labels for the requested outputs.
+    output_wires
+        .iter()
+        .map(|&w| {
+            labels[w.wid]
+                .clone()
+                .unwrap_or_else(|| panic!("no label on output wire {}", w.wid))
+        })
+        .collect()
 }
 
 fn fire_gate(
@@ -86,6 +162,7 @@ fn fire_gate(
     labels: &mut [Option<Label>],
     program: &Program,
     queue: &mut Vec<GateId>,
+    bulk_cache: &mut BulkCache,
 ) {
     let g = system.gates[gid];
     let lin0 = labels[g.in0.wid].clone();
@@ -170,8 +247,9 @@ fn fire_gate(
                 // Switch does not fire: no label propagation.
                 return;
             }
-            // ctrl = 0: propagate in either direction via H(ctrl_label, gid).
-            let h = hash::hash(&ctrl_label, gid, system.is_cf(g.out), system.modulus(g.out));
+            // ctrl = 0: propagate in either direction via H. For grouped
+            // switches, H is sliced from a single wide bulk call.
+            let h = switch_hash(system, gid, &ctrl_label, bulk_cache);
             // Forward: out = in0 + H.
             if let Some(din) = &lin0 {
                 try_set(labels, g.out, label::add(din, &h), queue, system);

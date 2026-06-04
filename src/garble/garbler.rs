@@ -29,6 +29,36 @@ use super::program::Program;
 use crate::system::System;
 use crate::types::{GateId, GateType, Wire};
 
+/// Lazy cache for per-group bulk-hash outputs. `bulk_cache[group_idx]` is
+/// computed on first use and reused for every member of that group.
+type BulkCache = Vec<Option<Vec<u8>>>;
+
+/// Resolve the H value for a switch gate, packing across group members
+/// when the gate is registered in a [`SwitchGroup`].
+fn switch_hash(
+    system: &System,
+    gid: GateId,
+    ctrl_mask: &Label,
+    bulk_cache: &mut BulkCache,
+) -> Label {
+    let g = system.gates[gid];
+    if let Some((group_idx, member_idx)) = system.gate_group(gid) {
+        let group = system.switch_group(group_idx);
+        let lg_m = hash::lg_modulus(group.modulus);
+        if bulk_cache[group_idx].is_none() {
+            bulk_cache[group_idx] = Some(hash::hash_bulk(
+                ctrl_mask,
+                group_idx,
+                group.members.len() * lg_m,
+            ));
+        }
+        let wide = bulk_cache[group_idx].as_ref().unwrap();
+        hash::extract_ncf(wide, member_idx, group.modulus)
+    } else {
+        hash::hash_solo(ctrl_mask, gid, system.is_cf(g.out), system.modulus(g.out))
+    }
+}
+
 /// Ensure δ's low bit is 1 so the point-and-permute trick works.
 pub fn normalize_delta(delta: u128) -> u128 {
     delta | 1
@@ -86,9 +116,10 @@ pub fn garble(
     // unconditionally — so it needs a firing chance even if nothing ever
     // updates its input. That's what lets the phantom `bs[i]` wires in
     // `word_to_hot_with_bits` get their first mask.
+    let mut bulk_cache: BulkCache = vec![None; system.num_switch_groups()];
     let mut queue: Vec<GateId> = (0..system.num_gates()).collect();
     while let Some(gid) = queue.pop() {
-        propagate_gate(system, gid, &mut masks, &mut queue);
+        propagate_gate(system, gid, &mut masks, &mut queue, &mut bulk_cache);
     }
 
     // Second pass: emit per-gate material and output masks in deterministic order.
@@ -114,12 +145,11 @@ pub fn garble(
         }
     }
 
+    // Output masks are emitted regardless of CF/NCF — the streaming pipeline
+    // carries CF chunk-word masks across phase boundaries, while the standard
+    // value-decoding `eval` rejects CF outputs at decode time. Mask emission
+    // itself is kind-neutral.
     for &w in output_wires {
-        assert!(
-            !system.is_cf(w),
-            "output wire {} must be NCF (use constant_ncf / input_ncf / alloc_wire_kind)",
-            w.wid
-        );
         let m = masks[w.wid]
             .clone()
             .unwrap_or_else(|| panic!("output wire {}: mask unresolved", w.wid));
@@ -134,6 +164,7 @@ fn propagate_gate(
     gid: GateId,
     masks: &mut [Option<Label>],
     queue: &mut Vec<GateId>,
+    bulk_cache: &mut BulkCache,
 ) {
     let g = system.gates[gid];
     let min0 = masks[g.in0.wid].clone();
@@ -193,9 +224,10 @@ fn propagate_gate(
             }
         }
         GateType::Switch => {
-            // out = H(ctrl, gid) + data  ⇔  data = out - H(ctrl, gid)
+            // out = H(ctrl, gid) + data  ⇔  data = out - H(ctrl, gid).
+            // For grouped switches, H is sliced from a single wide bulk call.
             if let Some(ctrl) = &min1 {
-                let h = hash::hash(ctrl, gid, system.is_cf(g.out), system.modulus(g.out));
+                let h = switch_hash(system, gid, ctrl, bulk_cache);
                 if let Some(data) = &min0 {
                     try_set(masks, g.out, label::add(&h, data), queue, system);
                 }

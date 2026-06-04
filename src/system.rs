@@ -1,11 +1,22 @@
 use crate::types::*;
 
+/// Security parameter, in bits.
+///
+/// A single λ-bit CCRH invocation is counted as one "hash" in the hash
+/// counters; a CF label on Z_{2^k} stores λ coordinates of k bits, so it costs
+/// k hashes. NCF labels in Z_p (p ≤ 409 in our setting) fit in fewer than λ
+/// bits, so an NCF switch fits in one hash.
+pub const LAMBDA_BITS: usize = 128;
+
 /// The constraint system: holds wires, gates, and propagation queue.
 #[derive(Debug)]
 pub struct System {
     pub(crate) gates: Vec<Gate>,
     pub(crate) values: Vec<Val>,
-    pub(crate) subscriptions: Vec<Vec<GateId>>,
+    /// Per-wire subscription lists (gates that reference this wire). Inline
+    /// `SmallVec` capacity covers the common case (most wires are referenced
+    /// by 2-3 gates) without per-wire heap allocation.
+    pub(crate) subscriptions: Vec<smallvec::SmallVec<[GateId; 4]>>,
     /// Per-wire control-friendliness flag (parallel to `values`).
     ///
     /// The paper distinguishes **control-friendly** wires (whose labels are
@@ -15,8 +26,43 @@ pub struct System {
     /// we routinely have CF Z_{2^k} wires and NCF Z_p wires, but the output of
     /// hot-to-ring style constructions over Z_2 can also legitimately be NCF.
     pub(crate) is_cf_flags: Vec<bool>,
-    /// Total join cost in bits accumulated so far.
+    /// NCF switch groups: members sharing a single control wire whose hash is
+    /// derived from one bulk CCRH call and sliced across members. Populated by
+    /// [`register_ncf_switch_group`]; read by the garbler/evaluator.
+    pub(crate) switch_groups: Vec<SwitchGroup>,
+    /// For each gate, the (group_index, member_index) it belongs to (if any).
+    /// Sized to `num_gates` lazily on first registration.
+    pub(crate) gate_to_group: Vec<Option<(u32, u32)>>,
+    /// Total join cost in bits (`lg|G|` summed over all joins; CF + NCF).
+    /// Communication = LAMBDA·join_complexity_cf + join_complexity_ncf.
     pub join_complexity: usize,
+    /// Join width restricted to control-friendly joins (each bit pays λ).
+    pub join_complexity_cf: usize,
+    /// Join width restricted to non-control-friendly joins (each bit pays 1).
+    pub join_complexity_ncf: usize,
+    /// CCRH invocations from CF-payload switches. A CF switch on Z_{2^k} costs
+    /// k hashes (one λ-bit call per payload bit).
+    pub hash_count_cf: usize,
+    /// CCRH invocations from NCF-payload switches. Solo NCF switches cost 1
+    /// each; a registered switch group of S members in Z_p costs only
+    /// ⌈S·lg|R| / λ⌉ — packed by [`register_ncf_switch_group`].
+    pub hash_count_ncf: usize,
+}
+
+/// A group of NCF switches that share one control wire.
+///
+/// The garbler/evaluator derives all members' hashes from a single wide CCRH
+/// call keyed on the shared control label and the group id, slicing the
+/// output across members.
+#[derive(Clone, Debug)]
+pub struct SwitchGroup {
+    /// Shared control wire (must be CF Z_2). Stored as a wire index.
+    pub ctrl: Wire,
+    /// Member switch gate ids, in slice order (member i gets bits
+    /// `[i·lg|R| .. (i+1)·lg|R|)` of the wide hash output).
+    pub members: Vec<GateId>,
+    /// Common payload modulus across members (NCF, so any modulus ≥ 2).
+    pub modulus: u64,
 }
 
 impl Default for System {
@@ -33,7 +79,13 @@ impl System {
             values: Vec::new(),
             subscriptions: Vec::new(),
             is_cf_flags: Vec::new(),
+            switch_groups: Vec::new(),
+            gate_to_group: Vec::new(),
             join_complexity: 0,
+            join_complexity_cf: 0,
+            join_complexity_ncf: 0,
+            hash_count_cf: 0,
+            hash_count_ncf: 0,
         }
     }
 
@@ -50,7 +102,7 @@ impl System {
             );
         }
         let wid = self.values.len();
-        self.subscriptions.push(Vec::new());
+        self.subscriptions.push(smallvec::SmallVec::new());
         self.values.push(Val::none(modulus));
         self.is_cf_flags.push(is_cf);
         Wire { wid }
@@ -97,6 +149,80 @@ impl System {
     /// Number of gates in the system.
     pub fn num_gates(&self) -> usize {
         self.gates.len()
+    }
+
+    /// Register a group of NCF switch gates that share one control wire.
+    ///
+    /// The garbler/evaluator will derive each member's hash from a single wide
+    /// CCRH call keyed on the shared control label and the group id, slicing
+    /// the output across members. This rebates the NCF hash count from the
+    /// naive `members.len()` to `⌈members.len()·lg|R| / λ⌉`.
+    ///
+    /// Requirements (asserted): every member is a `Switch` gate, every member
+    /// is NCF on the same modulus, every member's control wire is `ctrl`, and
+    /// no member is already in another group. Returns the new group id.
+    pub fn register_ncf_switch_group(&mut self, ctrl: Wire, members: Vec<GateId>) -> usize {
+        assert_eq!(self.modulus(ctrl), 2, "switch group control must be Z_2");
+        assert!(self.is_cf(ctrl), "switch group control must be CF");
+        assert!(!members.is_empty(), "switch group must be non-empty");
+
+        // Resize gate→group map to match num_gates lazily.
+        if self.gate_to_group.len() < self.gates.len() {
+            self.gate_to_group.resize(self.gates.len(), None);
+        }
+
+        let modulus = {
+            let g0 = self.gates[members[0]];
+            assert!(matches!(g0.typ, GateType::Switch), "group member must be a Switch");
+            assert!(!self.is_cf(g0.out), "switch group is NCF-only");
+            self.modulus(g0.out)
+        };
+        for &gid in &members {
+            let g = self.gates[gid];
+            assert!(matches!(g.typ, GateType::Switch), "group member must be a Switch");
+            assert!(!self.is_cf(g.out), "switch group is NCF-only");
+            assert_eq!(self.modulus(g.out), modulus, "group member moduli mismatch");
+            assert_eq!(g.in1.wid, ctrl.wid, "group member control mismatch");
+            assert!(self.gate_to_group[gid].is_none(), "gate {gid} already grouped");
+        }
+
+        let group_idx = self.switch_groups.len();
+        let s = members.len();
+        for (member_idx, &gid) in members.iter().enumerate() {
+            self.gate_to_group[gid] = Some((group_idx as u32, member_idx as u32));
+        }
+
+        // Rebate the hash count: replace the s solo NCF charges with the bulk total.
+        let lg_m = if modulus <= 1 {
+            0
+        } else {
+            ((modulus - 1).ilog2() + 1) as usize
+        };
+        let bulk = (s * lg_m).div_ceil(LAMBDA_BITS);
+        self.hash_count_ncf -= s;
+        self.hash_count_ncf += bulk;
+
+        self.switch_groups.push(SwitchGroup { ctrl, members, modulus });
+        group_idx
+    }
+
+    /// Look up a gate's group membership, if any.
+    pub fn gate_group(&self, gid: GateId) -> Option<(usize, usize)> {
+        if gid < self.gate_to_group.len() {
+            self.gate_to_group[gid].map(|(g, m)| (g as usize, m as usize))
+        } else {
+            None
+        }
+    }
+
+    /// Borrow a switch group by index.
+    pub fn switch_group(&self, idx: usize) -> &SwitchGroup {
+        &self.switch_groups[idx]
+    }
+
+    /// Number of registered switch groups.
+    pub fn num_switch_groups(&self) -> usize {
+        self.switch_groups.len()
     }
 
     // --- Wire constructors ---
@@ -181,10 +307,21 @@ impl System {
 
     /// Switch: data wire x (any ring), control wire s (must be CF Z_2).
     /// Output inherits x's kind and modulus. If s=0, output=x.
+    ///
+    /// Cost (charged to hash counters): a CF payload on Z_{2^k} adds k hashes
+    /// to `hash_count_cf` (one λ-bit CCRH call per payload bit). An NCF payload
+    /// adds 1 hash to `hash_count_ncf`; this can later be rebated by registering
+    /// a [`SwitchGroup`] that packs many NCF switches under one wide call.
     pub fn switch(&mut self, x: Wire, s: Wire) -> Wire {
         assert_eq!(self.modulus(s), 2, "switch control must be binary (Z_2)");
         assert!(self.is_cf(s), "switch control must be CF");
         let out = self.alloc_wire_kind(self.modulus(x), self.is_cf(x));
+        let m = self.modulus(x);
+        if self.is_cf(x) {
+            self.hash_count_cf += if m <= 1 { 0 } else { m.trailing_zeros() as usize };
+        } else {
+            self.hash_count_ncf += 1;
+        }
         let g = Gate {
             typ: GateType::Switch,
             param: 0,
@@ -199,15 +336,24 @@ impl System {
     /// Join: constrain x = y. Both must have the same modulus and kind.
     /// Costs `(λ if CF else 1) · lg|G|` bits of join width in the paper; we
     /// track the `lg|G|` factor here and leave the λ multiplier to garble-time.
+    ///
+    /// `join_complexity_cf` and `join_complexity_ncf` give the split (still in
+    /// `lg|G|` units). Total program join bits = LAMBDA·cf + ncf.
     pub fn join(&mut self, x: Wire, y: Wire) -> Wire {
         assert_eq!(self.modulus(x), self.modulus(y));
         assert_eq!(self.is_cf(x), self.is_cf(y), "join: kind mismatch");
         let m = self.modulus(x);
-        self.join_complexity += if m <= 1 {
+        let bits = if m <= 1 {
             0
         } else {
             (m as u128 - 1).ilog2() as usize + 1
         };
+        self.join_complexity += bits;
+        if self.is_cf(x) {
+            self.join_complexity_cf += bits;
+        } else {
+            self.join_complexity_ncf += bits;
+        }
         let g = Gate {
             typ: GateType::Join,
             param: 0,

@@ -130,6 +130,22 @@ impl CfLabel {
     pub fn raw_bits(&self) -> &[u64] {
         &self.bits
     }
+
+    /// Build a CF label from a raw u64-word storage. The buffer must have
+    /// exactly `⌈LAMBDA · k / 64⌉` words; bits beyond `LAMBDA · k` are masked
+    /// off so callers don't need to clear pseudorandom expansion tails.
+    pub fn from_raw_bits(mut bits: Vec<u64>, modulus: u64) -> Self {
+        assert!(modulus.is_power_of_two(), "CF modulus {} is not power of two", modulus);
+        let k = modulus.trailing_zeros() as usize;
+        let total_bits = LAMBDA * k;
+        let words = total_bits.div_ceil(64);
+        assert_eq!(bits.len(), words, "raw bits length mismatch");
+        let last_used = total_bits % 64;
+        if last_used != 0 {
+            bits[words - 1] &= (1u64 << last_used) - 1;
+        }
+        CfLabel { bits, modulus }
+    }
 }
 
 fn coord_mask(k: u32) -> u64 {
@@ -262,11 +278,14 @@ pub fn add(x: &Label, y: &Label) -> Label {
         }
         (Label::Ncf(a), Label::Ncf(b)) => {
             assert_eq!(a.modulus, b.modulus, "add: modulus mismatch");
+            // For our parameter range (p ≤ 409) both operands fit in u32 and
+            // their sum in u64; replace the `u128 % p` with one compare-subtract.
+            // Invariant: caller maintains a.rep < a.modulus and b.rep < b.modulus,
+            // so a.rep + b.rep < 2·modulus and at most one subtraction normalizes.
             let m = a.modulus;
-            Label::Ncf(NcfLabel {
-                rep: ((a.rep as u128 + b.rep as u128) % m as u128) as u64,
-                modulus: m,
-            })
+            let s = a.rep + b.rep;
+            let rep = if s >= m { s - m } else { s };
+            Label::Ncf(NcfLabel { rep, modulus: m })
         }
         _ => panic!("add: CF/NCF mismatch"),
     }
@@ -293,26 +312,38 @@ pub fn sub(x: &Label, y: &Label) -> Label {
         }
         (Label::Ncf(a), Label::Ncf(b)) => {
             assert_eq!(a.modulus, b.modulus, "sub: modulus mismatch");
-            let m = a.modulus as u128;
-            Label::Ncf(NcfLabel {
-                rep: ((a.rep as u128 + m - b.rep as u128) % m) as u64,
-                modulus: a.modulus,
-            })
+            // Same logic as NCF add: branch on the sign instead of `u128 % p`.
+            let m = a.modulus;
+            let rep = if a.rep >= b.rep { a.rep - b.rep } else { a.rep + m - b.rep };
+            Label::Ncf(NcfLabel { rep, modulus: m })
         }
         _ => panic!("sub: CF/NCF mismatch"),
     }
 }
 
 /// Scalar multiplication by `s` (in each coord's ring).
+///
+/// Fast paths:
+/// * `s = 0` → zero label (no allocation for NCF; trivial vec for CF).
+/// * `s mod modulus = 1` → caller's label cloned (no arithmetic).
+/// * Z_2 CF: depends only on `s & 1` (single XOR-of-zero or copy).
 pub fn scalar_mul(s: u64, x: &Label) -> Label {
     match x {
         Label::Cf(a) => {
             let k = a.k();
+            // s = 0 collapses to the zero label regardless of k.
+            if s == 0 {
+                return Label::Cf(CfLabel::zero(a.modulus));
+            }
+            // s ≡ 1 mod 2^k → identity.
+            let mask_k = coord_mask(k);
+            if (s & mask_k) == 1 {
+                return Label::Cf(a.clone());
+            }
             let mut out = CfLabel::zero(a.modulus);
             if k == 1 {
-                if s & 1 == 1 {
-                    out.bits.copy_from_slice(&a.bits);
-                }
+                // (s & 1) is 1 here (the s=0 path already returned), so just copy.
+                out.bits.copy_from_slice(&a.bits);
                 return Label::Cf(out);
             }
             for i in 0..LAMBDA {
@@ -320,10 +351,24 @@ pub fn scalar_mul(s: u64, x: &Label) -> Label {
             }
             Label::Cf(out)
         }
-        Label::Ncf(a) => Label::Ncf(NcfLabel {
-            rep: ((s as u128 * a.rep as u128) % a.modulus as u128) as u64,
-            modulus: a.modulus,
-        }),
+        Label::Ncf(a) => {
+            // For our parameter range (p ≤ 409) the product s·rep fits in u64
+            // whenever the caller passes a normalized scalar (s mod p < p) — so
+            // we can do a single u64 mul + u64 % p instead of u128. Add fast
+            // paths for s ≡ 0 (zero) and s ≡ 1 (identity); these come up a lot
+            // (mul-by-coeff with coeff=1 in chunk accumulation, identity truth
+            // tables in hot_to_ring_bulk).
+            let m = a.modulus;
+            let s_mod = if s < m { s } else { s % m };
+            if s_mod == 0 {
+                return Label::Ncf(NcfLabel { rep: 0, modulus: m });
+            }
+            if s_mod == 1 {
+                return Label::Ncf(*a);
+            }
+            let rep = (s_mod * a.rep) % m;
+            Label::Ncf(NcfLabel { rep, modulus: m })
+        }
     }
 }
 
@@ -378,24 +423,6 @@ pub fn div2k(x: &Label, k: u32) -> Label {
                 modulus: a.modulus >> k,
             })
         }
-    }
-}
-
-/// Apply a coord-wise homomorphism φ. Caller supplies the output modulus and
-/// CF-ness is preserved.
-pub fn apply_hom<F: Fn(u64) -> u64>(x: &Label, out_modulus: u64, phi: F) -> Label {
-    match x {
-        Label::Cf(a) => {
-            let mut out = CfLabel::zero(out_modulus);
-            for i in 0..LAMBDA {
-                out.set(i, phi(a.get(i)));
-            }
-            Label::Cf(out)
-        }
-        Label::Ncf(a) => Label::Ncf(NcfLabel {
-            rep: phi(a.rep),
-            modulus: out_modulus,
-        }),
     }
 }
 
@@ -562,14 +589,6 @@ mod tests {
             let expected = (a.get(i) & !(d - 1)) / d;
             assert_eq!(b.as_cf().get(i), expected);
         }
-    }
-
-    #[test]
-    fn test_apply_hom_identity() {
-        let mut r = rng();
-        let a = rand_cf(&mut r, 1 << 8);
-        let b = apply_hom(&Label::Cf(a.clone()), 1 << 8, |u| u);
-        assert_eq!(b, Label::Cf(a));
     }
 
     #[test]

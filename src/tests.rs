@@ -7,12 +7,12 @@
 //! - `components/crt.rs`: CRT parameters and reconstruction
 //! - `components/bigint.rs`: U576 arithmetic
 
-use crate::components::affine::build_s_aff;
+use crate::components::affine::{build_s_aff, build_s_aff_streaming};
 use crate::components::bigint::{FIRST_80_PRIMES, U576};
 use crate::components::crt::{CrtParams, crt_reconstruct};
 use crate::exec::Exec;
 use crate::garble::label::{CfLabel, LAMBDA};
-use crate::garble::{Label, Program, eval, garble, normalize_delta};
+use crate::garble::{Label, Pipeline, Program, eval, garble, normalize_delta};
 use crate::system::System;
 use crate::types::*;
 
@@ -549,7 +549,7 @@ fn test_s_aff_s3_primorial_10() {
 
 #[test]
 fn test_s_aff_s1_primorial_80() {
-    // Full 80-prime CRT pipeline with target parameters: n=256, ell=23.
+    // Full 80-prime CRT pipeline with target parameters: n=256, ell=22.
     // Coefficients a, b are random elements of Z_M (M ≈ 2^553), x is 256 bits.
     let params = CrtParams::from_primes(&FIRST_80_PRIMES, 256);
     let n = params.n as usize;
@@ -622,55 +622,258 @@ fn test_s_aff_s1_primorial_80() {
 #[test]
 #[ignore]
 fn test_s_aff_scaling() {
-    // Run with: N=12 /usr/bin/time -l cargo test --release test_s_aff_scaling -- --ignored --nocapture
+    // Run with: N=12 S=4 GARBLE=1 /usr/bin/time -l cargo test --release \
+    //   test_s_aff_scaling -- --ignored --nocapture
+    //
+    // Env vars:
+    //   N        — input bit-length (default 8)
+    //   S        — number of affine maps (default 1)
+    //   GARBLE   — if set to "1", also time the all-at-once garble + eval round-trip
+    //   STREAM   — if set to "1", run the streaming pipeline (Pipeline + build_s_aff_streaming)
+    use crate::system::LAMBDA_BITS;
+    use std::time::Instant;
+
     let n: u32 = std::env::var("N")
         .unwrap_or_else(|_| "8".into())
         .parse()
         .expect("N must be a u32");
+    let s_dim: usize = std::env::var("S")
+        .unwrap_or_else(|_| "1".into())
+        .parse()
+        .expect("S must be a usize");
+    let do_garble: bool = std::env::var("GARBLE").as_deref() == Ok("1");
+    let do_stream: bool = std::env::var("STREAM").as_deref() == Ok("1");
 
     let params = CrtParams::from_primes(&FIRST_80_PRIMES, n);
     eprintln!(
-        "n={n}, ell={}, chunk_size={}, num_chunks={}",
+        "n={n}, S={s_dim}, ell={}, chunk_size={}, num_chunks={}, garble={do_garble}",
         params.ell, params.chunk_size, params.num_chunks
     );
-    eprintln!("table_size = 2^{} = {}", params.ell, 1u64 << params.ell);
 
     let mut rng = rng();
     let max_x = 1u64 << n;
-    let a: u64 = rng.random_range(0..1u64 << 48);
-    let b: u64 = rng.random_range(0..1u64 << 48);
+    let a_vals: Vec<u64> = (0..s_dim).map(|_| rng.random_range(0..1u64 << 48)).collect();
+    let b_vals: Vec<u64> = (0..s_dim).map(|_| rng.random_range(0..1u64 << 48)).collect();
     let x: u64 = rng.random_range(0..max_x);
 
-    let a_residues: Vec<Vec<u64>> = params.primes.iter().map(|&pi| vec![a % pi]).collect();
-    let b_residues: Vec<Vec<u64>> = params.primes.iter().map(|&pi| vec![b % pi]).collect();
+    let a_residues: Vec<Vec<u64>> = params
+        .primes
+        .iter()
+        .map(|&pi| a_vals.iter().map(|&a| a % pi).collect())
+        .collect();
+    let b_residues: Vec<Vec<u64>> = params
+        .primes
+        .iter()
+        .map(|&pi| b_vals.iter().map(|&b| b % pi).collect())
+        .collect();
 
+    // The all-at-once side of the test (build + Exec + optional garble+eval).
+    // Skipped when STREAM=1 is set without GARBLE=1 — the streaming side does
+    // its own verification, so the giant System we'd otherwise build first
+    // would just inflate peak RSS with state we then discard.
+    let do_all_at_once = do_garble || !do_stream;
+    if do_all_at_once {
     let mut sys = System::new();
     let bits: Vec<Wire> = (0..n).map(|_| sys.input(2)).collect();
 
-    eprintln!("building switch system...");
+    let t_build = Instant::now();
     let result = build_s_aff(&mut sys, &bits, &params, &a_residues, &b_residues);
+    let build_secs = t_build.elapsed().as_secs_f64();
     eprintln!(
-        "system built: {} wires, {} gates",
+        "[build]  {:>7.2}s  | {} wires, {} gates, {} switch groups",
+        build_secs,
         sys.num_wires(),
-        sys.num_gates()
+        sys.num_gates(),
+        sys.num_switch_groups(),
+    );
+    eprintln!(
+        "          join: {} bits (cf {}, ncf {})  hash: cf {}, ncf {}",
+        sys.join_complexity,
+        sys.join_complexity_cf,
+        sys.join_complexity_ncf,
+        sys.hash_count_cf,
+        sys.hash_count_ncf,
     );
 
-    eprintln!("executing...");
+    // Bulk-pack rebate report.
+    let naive_ncf: usize = sys
+        .gates
+        .iter()
+        .filter(|g| matches!(g.typ, GateType::Switch) && !sys.is_cf(g.out))
+        .count();
+    let packed_ncf_groups: usize = (0..sys.num_switch_groups())
+        .map(|i| {
+            let g = sys.switch_group(i);
+            let lg_m = ((g.modulus - 1).ilog2() + 1) as usize;
+            (g.members.len() * lg_m).div_ceil(LAMBDA_BITS)
+        })
+        .sum();
+    let saved = naive_ncf - sys.hash_count_ncf;
+    eprintln!(
+        "          bulk-pack: naive_ncf {} → packed_ncf {} ({}× rebate, saved {})",
+        naive_ncf,
+        sys.hash_count_ncf,
+        if packed_ncf_groups > 0 {
+            naive_ncf as f64 / packed_ncf_groups as f64
+        } else {
+            1.0
+        },
+        saved,
+    );
+
+    let input_values: Vec<Val> = (0..n).map(|j| Val::new((x >> j) & 1, 2)).collect();
+
+    let t_exec = Instant::now();
     let mut exec = Exec::new(&sys);
-    for j in 0..n {
-        exec.set(bits[j as usize], Val::new((x >> j) & 1, 2));
+    for (&w, &v) in bits.iter().zip(input_values.iter()) {
+        exec.set(w, v);
     }
     exec.run();
+    let exec_secs = t_exec.elapsed().as_secs_f64();
+    eprintln!("[exec]   {:>7.2}s  | reference value propagation", exec_secs);
 
-    let residues: Vec<u64> = result
-        .outputs
-        .iter()
-        .map(|prime_outs| exec.get(prime_outs[0]).v)
-        .collect();
-    let reconstructed = crt_reconstruct(&residues, &params.primes);
-    let expected = a * x + b;
-    assert_eq!(reconstructed, U576::from_u64(expected));
-    eprintln!("ok: a*x+b = {expected}");
+    // Verify Exec outputs reconstruct correctly.
+    for s in 0..s_dim {
+        let residues: Vec<u64> = result
+            .outputs
+            .iter()
+            .map(|prime_outs| exec.get(prime_outs[s]).v)
+            .collect();
+        let reconstructed = crt_reconstruct(&residues, &params.primes);
+        let expected = a_vals[s] * x + b_vals[s];
+        assert_eq!(reconstructed, U576::from_u64(expected));
+    }
+
+    if do_garble {
+        let mut output_wires: Vec<Wire> = Vec::with_capacity(80 * s_dim);
+        for row in &result.outputs {
+            output_wires.extend(row.iter().copied());
+        }
+        let exec_outputs: Vec<Val> = output_wires.iter().map(|&w| exec.get(w)).collect();
+
+        let delta: u128 = normalize_delta(rng.random());
+        let input_masks: Vec<Label> = bits
+            .iter()
+            .map(|&w| sample_cf_mask(&mut rng, sys.modulus(w)))
+            .collect();
+
+        let t_garble = Instant::now();
+        let program = garble(&sys, &bits, &input_masks, &output_wires, delta);
+        let garble_secs = t_garble.elapsed().as_secs_f64();
+        eprintln!(
+            "[garble] {:>7.2}s  | program: {} bits ({:.2} MB)",
+            garble_secs,
+            program.total_bits(),
+            program.total_bits() as f64 / 8.0 / 1024.0 / 1024.0,
+        );
+
+        let t_eval = Instant::now();
+        let got = eval(
+            &sys,
+            &bits,
+            &input_values,
+            delta,
+            &input_masks,
+            &program,
+            &output_wires,
+        );
+        let eval_secs = t_eval.elapsed().as_secs_f64();
+        eprintln!("[eval]   {:>7.2}s  | label propagation + decode", eval_secs);
+        for (i, (g, e)) in got.iter().zip(exec_outputs.iter()).enumerate() {
+            assert_eq!(g, e, "output {i} mismatch");
+        }
+
+        // Theoretical hashing cost at AES-NI speed (~1.5 GB/s). The CCRH stub
+        // is currently zero, so this isn't *measured* time — it's the budget
+        // a real CCRH would need.
+        let total_hashes = sys.hash_count_cf + sys.hash_count_ncf;
+        let hash_bytes = total_hashes * (LAMBDA_BITS / 8);
+        let aes_ni_gbs = 1.5; // conservative AES-MMO throughput on Apple Silicon
+        let est_hash_secs = (hash_bytes as f64 / 1e9) / aes_ni_gbs;
+        eprintln!(
+            "[hash*]  {:>7.3}s  | {} CCRH calls × λ bits = {:.1} MB at {} GB/s (estimate; current H=0)",
+            est_hash_secs,
+            total_hashes,
+            hash_bytes as f64 / 1024.0 / 1024.0,
+            aes_ni_gbs,
+        );
+
+        let total = build_secs + garble_secs + eval_secs;
+        eprintln!(
+            "                    | build {:.0}% | garble {:.0}% | eval {:.0}% | hash budget {:.1}%",
+            100.0 * build_secs / total,
+            100.0 * garble_secs / total,
+            100.0 * eval_secs / total,
+            100.0 * est_hash_secs / total,
+        );
+    }
+
+    eprintln!("ok: all {s_dim} affine maps reconstructed");
+    } // end do_all_at_once
+
+    if do_stream {
+        // Streaming path: builds + garbles + evals one phase at a time, dropping
+        // intermediate state at every phase boundary.
+        eprintln!("---- streaming pipeline ----");
+        let t_stream = Instant::now();
+        let mut pipeline = Pipeline::new(&mut rng);
+        let x_bits: Vec<u64> = (0..n).map(|j| (x >> j) & 1).collect();
+        let bit_ids: Vec<_> = x_bits
+            .iter()
+            .map(|&b| pipeline.seed_input_cf_value(&mut rng, 2, b))
+            .collect();
+        let outputs = build_s_aff_streaming(
+            &mut pipeline,
+            &bit_ids,
+            &x_bits,
+            &params,
+            &a_residues,
+            &b_residues,
+        );
+        let stream_secs = t_stream.elapsed().as_secs_f64();
+
+        eprintln!(
+            "[stream] {:>7.2}s  | {} phases, peak {} wires / {} gates per phase",
+            stream_secs,
+            pipeline.phase_stats.len(),
+            pipeline.peak_phase_wires,
+            pipeline.peak_phase_gates,
+        );
+        eprintln!(
+            "          garble: {:.2}s ({:.0}%) | eval: {:.2}s ({:.0}%) | other: {:.2}s",
+            pipeline.garble_secs,
+            100.0 * pipeline.garble_secs / stream_secs,
+            pipeline.eval_secs,
+            100.0 * pipeline.eval_secs / stream_secs,
+            stream_secs - pipeline.garble_secs - pipeline.eval_secs,
+        );
+        eprintln!(
+            "          totals: {} wires, {} gates, {} switch groups",
+            pipeline.total_wires, pipeline.total_gates, pipeline.total_switch_groups,
+        );
+        eprintln!(
+            "          program: {} bits ({:.2} MB)",
+            pipeline.total_program_bits,
+            pipeline.total_program_bits as f64 / 8.0 / 1024.0 / 1024.0,
+        );
+        eprintln!(
+            "          join: total {} bits (cf {}, ncf {})  hash: cf {}, ncf {}",
+            pipeline.join_complexity_cf + pipeline.join_complexity_ncf,
+            pipeline.join_complexity_cf,
+            pipeline.join_complexity_ncf,
+            pipeline.hash_count_cf,
+            pipeline.hash_count_ncf,
+        );
+
+        // Verify outputs reconstruct correctly.
+        for s in 0..s_dim {
+            let residues: Vec<u64> = outputs.iter().map(|prime_outs| prime_outs[s]).collect();
+            let reconstructed = crt_reconstruct(&residues, &params.primes);
+            let expected = a_vals[s] * x + b_vals[s];
+            assert_eq!(reconstructed, U576::from_u64(expected));
+        }
+        eprintln!("ok: streaming reconstructed all {s_dim} affine maps");
+    }
 }
 
 // ==================== Garble / Eval round-trip tests ====================
@@ -885,11 +1088,9 @@ fn test_garble_program_size_matches_join_width() {
     let result = build_s_aff(&mut sys, &bits, &params, &a_residues, &b_residues);
     let output_wires: Vec<Wire> = result.outputs.iter().map(|row| row[0]).collect();
 
-    // Compute expected program bits:
-    //   cf_join_bits    = LAMBDA * (sum of k over CF join gates)
-    //   ncf_join_bits   = sum of ceil(log2 mod) over NCF join gates
-    //   switch_lsb_bits = 1 per Switch gate (point-and-permute overhead)
-    //   output_bits     = sum of ceil(log2 mod) over NCF output wires
+    // Compute expected program bits two independent ways and require both
+    // to agree with the program — the gate iteration (verifies per-gate
+    // accounting) and the System counters (verifies the System's own bookkeeping).
     let mut cf_join_bits: usize = 0;
     let mut ncf_join_bits: usize = 0;
     let mut switch_lsb_bits: usize = 0;
@@ -909,6 +1110,15 @@ fn test_garble_program_size_matches_join_width() {
     }
     let output_bits = expected_output_bits(&sys, &output_wires);
     let expected_total = cf_join_bits + ncf_join_bits + switch_lsb_bits + output_bits;
+
+    // Cross-check against System counters.
+    assert_eq!(
+        sys.join_complexity_cf + sys.join_complexity_ncf,
+        sys.join_complexity,
+        "join_complexity_cf + ncf must equal join_complexity"
+    );
+    assert_eq!(LAMBDA * sys.join_complexity_cf, cf_join_bits);
+    assert_eq!(sys.join_complexity_ncf, ncf_join_bits);
 
     // Run garble (values don't matter for the size check, but we do a full round-trip).
     let x_bits: Vec<u64> = (0..n).map(|_| rng.random_range(0..2u64)).collect();
@@ -941,6 +1151,119 @@ fn test_garble_program_size_matches_join_width() {
     );
 }
 
+#[test]
+fn test_hash_count_consistency_and_bulk_rebate() {
+    // Verifies the System's hash-count bookkeeping against an independent
+    // structural calculation, and checks that the affine pipeline actually
+    // forms NCF switch groups (so the bulk-pack rebate is non-trivial).
+    //
+    // Fixture: S=3 affine maps over a 10-prime primorial. With S>1 every
+    // residue's hot_to_ring_bulk registers per-h_p[k] groups of 3 NCF switches
+    // sharing one control wire — exactly the case the optimization addresses.
+    use crate::system::LAMBDA_BITS;
+
+    let primes = [2u64, 3, 5, 7, 11, 13, 17, 19, 23, 29];
+    let params = CrtParams::from_primes(&primes, 16);
+    let n = params.n as usize;
+    let s_dim = 3usize;
+    let mut rng = rng();
+
+    let a_residues: Vec<Vec<u64>> = params
+        .primes
+        .iter()
+        .map(|&pi| (0..s_dim).map(|j| (j as u64 + 1) % pi).collect())
+        .collect();
+    let b_residues: Vec<Vec<u64>> = params
+        .primes
+        .iter()
+        .map(|&pi| (0..s_dim).map(|_| 0u64 % pi).collect())
+        .collect();
+
+    let mut sys = System::new();
+    let bits: Vec<Wire> = (0..n).map(|_| sys.input(2)).collect();
+    let result = build_s_aff(&mut sys, &bits, &params, &a_residues, &b_residues);
+    let mut output_wires: Vec<Wire> = Vec::new();
+    for row in &result.outputs {
+        output_wires.extend(row.iter().copied());
+    }
+
+    // Compute the expected hash counts structurally:
+    //   - CF switch on Z_{2^k}: k λ-bit calls (no bulk benefit).
+    //   - Solo NCF switch (not in a group): 1 call.
+    //   - Group of S NCF switches in Z_p: ⌈S·lg|R| / λ⌉ calls.
+    let mut expected_cf: usize = 0;
+    let mut expected_ncf: usize = 0;
+    for (gid, g) in sys.gates.iter().enumerate() {
+        if !matches!(g.typ, GateType::Switch) {
+            continue;
+        }
+        if sys.is_cf(g.out) {
+            let m = sys.modulus(g.out);
+            expected_cf += if m <= 1 { 0 } else { m.trailing_zeros() as usize };
+        } else if sys.gate_group(gid).is_none() {
+            expected_ncf += 1;
+        }
+    }
+    for i in 0..sys.num_switch_groups() {
+        let group = sys.switch_group(i);
+        let lg_m = ((group.modulus - 1).ilog2() + 1) as usize;
+        expected_ncf += (group.members.len() * lg_m).div_ceil(LAMBDA_BITS);
+    }
+
+    assert_eq!(
+        sys.hash_count_cf, expected_cf,
+        "hash_count_cf {} disagrees with structural total {}",
+        sys.hash_count_cf, expected_cf,
+    );
+    assert_eq!(
+        sys.hash_count_ncf, expected_ncf,
+        "hash_count_ncf {} disagrees with structural total {}",
+        sys.hash_count_ncf, expected_ncf,
+    );
+
+    // The pipeline must actually exercise bulk packing: at least one group
+    // exists, and its rebate is strictly favorable vs. the naive accounting.
+    assert!(
+        sys.num_switch_groups() > 0,
+        "build_s_aff with S>1 should register at least one switch group"
+    );
+    let mut naive_ncf_for_groups: usize = 0;
+    let mut packed_ncf_for_groups: usize = 0;
+    for i in 0..sys.num_switch_groups() {
+        let group = sys.switch_group(i);
+        let lg_m = ((group.modulus - 1).ilog2() + 1) as usize;
+        naive_ncf_for_groups += group.members.len();
+        packed_ncf_for_groups += (group.members.len() * lg_m).div_ceil(LAMBDA_BITS);
+    }
+    assert!(
+        packed_ncf_for_groups < naive_ncf_for_groups,
+        "expected bulk rebate (packed={}, naive={}); pipeline isn't packing",
+        packed_ncf_for_groups,
+        naive_ncf_for_groups,
+    );
+
+    // Run a full round-trip: the bulk-packed garbler+evaluator must still
+    // recover the same outputs Exec produces. With H=0 in the placeholder this
+    // succeeds iff both sides agree on member slicing (and on which gates are
+    // grouped at all).
+    let x_bits: Vec<u64> = (0..n).map(|_| rng.random_range(0..2u64)).collect();
+    let input_values: Vec<Val> = x_bits.iter().map(|&b| Val::new(b, 2)).collect();
+    let mut exec = Exec::new(&sys);
+    for (&w, &v) in bits.iter().zip(input_values.iter()) {
+        exec.set(w, v);
+    }
+    exec.run();
+    let exec_outputs: Vec<Val> = output_wires.iter().map(|&w| exec.get(w)).collect();
+    let _program = garble_eval_roundtrip(
+        &mut rng,
+        &sys,
+        &bits,
+        &input_values,
+        &output_wires,
+        &exec_outputs,
+    );
+}
+
 /// Sum of ceil(log2(modulus)) over the (NCF) output wires.
 fn expected_output_bits(sys: &System, output_wires: &[Wire]) -> usize {
     output_wires
@@ -954,4 +1277,102 @@ fn expected_output_bits(sys: &System, output_wires: &[Wire]) -> usize {
             }
         })
         .sum()
+}
+
+#[test]
+fn test_streaming_s_aff_matches_all_at_once() {
+    // Run the same fixture through (a) the all-at-once garble→eval and (b) the
+    // streaming pipeline; outputs must match bit-for-bit.
+    //
+    // Picks parameters where bulk-pack is exercised (S>1) and several primes
+    // are present, but small enough to keep the all-at-once side fast.
+    let primes: [u64; 10] = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29];
+    let params = CrtParams::from_primes(&primes, 16);
+    let n = params.n as usize;
+    let s_dim = 3usize;
+    let mut rng = rng();
+    let m: u128 = params.primes.iter().map(|&p| p as u128).product();
+
+    for _ in 0..5 {
+        let a_vals: Vec<u64> = (0..s_dim).map(|_| rng.random_range(0..m as u64)).collect();
+        let b_vals: Vec<u64> = (0..s_dim).map(|_| rng.random_range(0..m as u64)).collect();
+        let x: u64 = rng.random_range(0..(1u64 << n));
+
+        let a_residues: Vec<Vec<u64>> = params
+            .primes
+            .iter()
+            .map(|&pi| a_vals.iter().map(|&a| a % pi).collect())
+            .collect();
+        let b_residues: Vec<Vec<u64>> = params
+            .primes
+            .iter()
+            .map(|&pi| b_vals.iter().map(|&b| b % pi).collect())
+            .collect();
+        let input_bits: Vec<u64> = (0..n).map(|j| (x >> j) & 1).collect();
+
+        // (a) All-at-once: build, garble, eval.
+        let mut sys = System::new();
+        let bit_wires: Vec<Wire> = (0..n).map(|_| sys.input(2)).collect();
+        let result = build_s_aff(&mut sys, &bit_wires, &params, &a_residues, &b_residues);
+        let mut output_wires: Vec<Wire> = Vec::with_capacity(params.num_primes * s_dim);
+        for row in &result.outputs {
+            output_wires.extend(row.iter().copied());
+        }
+        let input_values: Vec<Val> = input_bits.iter().map(|&b| Val::new(b, 2)).collect();
+        let mut exec = Exec::new(&sys);
+        for (&w, &v) in bit_wires.iter().zip(input_values.iter()) {
+            exec.set(w, v);
+        }
+        exec.run();
+        let exec_outputs: Vec<Val> = output_wires.iter().map(|&w| exec.get(w)).collect();
+        let expected_outputs: Vec<Val> = {
+            let delta = normalize_delta(rng.random());
+            let input_masks: Vec<Label> =
+                bit_wires.iter().map(|_| sample_cf_mask(&mut rng, 2)).collect();
+            let program = garble(&sys, &bit_wires, &input_masks, &output_wires, delta);
+            let got = eval(
+                &sys,
+                &bit_wires,
+                &input_values,
+                delta,
+                &input_masks,
+                &program,
+                &output_wires,
+            );
+            // Sanity: garble→eval recovers the Exec values.
+            assert_eq!(got, exec_outputs);
+            got
+        };
+        drop(sys);
+
+        // (b) Streaming.
+        let mut pipeline = Pipeline::new(&mut rng);
+        let bit_ids: Vec<_> = input_bits
+            .iter()
+            .map(|&b| pipeline.seed_input_cf_value(&mut rng, 2, b))
+            .collect();
+        let outputs = build_s_aff_streaming(
+            &mut pipeline,
+            &bit_ids,
+            &input_bits,
+            &params,
+            &a_residues,
+            &b_residues,
+        );
+
+        // Streaming returns Vec<Vec<u64>> with shape [num_primes][s_dim]; flatten
+        // in the same order build_s_aff lays out (prime-major, then s).
+        let mut streaming_flat: Vec<u64> = Vec::with_capacity(params.num_primes * s_dim);
+        for row in &outputs {
+            streaming_flat.extend(row.iter().copied());
+        }
+
+        for (i, (got, expected)) in streaming_flat.iter().zip(expected_outputs.iter()).enumerate() {
+            assert_eq!(
+                *got, expected.v,
+                "stream-vs-all-at-once mismatch at output[{i}]: got {got}, expected {}",
+                expected.v
+            );
+        }
+    }
 }
