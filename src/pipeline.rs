@@ -268,10 +268,11 @@ impl Pipeline {
         self.peak_phase_wires = self.peak_phase_wires.max(stats.wires);
         self.peak_phase_gates = self.peak_phase_gates.max(stats.gates);
         self.total_program_bits += stats.program_bits;
-        self.join_complexity_cf += sys.join_complexity_cf;
-        self.join_complexity_ncf += sys.join_complexity_ncf;
-        self.hash_count_cf += sys.hash_count_cf;
-        self.hash_count_ncf += sys.hash_count_ncf;
+        let cost = sys.cost();
+        self.join_complexity_cf += cost.join_complexity_cf;
+        self.join_complexity_ncf += cost.join_complexity_ncf;
+        self.hash_count_cf += cost.hash_count_cf;
+        self.hash_count_ncf += cost.hash_count_ncf;
         self.phase_stats.push(stats);
 
         // Promote outputs to carry items.

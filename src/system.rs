@@ -26,20 +26,30 @@ pub struct System {
     /// For each gate, the (group_index, member_index) it belongs to (if any).
     /// Sized to `num_gates` lazily on first registration.
     pub(crate) gate_to_group: Vec<Option<(u32, u32)>>,
-    /// Total join cost in bits (`lg|G|` summed over all joins; CF + NCF).
-    /// Communication = LAMBDA·join_complexity_cf + join_complexity_ncf.
-    pub join_complexity: usize,
-    /// Join width restricted to control-friendly joins (each bit pays λ).
+}
+
+/// Communication + hash cost of a circuit — a pure fold over its gates and
+/// switch groups (see [`System::cost`]). Switches contribute no communication
+/// (zero reveal); only joins do.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Cost {
+    /// Join width over control-friendly joins, in `lg|G|` units (each bit pays λ).
     pub join_complexity_cf: usize,
-    /// Join width restricted to non-control-friendly joins (each bit pays 1).
+    /// Join width over non-control-friendly joins, in bits (each pays 1).
     pub join_complexity_ncf: usize,
-    /// CCRH invocations from CF-payload switches. A CF switch on Z_{2^k} costs
-    /// k hashes (one λ-bit call per payload bit).
+    /// CCRH invocations from CF-payload switches (a CF switch on Z_{2^k} costs k).
     pub hash_count_cf: usize,
-    /// CCRH invocations from NCF-payload switches. Solo NCF switches cost 1
-    /// each; a registered switch group of S members in Z_p costs only
-    /// ⌈S·lg|R| / λ⌉ — packed by [`register_ncf_switch_group`].
+    /// CCRH invocations from NCF switches: 1 per solo switch, `⌈S·lg|R|/λ⌉` per
+    /// `S`-member switch group (bulk-packed).
     pub hash_count_ncf: usize,
+}
+
+impl Cost {
+    /// Total join width in `lg|G|` units (CF + NCF). Communication in bits is
+    /// `λ·join_complexity_cf + join_complexity_ncf`.
+    pub fn join_complexity(&self) -> usize {
+        self.join_complexity_cf + self.join_complexity_ncf
+    }
 }
 
 /// A group of NCF switches that share one control wire.
@@ -74,12 +84,46 @@ impl System {
             is_cf_flags: Vec::new(),
             switch_groups: Vec::new(),
             gate_to_group: Vec::new(),
-            join_complexity: 0,
-            join_complexity_cf: 0,
-            join_complexity_ncf: 0,
-            hash_count_cf: 0,
-            hash_count_ncf: 0,
         }
+    }
+
+    /// Compute the circuit's communication + hash cost by folding over its gates
+    /// and switch groups. Pure (no mutation), so it is independent of the order
+    /// gates and groups were added.
+    pub fn cost(&self) -> Cost {
+        let mut c = Cost::default();
+        for (gid, &g) in self.gates.iter().enumerate() {
+            match g {
+                Gate::Switch { out, .. } => {
+                    if self.is_cf(out) {
+                        let m = self.modulus(out);
+                        c.hash_count_cf += if m <= 1 { 0 } else { m.trailing_zeros() as usize };
+                    } else if self.gate_group(gid).is_none() {
+                        // Solo NCF switch; grouped ones are counted via the group.
+                        c.hash_count_ncf += 1;
+                    }
+                }
+                Gate::Join { a, .. } => {
+                    let m = self.modulus(a);
+                    let bits = if m <= 1 { 0 } else { (m as u128 - 1).ilog2() as usize + 1 };
+                    if self.is_cf(a) {
+                        c.join_complexity_cf += bits;
+                    } else {
+                        c.join_complexity_ncf += bits;
+                    }
+                }
+                _ => {}
+            }
+        }
+        for group in &self.switch_groups {
+            let lg_m = if group.modulus <= 1 {
+                0
+            } else {
+                (group.modulus - 1).ilog2() as usize + 1
+            };
+            c.hash_count_ncf += (group.members.len() * lg_m).div_ceil(LAMBDA);
+        }
+        c
     }
 
     /// Allocate a wire with explicit CF/NCF kind.
@@ -148,8 +192,8 @@ impl System {
     ///
     /// The garbler/evaluator will derive each member's hash from a single wide
     /// CCRH call keyed on the shared control label and the group id, slicing
-    /// the output across members. This rebates the NCF hash count from the
-    /// naive `members.len()` to `⌈members.len()·lg|R| / λ⌉`.
+    /// the output across members. [`System::cost`] charges the group
+    /// `⌈members.len()·lg|R| / λ⌉` hashes instead of `members.len()`.
     ///
     /// Requirements (asserted): every member is a `Switch` gate, every member
     /// is NCF on the same modulus, every member's control wire is `ctrl`, and
@@ -184,21 +228,9 @@ impl System {
         }
 
         let group_idx = self.switch_groups.len();
-        let s = members.len();
         for (member_idx, &gid) in members.iter().enumerate() {
             self.gate_to_group[gid] = Some((group_idx as u32, member_idx as u32));
         }
-
-        // Rebate the hash count: replace the s solo NCF charges with the bulk total.
-        let lg_m = if modulus <= 1 {
-            0
-        } else {
-            ((modulus - 1).ilog2() + 1) as usize
-        };
-        let bulk = (s * lg_m).div_ceil(LAMBDA);
-        self.hash_count_ncf -= s;
-        self.hash_count_ncf += bulk;
-
         self.switch_groups.push(SwitchGroup { ctrl, members, modulus });
         group_idx
     }
@@ -302,45 +334,22 @@ impl System {
     /// Switch: data wire x (any ring), control wire s (must be CF Z_2).
     /// Output inherits x's kind and modulus. If s=0, output=x.
     ///
-    /// Cost (charged to hash counters): a CF payload on Z_{2^k} adds k hashes
-    /// to `hash_count_cf` (one λ-bit CCRH call per payload bit). An NCF payload
-    /// adds 1 hash to `hash_count_ncf`; this can later be rebated by registering
-    /// a [`SwitchGroup`] that packs many NCF switches under one wide call.
+    /// Switches add no communication (the join width is the only cost; see
+    /// [`System::cost`]); a CF-payload switch on Z_{2^k} costs k hashes, an NCF
+    /// one costs 1 (rebated when registered in a [`SwitchGroup`]).
     pub fn switch(&mut self, x: Wire, s: Wire) -> Wire {
         assert_eq!(self.modulus(s), 2, "switch control must be binary (Z_2)");
         assert!(self.is_cf(s), "switch control must be CF");
         let out = self.alloc_wire_kind(self.modulus(x), self.is_cf(x));
-        let m = self.modulus(x);
-        if self.is_cf(x) {
-            self.hash_count_cf += if m <= 1 { 0 } else { m.trailing_zeros() as usize };
-        } else {
-            self.hash_count_ncf += 1;
-        }
         self.add_gate(Gate::Switch { data: x, ctrl: s, out });
         out
     }
 
     /// Join: constrain x = y. Both must have the same modulus and kind.
-    /// Costs `(λ if CF else 1) · lg|G|` bits of join width in the paper; we
-    /// track the `lg|G|` factor here and leave the λ multiplier to garble-time.
-    ///
-    /// `join_complexity_cf` and `join_complexity_ncf` give the split (still in
-    /// `lg|G|` units). Total program join bits = LAMBDA·cf + ncf.
+    /// Costs `(λ if CF else 1) · lg|G|` bits of communication (see [`System::cost`]).
     pub fn join(&mut self, x: Wire, y: Wire) -> Wire {
         assert_eq!(self.modulus(x), self.modulus(y));
         assert_eq!(self.is_cf(x), self.is_cf(y), "join: kind mismatch");
-        let m = self.modulus(x);
-        let bits = if m <= 1 {
-            0
-        } else {
-            (m as u128 - 1).ilog2() as usize + 1
-        };
-        self.join_complexity += bits;
-        if self.is_cf(x) {
-            self.join_complexity_cf += bits;
-        } else {
-            self.join_complexity_ncf += bits;
-        }
         self.add_gate(Gate::Join { a: x, b: y });
         x
     }
