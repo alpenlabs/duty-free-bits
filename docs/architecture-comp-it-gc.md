@@ -1,8 +1,31 @@
 # Architecture: Computational GC ∘ Information-Theoretic GC (v2)
 
-Status: **design, plan-reviewed** (branch `feat/comp-it-gc`). Incorporates the
-systems / cryptography / software / audit reviews of v1. No behavior change vs
-`feat/garble-eval`; this restructures the code so it mirrors the protocol.
+Status: **in progress** (branch `feat/comp-it-gc`). Incorporates the
+systems / cryptography / software / audit plan reviews of v1.
+
+## Progress
+
+- **DONE** Security: CCRH nonce-reuse (two-time-pad) fix + regression (parent branch).
+- **DONE** Gate 0: off-aarch64 compile fix (portable software AES, byte-identical to
+  NEON, FIPS-197 KAT + cross-check); `opt-level` `z`→`3` (2.9× faster streaming).
+- **DONE** Gate 1: differential safety net (Exec == all-at-once == streaming across the
+  128-batch boundary), multi-batch nonce-legality, CCRH golden vectors.
+- **DONE** Crypto separated: Label-free `crypto` module (CCRH core + AES backends +
+  `NonceAllocator`/`windows`); `garble::hash` is now the label↔block facade.
+- **DONE** `it_gc` module: the kernel promoted to a first-class IT-GC module.
+- **DONE** Per-prime CCRH nonce windows (Def-4 legality by construction; primes
+  independent → parallelism-ready).
+- **DEFERRED** (R6) Prime-level parallelism: the windows make it a clean drop-in, but
+  it is left out per request — a single-threaded build is wanted for benchmarking; add
+  it later behind a toggle.
+- **OPEN OPTIMIZATION** Zero switch communication in comp_gc (paper §3.3). The general
+  gate engine still emits one point-and-permute ctrl LSB per switch. These are *secure
+  and correct* (a revealed LSB is a random mask bit, and the evaluator already knows x),
+  but they are ~2.5M of the 4.1M program bits at scale — communication the paper achieves
+  as zero. Eliminating them means the evaluator derives every control from cleartext `x`
+  (a parallel Exec pass) instead of point-and-permute. Deferred as a risky core-evaluator
+  change that is an *optimization*, not a correctness/security need; the final review will
+  decide whether to take it on.
 
 ## 0. Guiding principle
 
