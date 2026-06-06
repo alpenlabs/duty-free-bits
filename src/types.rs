@@ -12,10 +12,9 @@ pub struct Wire {
     pub wid: usize,
 }
 
-/// A gate in the switch system. Each variant names exactly the wires (and scalar
-/// parameters) it uses — there are no dummy wires or overloaded fields.
+/// A gate in the switch system.
 #[derive(Clone, Copy, Debug)]
-#[allow(missing_docs)] // field roles are clear from names + the variant docs
+#[allow(missing_docs)]
 pub enum Gate {
     /// `out := data` when `ctrl = 0` (ctrl is CF Z_2); open (no constraint) when ctrl = 1.
     Switch { data: Wire, ctrl: Wire, out: Wire },

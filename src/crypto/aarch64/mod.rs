@@ -1,19 +1,13 @@
 //! aarch64-specific intrinsics: AES-NI key schedule + CCRND hash.
 //!
 //! Lifted from the `gobble` crate (`/Users/nakul/ckt/crates/gobble/src/aarch64/mod.rs`).
-//! That crate uses these primitives for privacy-free half-gates; we use them
-//! for our switch-system CCRH (`hash::hash_solo` / `hash::hash_bulk`). The
-//! protocol is different but the underlying H requirement is the same:
-//! one tweakable correlation-robust hash from a 128-bit input + 128-bit
-//! tweak to a 128-bit output.
 //!
 //! `ccrnd_with_round_keys` implements the CCRND construction from §5 of
 //! <https://eprint.iacr.org/2019/074.pdf>:
 //!
 //!   H(x, t) = AES_K( σ(x ⊕ public_s ⊕ t) ) ⊕ σ(x ⊕ public_s ⊕ t)
 //!
-//! where σ is the linear orthomorphism `(L||R) → (L⊕R)||L`. One AES call
-//! plus a few XORs and a NEON `vextq` shuffle.
+//! where σ is the linear orthomorphism `(L||R) → (L⊕R)||L`.
 
 use std::arch::aarch64::*;
 use std::mem::transmute;
@@ -171,10 +165,8 @@ mod tests {
         let x1 = bytes_to_block_safe([0x01u8; 16]);
         let x2 = bytes_to_block_safe([0x02u8; 16]);
         let t = bytes_to_block_safe([0x05u8; 16]);
-        let a: [u8; 16] =
-            unsafe { transmute(ccrnd_with_round_keys(x1, t, &round_keys, public_s)) };
-        let b: [u8; 16] =
-            unsafe { transmute(ccrnd_with_round_keys(x2, t, &round_keys, public_s)) };
+        let a: [u8; 16] = unsafe { transmute(ccrnd_with_round_keys(x1, t, &round_keys, public_s)) };
+        let b: [u8; 16] = unsafe { transmute(ccrnd_with_round_keys(x2, t, &round_keys, public_s)) };
         assert_ne!(a, b);
     }
 
@@ -186,10 +178,8 @@ mod tests {
         let x = bytes_to_block_safe([0x42u8; 16]);
         let t1 = bytes_to_block_safe([0x05u8; 16]);
         let t2 = bytes_to_block_safe([0x06u8; 16]);
-        let a: [u8; 16] =
-            unsafe { transmute(ccrnd_with_round_keys(x, t1, &round_keys, public_s)) };
-        let b: [u8; 16] =
-            unsafe { transmute(ccrnd_with_round_keys(x, t2, &round_keys, public_s)) };
+        let a: [u8; 16] = unsafe { transmute(ccrnd_with_round_keys(x, t1, &round_keys, public_s)) };
+        let b: [u8; 16] = unsafe { transmute(ccrnd_with_round_keys(x, t2, &round_keys, public_s)) };
         assert_ne!(a, b);
     }
 }

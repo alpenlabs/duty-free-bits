@@ -4,14 +4,11 @@
 //! `X + x` (NCF), where `X` is the garbler's mask. Labels are derived in *any*
 //! order the graph permits — forward through affine gates, backward too, and
 //! through switches only when `ctrl = 0`. The control is taken from the
-//! cleartext wire `values` (the evaluator knows `x`, so it computes them itself —
-//! paper §3.3: switches reveal nothing). This is what allows patterns like
-//! `ohe_scale`'s "junk sh_i labels, join fixes the sum, backward add recovers
-//! individual sh_i" to work.
+//! cleartext wire `values`.
 
+use super::program::Program;
 use crate::hash;
 use crate::label::{self, Label};
-use super::program::Program;
 use crate::system::System;
 use crate::types::{Gate, GateId, Val, Wire};
 
@@ -51,25 +48,21 @@ fn switch_hash(
 /// Takes the evaluator's labels for inputs (already including value·Δ_R) plus the
 /// cleartext `values` of every wire (from running [`Exec`] on the evaluator's
 /// known input `x`), and returns the labels of the requested output wires. The
-/// cleartext values supply switch controls — nothing is revealed by the garbler.
-/// No mask-subtraction or value decoding here; the caller converts labels back to
-/// values when needed. This is the form used by [`Pipeline`] for streaming
-/// garble+eval.
-///
-/// [`Exec`]: crate::exec::Exec
-/// [`Pipeline`]: crate::pipeline::Pipeline
+/// cleartext values supply switch controls.
 pub fn eval_with_labels(
     system: &System,
     input_wires: &[Wire],
     input_labels: &[Label],
     values: &[Val],
-    delta: u128,
     program: &Program,
     output_wires: &[Wire],
 ) -> Vec<Label> {
     assert_eq!(input_wires.len(), input_labels.len());
-    assert_eq!(values.len(), system.num_wires(), "values must cover all wires");
-    assert_eq!(delta & 1, 1, "Δ must have low bit 1");
+    assert_eq!(
+        values.len(),
+        system.num_wires(),
+        "values must cover all wires"
+    );
 
     let mut labels: Vec<Option<Label>> = vec![None; system.num_wires()];
 
@@ -84,7 +77,11 @@ pub fn eval_with_labels(
 
     // Inputs: caller-provided labels.
     for (&w, lbl) in input_wires.iter().zip(input_labels.iter()) {
-        assert_eq!(lbl.modulus(), system.modulus(w), "input label modulus mismatch");
+        assert_eq!(
+            lbl.modulus(),
+            system.modulus(w),
+            "input label modulus mismatch"
+        );
         labels[w.wid] = Some(lbl.clone());
     }
 
@@ -99,7 +96,15 @@ pub fn eval_with_labels(
     // Propagate.
     let mut bulk_cache: BulkCache = vec![None; system.num_switch_groups()];
     while let Some(gid) = queue.pop() {
-        fire_gate(system, gid, &mut labels, values, program, &mut queue, &mut bulk_cache);
+        fire_gate(
+            system,
+            gid,
+            &mut labels,
+            values,
+            program,
+            &mut queue,
+            &mut bulk_cache,
+        );
     }
 
     // Pull out labels for the requested outputs.
@@ -124,7 +129,11 @@ fn fire_gate(
 ) {
     match system.gates[gid] {
         Gate::Add { in0, in1, out } => {
-            let (l0, l1, lo) = (labels[in0.wid].clone(), labels[in1.wid].clone(), labels[out.wid].clone());
+            let (l0, l1, lo) = (
+                labels[in0.wid].clone(),
+                labels[in1.wid].clone(),
+                labels[out.wid].clone(),
+            );
             if let (Some(a), Some(b)) = (&l0, &l1) {
                 try_set(labels, out, label::add(a, b), queue, system); // out = in0 + in1
             }
@@ -136,7 +145,11 @@ fn fire_gate(
             }
         }
         Gate::Sub { in0, in1, out } => {
-            let (l0, l1, lo) = (labels[in0.wid].clone(), labels[in1.wid].clone(), labels[out.wid].clone());
+            let (l0, l1, lo) = (
+                labels[in0.wid].clone(),
+                labels[in1.wid].clone(),
+                labels[out.wid].clone(),
+            );
             if let (Some(a), Some(b)) = (&l0, &l1) {
                 try_set(labels, out, label::sub(a, b), queue, system); // out = in0 - in1
             }
@@ -150,7 +163,13 @@ fn fire_gate(
         Gate::Mul { in0, scalar, out } => {
             // label_out = s · label_in; when s = 0 the output label is 0 regardless.
             if scalar == 0 {
-                try_set(labels, out, Label::zero(system.is_cf(out), system.modulus(out)), queue, system);
+                try_set(
+                    labels,
+                    out,
+                    Label::zero(system.is_cf(out), system.modulus(out)),
+                    queue,
+                    system,
+                );
             } else if let Some(a) = labels[in0.wid].clone() {
                 try_set(labels, out, label::scalar_mul(scalar, &a), queue, system);
             }

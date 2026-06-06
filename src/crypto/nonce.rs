@@ -2,10 +2,7 @@
 //!
 //! Every CCRH call `H(seed, nonce)` must use a fresh `nonce` for a given seed
 //! (paper App. A, Def. 4: a query sequence is legal iff no `(seed, nonce)`
-//! repeats). Reusing a pair reuses the one-time pad it produces — a two-time-pad
-//! break that leaks the masked secret. The information-theoretic GC draws its
-//! body-switch nonces from here so legality holds *by construction* (monotonic,
-//! non-overlapping ranges) rather than by hand-threaded counters.
+//! repeats).
 
 /// A monotonic allocator of disjoint nonce ranges.
 #[derive(Debug, Default, Clone)]
@@ -19,8 +16,7 @@ impl NonceAllocator {
         Self { next: 0 }
     }
 
-    /// Reserve a contiguous block of `count` nonces; returns its base. Ranges
-    /// are issued in increasing order, so they are disjoint by construction.
+    /// Reserve a contiguous block of `count` nonces; returns its base.
     pub fn reserve(&mut self, count: u64) -> u64 {
         let base = self.next;
         self.next = self

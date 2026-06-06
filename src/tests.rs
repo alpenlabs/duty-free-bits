@@ -53,8 +53,14 @@ fn assert_s_aff_streaming_correct(
         .iter()
         .map(|&b| pipeline.seed_input_cf_value(rng, 2, b))
         .collect();
-    let outputs =
-        build_s_aff_streaming(&mut pipeline, &bit_ids, &input_bits, params, &a_residues, &b_residues);
+    let outputs = build_s_aff_streaming(
+        &mut pipeline,
+        &bit_ids,
+        &input_bits,
+        params,
+        &a_residues,
+        &b_residues,
+    );
 
     // Known answer: (a_j·x + b_j) mod p_i, in small modular arithmetic
     // (operands < p_i ≤ 409, so products fit u64).
@@ -538,8 +544,12 @@ fn test_s_aff_scaling() {
 
     let mut rng = rng();
     let max_x = 1u64 << n;
-    let a_vals: Vec<u64> = (0..s_dim).map(|_| rng.random_range(0..1u64 << 48)).collect();
-    let b_vals: Vec<u64> = (0..s_dim).map(|_| rng.random_range(0..1u64 << 48)).collect();
+    let a_vals: Vec<u64> = (0..s_dim)
+        .map(|_| rng.random_range(0..1u64 << 48))
+        .collect();
+    let b_vals: Vec<u64> = (0..s_dim)
+        .map(|_| rng.random_range(0..1u64 << 48))
+        .collect();
     let x: u64 = rng.random_range(0..max_x);
 
     let a_residues: Vec<Vec<u64>> = params

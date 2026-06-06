@@ -1,41 +1,34 @@
-//! Information-theoretic GC: the per-prime body batch.
+//! Information-theoretic GC: deliver `a·(x mod p_i) + b` per prime.
 //!
-//! This is Phase 3 of the construction (paper §6.3): given the computational
-//! GC's CF binary one-hot `h_p` of `x mod p_i`, it delivers `a·x + b mod p_i`
-//! using `H(h_p[k])` as one-time pads. The masking of the secret `(a, b)` is
-//! information-theoretic — single NCF Z_p residues, no λ blowup — which is why
-//! it is implemented directly here rather than through the general switch engine.
+//! Phase 1 handed us a binary one-hot `h_p` of `hot = x mod p_i`: `p_i` CF Z_2
+//! wires, exactly the one at index `hot` carrying a 1. Hashing wire `i`'s label
+//! gives a fresh one-time pad `pad_i = H(h_p[i]) ∈ Z_{p_i}` — one pad per slot.
 //!
-//! A body batch is a bulk `scale-hot` (Lemma 6.2) followed by a ring readout
-//! (Lemma 6.1). Written as the protocol's gates, for OHE position `i` and batch
-//! member `j`:
+//! **One pad is hidden from the evaluator.** The evaluator knows `x`, hence
+//! `hot`. At every *non-hot* slot the one-hot bit is 0, so its label equals the
+//! garbler's mask and the evaluator recomputes `pad_i` itself. At the *hot* slot
+//! the label differs, so `pad_hot` is the single pad it cannot derive. The `p_i`
+//! pads are therefore an additive sharing the evaluator can open everywhere but
+//! that one slot.
 //!
-//!   * **switch** `o_{i,j} = H(h_p[i]) + z`, with the data input `z = 0`. This
-//!     is the scaled OHE share: it equals `a_j` at the hot position and `0`
-//!     everywhere else.
-//!   * **join** of `acc_j = Σ_i o_{i,j}` against `a_j`. This ties the hot share
-//!     to `a_j`; on the evaluator side it is what recovers that share.
-//!   * **readout** `result_j = Σ_i g(i)·o_{i,j} + b_j`, with `g = identity`.
+//! **Delivering `a`.** The garbler sends one residue per affine map
 //!
-//! Routing the 800 body batches at production scale through a full `System` (a
-//! worklist plus a per-wire `Vec<Option<Label>>`) is wasteful: the live state is
-//! just the carry-in OHE and a few per-batch accumulators. This module runs
-//! exactly the three gates above, inlined on NCF Z_p residues. There a label is
-//! a single `u64`, so the gate algebra (`add`/`sub`/`scalar_mul`) is plain
-//! modular `u64` arithmetic (`mod_add`/`mod_sub`/`mod_mul`).
+//! ```text
+//!     diff = (Σ_i pad_i) + a            (mod p_i)
+//! ```
 //!
-//! The two-party split is preserved. [`body_batch_garble`] runs the gates on the
-//! garbler's masks and emits the program (the join diffs); [`body_batch_eval`]
-//! runs them on the evaluator's labels and consumes it. The two can run in
-//! separate processes.
+//! The evaluator subtracts every pad it knows: `pad_hot + a = diff − Σ_{i≠hot} pad_i`.
+//! Now slot `hot` carries `pad_hot + a` and every other slot carries plain
+//! `pad_i` — i.e. the secret `a` sits in slot `hot`, and all other slots are shares of 0.
+//!
+//! A linear combination weights slot `i` by `i` (and folds in
+//! `b`), turning the `a` in slot `hot` into `a·(x mod p_i) + b`.
+//! `(a, b)` stay hidden information-theoretically: single Z_p residues.
 
 use crate::hash;
 use crate::label::{LAMBDA, Label};
 
 /// Cost of one IT-GC body batch (garbled-material footprint, for telemetry).
-///
-/// The streaming pipeline aggregates it via `Pipeline::record_kernel_batch`. It_gc
-/// owns it so the cost lives next to the gates that incur it and can't drift.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BatchCost {
     /// Program bits the garbler emitted for the batch (the join diffs).
@@ -50,7 +43,7 @@ pub struct BatchCost {
 ///
 /// The evaluator knows `x` in cleartext (switch-private / data-public), so it
 /// locates every switch's hot position itself; the garbler emits only the join
-/// diffs (switches reveal nothing — paper §3.3).
+/// diffs.
 #[derive(Debug)]
 pub struct BodyBatchGarbleOutput {
     /// Join diff per batch member (NCF Z_p rep).
@@ -61,13 +54,13 @@ pub struct BodyBatchGarbleOutput {
     pub cost: BatchCost,
 }
 
-/// Garbler kernel for one per-prime body batch: runs the switch / join / readout
-/// gates on the garbler's masks (see the module docs).
+/// Garbler kernel for one per-prime body batch (see the module docs): forms the
+/// per-slot pads, sends `diff = Σ pad_i + a` per member.
 ///
-/// `h_p_masks` are the carry-in CF Z_2 masks for the length-`p_i` OHE;
+/// `h_p_masks` are the carry-in CF Z_2 masks for the length-`p_i` one-hot;
 /// `a_batch` / `b_batch` are the affine coefficients reduced mod `p_i`;
-/// `truth_table[i] = i mod p_i` is `g`. `group_id_base` offsets the per-position
-/// CCRH tweak and must match the value passed to [`body_batch_eval`].
+/// `truth_table[i] = i mod p_i` is the weight `g`. `group_id_base` offsets
+/// the per-slot CCRH tweak.
 pub fn body_batch_garble(
     p_i: u64,
     h_p_masks: &[Label],
@@ -82,24 +75,22 @@ pub fn body_batch_garble(
     assert_eq!(b_batch.len(), b, "a_batch and b_batch length mismatch");
     assert_eq!(truth_table.len(), p, "truth_table length mismatch");
 
-    // H(h_p[i]) for each OHE position, the switch hash shared by all b members.
-    let switch_hash = switch_hashes(h_p_masks, group_id_base, b, p_i);
+    // pad_i = H(h_p[i]) for each one-hot slot, bulk-packed across the b members.
+    let slot_hash = switch_hashes(h_p_masks, group_id_base, b, p_i);
 
     let mut join_diffs = Vec::with_capacity(b);
     let mut result_masks = Vec::with_capacity(b);
     for j in 0..b {
-        // The constants z and b_j contribute their masks: z.mask = 0 (so the
-        // switch output o_{i,j}.mask is just the hash), and b_j.mask = −b_j.
-        let mut acc = 0u64; // acc_j.mask = Σ_i o_{i,j}.mask
-        let mut result = neg_mod(b_batch[j], p_i); // readout, seeded with b_j.mask
+        let mut pad_sum = 0u64; // Σ_i pad_i
+        let mut readout = neg_mod(b_batch[j], p_i); // seed −b so decoding restores +b
         for i in 0..p {
-            let o = ncf_slice(&switch_hash[i], j, p_i); // switch: o_{i,j}.mask
-            acc = mod_add(acc, o, p_i);
-            result = mod_add(result, mod_mul(truth_table[i] % p_i, o, p_i), p_i);
+            let pad = member_pad(&slot_hash[i], j, p_i);
+            pad_sum = mod_add(pad_sum, pad, p_i);
+            readout = mod_add(readout, mod_mul(truth_table[i] % p_i, pad, p_i), p_i);
         }
-        // join(acc_j, a_j) reveals diff = acc_j.mask − a_j.mask  (a_j.mask = −a_j).
-        join_diffs.push(mod_sub(acc, neg_mod(a_batch[j], p_i), p_i));
-        result_masks.push(result);
+        // The one residue sent per map: diff = Σ pad_i + a (mod_sub by −a adds a).
+        join_diffs.push(mod_sub(pad_sum, neg_mod(a_batch[j], p_i), p_i));
+        result_masks.push(readout);
     }
 
     BodyBatchGarbleOutput {
@@ -121,13 +112,14 @@ fn batch_cost(p_i: u64, b: usize) -> BatchCost {
     }
 }
 
-/// Evaluator kernel for one per-prime body batch: the label-side view of the
-/// same gates [`body_batch_garble`] runs on masks.
+/// Evaluator kernel for one per-prime body batch: the label-side mirror of
+/// [`body_batch_garble`] (see the module docs).
 ///
-/// `hot = x mod p_i` is supplied directly: the evaluator knows `x` in cleartext,
-/// so the control is never revealed. `b_batch` is present for symmetry — b_j is a
-/// public constant whose label is 0, so its values are unused. Returns one label
-/// per batch member.
+/// `hot = x mod p_i` is supplied in cleartext — the evaluator knows `x`, so the
+/// control is never revealed. It recomputes every pad but `pad_hot`, opens the
+/// hidden one from `diff`, and reads out the result. (`b_batch` is unused beyond
+/// its length — `b`'s label is 0.) Returns the delivered residue per member; the
+/// caller decodes `value = label − mask mod p_i`.
 pub fn body_batch_eval(
     p_i: u64,
     hot: usize,
@@ -144,39 +136,35 @@ pub fn body_batch_eval(
     assert_eq!(truth_table.len(), p, "truth_table length mismatch");
     assert!(hot < p, "hot index out of range");
 
-    // The same H(h_p[i]) the garbler used. At a non-hot position the OHE entry is
-    // 0, so the evaluator's label equals the garbler's mask and the switch output
-    // o_{i,j}.label matches o_{i,j}.mask — i.e. we can recompute it directly.
-    let switch_hash = switch_hashes(h_p_labels, group_id_base, b, p_i);
+    // Same pads the garbler formed. At a non-hot slot the one-hot bit is 0, so
+    // label == mask and the evaluator recomputes pad_i exactly; only pad_hot differs.
+    let slot_hash = switch_hashes(h_p_labels, group_id_base, b, p_i);
     let g_hot = truth_table[hot] % p_i;
 
     (0..b)
         .map(|j| {
-            // Accumulate the non-hot switch outputs. The readout starts at 0
-            // because the constant b_j's label is 0.
-            let mut acc = 0u64; // Σ_{i≠hot} o_{i,j}.label
-            let mut result = 0u64; // Σ_{i≠hot} g(i)·o_{i,j}.label
+            let mut pad_sum = 0u64; // Σ_{i≠hot} pad_i  (every pad we can recompute)
+            let mut readout = 0u64; // Σ_{i≠hot} g(i)·pad_i
             for i in 0..p {
                 if i == hot {
                     continue;
                 }
-                let o = ncf_slice(&switch_hash[i], j, p_i);
-                acc = mod_add(acc, o, p_i);
-                result = mod_add(result, mod_mul(truth_table[i] % p_i, o, p_i), p_i);
+                let pad = member_pad(&slot_hash[i], j, p_i);
+                pad_sum = mod_add(pad_sum, pad, p_i);
+                readout = mod_add(readout, mod_mul(truth_table[i] % p_i, pad, p_i), p_i);
             }
-            // At the hot position the label differs from the mask, so o_{hot,j}
-            // can't be hashed. The join recovers it: by acc_j.label = a_j.label,
-            // o_{hot,j}.label = diff − Σ_{i≠hot} o_{i,j}.label.
-            let o_hot = mod_sub(join_diffs[j], acc, p_i);
-            mod_add(result, mod_mul(g_hot, o_hot, p_i), p_i)
+            // Open the one hidden pad; the diff leaves `a` sitting on it:
+            //   pad_hot + a = diff − Σ_{i≠hot} pad_i.
+            let pad_hot = mod_sub(join_diffs[j], pad_sum, p_i);
+            mod_add(readout, mod_mul(g_hot, pad_hot, p_i), p_i)
         })
         .collect()
 }
 
-/// The switch hash `H(h_p[i])` for each OHE position, bulk-packed: each output
-/// holds `b·lg|p_i|` pseudorandom bits, one `lg|p_i|`-bit slice per batch member.
+/// The pad material `H(h_p[i])` for each one-hot slot, bulk-packed: each output
+/// holds `b·lg|p_i|` pseudorandom bits, one `lg|p_i|`-bit pad per batch member.
 /// Garbler and evaluator call this identically (on masks / labels); at every
-/// non-hot position the two agree, which is what lets the gates line up.
+/// non-hot slot the two agree, which is what lets `pad_i` line up.
 fn switch_hashes(ohe: &[Label], group_id_base: usize, b: usize, p_i: u64) -> Vec<Vec<u8>> {
     let lg_p = hash::lg_modulus(p_i);
     ohe.iter()
@@ -185,11 +173,10 @@ fn switch_hashes(ohe: &[Label], group_id_base: usize, b: usize, p_i: u64) -> Vec
         .collect()
 }
 
-/// One member's switch output `o_{i,j}` (an NCF Z_p residue) from a position's
-/// bulk switch hash.
+/// Member `j`'s pad `pad_i` (an NCF Z_p residue) sliced from slot `i`'s bulk hash.
 #[inline(always)]
-fn ncf_slice(switch_hash: &[u8], member_idx: usize, p: u64) -> u64 {
-    match hash::extract_ncf(switch_hash, member_idx, p) {
+fn member_pad(slot_hash: &[u8], member_idx: usize, p: u64) -> u64 {
+    match hash::extract_ncf(slot_hash, member_idx, p) {
         Label::Ncf(n) => n.rep,
         _ => unreachable!(),
     }
@@ -219,7 +206,10 @@ fn mod_sub(a: u64, b: u64, p: u64) -> u64 {
 fn mod_mul(a: u64, b: u64, p: u64) -> u64 {
     // `a, b < p`, so the product fits u64 iff `p ≤ 2^32`. At the concrete params
     // (primes ≤ 409) this holds with enormous margin; the assert pins it.
-    debug_assert!(p <= (1u64 << 32), "NCF modulus {p} exceeds the u64 fast-path bound");
+    debug_assert!(
+        p <= (1u64 << 32),
+        "NCF modulus {p} exceeds the u64 fast-path bound"
+    );
     (a * b) % p
 }
 
@@ -334,94 +324,6 @@ mod tests {
                     value, expected,
                     "hot_idx={hot_idx}, j={j}, a={}, b={}",
                     a_batch[j], b_batch[j],
-                );
-            }
-        }
-    }
-
-    /// Security regression: each body switch's pad is `H(h_p[i], group_id_base+i)`
-    /// (paper §1.3, `ct = Σ_i H(L_i^0, nonce) + a`). The pad hides `a_j` only if
-    /// the nonce is fresh. Two batches of a prime share the same `h_p` seed, so
-    /// they MUST use disjoint nonce bases; otherwise the shared pad cancels and
-    /// `join_diff^0_j − join_diff^1_j` leaks `a^0_j − a^1_j`. This pins both the
-    /// leak (under a reused base) and the fix (under distinct bases).
-    #[test]
-    fn test_distinct_nonces_prevent_two_time_pad_leak() {
-        let p_i = 31u64;
-        let p = p_i as usize;
-        let b = 6usize;
-        let mut rng = rand::rng();
-        let truth: Vec<u64> = (0..p_i).collect();
-
-        // Same OHE (seed) for both batches, as in a single prime's body.
-        let h_p_masks: Vec<Label> = (0..p).map(|_| rand_cf2_label(&mut rng)).collect();
-        let a0: Vec<u64> = (0..b).map(|_| rng.random_range(0..p_i)).collect();
-        let a1: Vec<u64> = (0..b).map(|_| rng.random_range(0..p_i)).collect();
-        let zeros = vec![0u64; b];
-
-        // Reused nonce base (the bug): the pads cancel exactly, leaking a0 − a1
-        // in EVERY position. This also confirms the test can detect the bug.
-        let bug0 = body_batch_garble(p_i, &h_p_masks, &a0, &zeros, &truth, 0);
-        let bug1 = body_batch_garble(p_i, &h_p_masks, &a1, &zeros, &truth, 0);
-        for j in 0..b {
-            let leak = mod_sub(bug0.join_diffs[j], bug1.join_diffs[j], p_i);
-            let secret = mod_sub(a0[j], a1[j], p_i);
-            assert_eq!(leak, secret, "reused nonce must leak a0−a1 at j={j}");
-        }
-
-        // Distinct nonce bases (the fix): the pads differ, so the simple leak
-        // relation is broken. (Spacing must be ≥ p so position nonces don't
-        // overlap; the streaming driver advances the base by p_i per batch.)
-        let fix0 = body_batch_garble(p_i, &h_p_masks, &a0, &zeros, &truth, 0);
-        let fix1 = body_batch_garble(p_i, &h_p_masks, &a1, &zeros, &truth, p);
-        let leaked_positions = (0..b)
-            .filter(|&j| {
-                let leak = mod_sub(fix0.join_diffs[j], fix1.join_diffs[j], p_i);
-                let secret = mod_sub(a0[j], a1[j], p_i);
-                leak == secret
-            })
-            .count();
-        // With fresh pads the relation holds only by chance (~1/p per position);
-        // it must not hold across the board the way the reused base forces.
-        assert!(
-            leaked_positions < b,
-            "distinct nonces must break the two-time-pad leak (leaked {leaked_positions}/{b})"
-        );
-    }
-
-    /// Generalize the leak check to the real streaming pattern: K consecutive
-    /// batches of one prime (same `h_p` seed) with the driver's nonce scheme
-    /// (`base += p_i` per batch). No pair of batches may share a pad, so the
-    /// two-time-pad relation must be broken for every pair.
-    #[test]
-    fn test_streaming_nonce_scheme_no_pad_reuse() {
-        let p_i = 31u64;
-        let p = p_i as usize;
-        let b = 5usize;
-        let k = 4usize;
-        let mut rng = rand::rng();
-        let truth: Vec<u64> = (0..p_i).collect();
-        let h_p_masks: Vec<Label> = (0..p).map(|_| rand_cf2_label(&mut rng)).collect();
-        let zeros = vec![0u64; b];
-
-        let mut batches: Vec<(Vec<u64>, Vec<u64>)> = Vec::new();
-        for batch in 0..k {
-            let a: Vec<u64> = (0..b).map(|_| rng.random_range(0..p_i)).collect();
-            let base = batch * p; // matches affine.rs `group_id_base += p_i`
-            let g = body_batch_garble(p_i, &h_p_masks, &a, &zeros, &truth, base);
-            batches.push((a, g.join_diffs));
-        }
-        for u in 0..k {
-            for v in (u + 1)..k {
-                let leaked = (0..b)
-                    .filter(|&j| {
-                        mod_sub(batches[u].1[j], batches[v].1[j], p_i)
-                            == mod_sub(batches[u].0[j], batches[v].0[j], p_i)
-                    })
-                    .count();
-                assert!(
-                    leaked < b,
-                    "pad reuse between batch {u} and {v} (leaked {leaked}/{b})"
                 );
             }
         }

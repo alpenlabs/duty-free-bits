@@ -1,9 +1,8 @@
-//! One-hot encoding primitives (paper §6.2).
+//! One-hot encoding primitives.
 //!
 //! [`ohe`] builds a binary one-hot from input bits (one switch per output
 //! position, then `n-1` binary joins); [`ohe_scale`] turns a binary one-hot
-//! into a ring vector whose hot entry carries a scalar `s`. These are the
-//! building blocks the bit→word→one-hot conversions in [`super::convert`] compose.
+//! into a ring vector whose hot entry carries a scalar `s`.
 
 use crate::system::System;
 use crate::types::*;

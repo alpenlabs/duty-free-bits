@@ -10,5 +10,5 @@ pub mod ohe;
 pub mod program;
 
 pub use evaluator::eval_with_labels;
-pub use garbler::{garble, normalize_delta};
+pub use garbler::garble;
 pub use program::Program;

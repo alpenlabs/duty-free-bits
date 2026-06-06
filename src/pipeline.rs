@@ -1,27 +1,23 @@
 //! Streaming garble + eval pipeline.
 //!
 //! Garbling the whole computation as one `System` would hold every wire's mask
-//! and label in memory at once — at n=256, S=1280 that is tens of millions of
-//! wires alive simultaneously, almost all short-lived intermediates. `Pipeline`
-//! instead executes the computation as a sequence of *phases*:
+//! and label in memory at once. Instead, `Pipeline` executes the computation as a sequence of *phases*:
 //!
 //! 1. Allocate a fresh `System` for the phase.
 //! 2. Re-bind a small carry-forward set of `(mask, label, value)` triples from
 //!    previous phases as the new System's input wires.
 //! 3. Run the caller's gate-construction closure.
 //! 4. Garble + evaluate the sub-System (the evaluator runs a cleartext `Exec`
-//!    pass over the carried values to read switch controls — no reveal).
+//!    pass over the carried values to read switch controls).
 //! 5. Extract `(mask, label, value)` for the wires the caller declares as outputs.
 //! 6. Drop the System; only the new carry items survive.
 //!
-//! Peak memory collapses to the largest single phase plus the carry set. Δ is
-//! global and the invariant `label = mask + value · Δ_R(modulus)` holds across
-//! phase boundaries.
+//! Peak memory collapses to the largest single phase plus the carry set. Δ is global.
 
 use crate::comp_gc::eval_with_labels;
-use crate::comp_gc::{garble, normalize_delta};
-use crate::label::{self, CfLabel, LAMBDA, Label};
+use crate::comp_gc::garble;
 use crate::exec::Exec;
+use crate::label::{self, CfLabel, LAMBDA, Label};
 use crate::system::System;
 use crate::types::{Val, Wire};
 use rand::Rng;
@@ -32,9 +28,9 @@ pub type CarryId = usize;
 /// One carry-forward wire's state.
 ///
 /// `mask` is the garbler's value for the wire; `label` is the evaluator's.
-/// They satisfy `label = mask + value · Δ_R(modulus)`. `value` is the wire's
+/// They satisfy `label = mask + value · Δ_R`. `value` is the wire's
 /// cleartext value, known to the evaluator (it knows `x`) — it seeds the next
-/// phase's `Exec` so the evaluator can read switch controls without any reveal.
+/// phase's `Exec` so the evaluator can read switch controls.
 #[derive(Clone, Debug)]
 pub struct CarryItem {
     /// Modulus of the wire's ring.
@@ -74,7 +70,7 @@ use crate::it_gc::BatchCost;
 /// with [`decode_ncf`](Pipeline::decode_ncf).
 #[derive(Debug)]
 pub struct Pipeline {
-    /// Global Free-XOR Δ (low bit forced to 1; see `normalize_delta`).
+    /// Global Free-XOR Δ: uniformly random, secret, and nonzero.
     pub delta: u128,
     /// Carry slots; `None` after [`drop_carry`](Pipeline::drop_carry).
     carry: Vec<Option<CarryItem>>,
@@ -109,14 +105,14 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
-    /// New pipeline with a freshly-sampled, normalized Δ.
+    /// New pipeline with a freshly-sampled Δ.
     pub fn new<R: Rng>(rng: &mut R) -> Self {
-        Self::with_delta(normalize_delta(rng.random()))
+        Self::with_delta(rng.random())
     }
 
-    /// New pipeline with an explicit Δ. `delta` must already have low bit 1.
+    /// New pipeline with an explicit Δ.
     pub fn with_delta(delta: u128) -> Self {
-        assert_eq!(delta & 1, 1, "Δ must have low bit 1 (call normalize_delta)");
+        debug_assert!(delta != 0, "Δ must be nonzero");
         Self {
             delta,
             carry: Vec::new(),
@@ -138,8 +134,7 @@ impl Pipeline {
 
     /// Seed a CF input wire with a known value (e.g. an input bit).
     ///
-    /// Samples a uniform mask, computes `label = mask + value · Δ_R`, and
-    /// registers a carry item.
+    /// Samples a uniform mask and registers a carry item.
     pub fn seed_input_cf_value<R: Rng>(
         &mut self,
         rng: &mut R,
@@ -224,7 +219,7 @@ impl Pipeline {
         self.garble_secs += t_garble.elapsed().as_secs_f64();
 
         // Evaluate. The evaluator knows x, so it runs a cleartext `Exec` pass to
-        // obtain every switch control (paper §3.3 — no reveal), then propagates
+        // obtain every switch control, then propagates
         // labels. The same pass yields the output wires' cleartext values.
         let input_labels: Vec<Label> = inputs
             .iter()
@@ -242,7 +237,6 @@ impl Pipeline {
             &input_wires,
             &input_labels,
             exec.values(),
-            self.delta,
             &program,
             &output_wires,
         );

@@ -5,11 +5,7 @@
 //!
 //! * `Add`/`Sub`: bidirectional — any two of (in0, in1, out) determine the third.
 //! * `Mul(s, x)`: the output mask is `s · X_x`. When `s = 0` this is `0`
-//!   regardless of `X_x`, so the gate can fire without its input being masked.
-//!   This isn't a shortcut — it's the gate's defining equation. It matters
-//!   because the last iteration of `word_to_hot_with_bits` is exactly
-//!   `Mul(0, acc[0])`, and that's how the circular phantom-bit construction
-//!   gets its first mask.
+//!   regardless of `X_x`, so the gate can fire without its input being masked (required to break circularity in the last iteration of `word_to_hot_with_bits`)
 //! * `Mod2k` / `Div2k`: forward only (non-invertible at the mask level).
 //! * `Switch`: bidirectional (ctrl+data → out, ctrl+out → data) using
 //!   `Y = H(X_ctrl, gid) + X_data`. Garbler does not branch on ctrl value —
@@ -17,16 +13,15 @@
 //! * `Join`: does not propagate masks (both sides are independently determined).
 //! * `SameWire`: symmetric copy.
 //!
-//! Δ is the global Free-XOR offset; its low bit is forced to 1 so that `Δ_R(2)`
-//! is nonzero and CF Z_2 labels distinguish 0 from 1.
-//!
+//! Δ is the global Free-XOR offset: sampled uniformly at random and kept secret
+//! from the evaluator.
 //! A final pass over gates in creation order emits the join diffs (the only
 //! switch-system communication — switches reveal nothing) and appends the
 //! declared output masks.
 
+use super::program::Program;
 use crate::hash;
 use crate::label::{self, Label, NcfLabel};
-use super::program::Program;
 use crate::system::System;
 use crate::types::{Gate, GateId, Wire};
 
@@ -62,12 +57,6 @@ fn switch_hash(
     }
 }
 
-/// Force Δ's low bit to 1, so `Δ_R(2)` is nonzero (CF Z_2 labels must separate
-/// value 0 from value 1).
-pub fn normalize_delta(delta: u128) -> u128 {
-    delta | 1
-}
-
 /// Garble `system`, exposing `input_wires` as evaluator-chosen inputs and
 /// `output_wires` as NCF outputs she will recover.
 pub fn garble(
@@ -78,7 +67,6 @@ pub fn garble(
     delta: u128,
 ) -> Program {
     assert_eq!(input_wires.len(), input_masks.len());
-    assert_eq!(delta & 1, 1, "Δ must have low bit 1 (call normalize_delta)");
 
     let mut masks: Vec<Option<Label>> = vec![None; system.num_wires()];
 
@@ -104,7 +92,11 @@ pub fn garble(
     // Seed 2: declared inputs (CF, caller-supplied).
     for (&w, m) in input_wires.iter().zip(input_masks.iter()) {
         assert!(system.is_cf(w), "input wire {} must be CF", w.wid);
-        assert_eq!(m.modulus(), system.modulus(w), "input mask modulus mismatch");
+        assert_eq!(
+            m.modulus(),
+            system.modulus(w),
+            "input mask modulus mismatch"
+        );
         assert!(m.is_cf(), "input mask must be CF");
         assert!(
             masks[w.wid].is_none(),
@@ -164,7 +156,11 @@ fn propagate_gate(
     match system.gates[gid] {
         Gate::Add { in0, in1, out } => {
             // out = in0 + in1  ⇔  in0 = out - in1  ⇔  in1 = out - in0
-            let (m0, m1, mo) = (masks[in0.wid].clone(), masks[in1.wid].clone(), masks[out.wid].clone());
+            let (m0, m1, mo) = (
+                masks[in0.wid].clone(),
+                masks[in1.wid].clone(),
+                masks[out.wid].clone(),
+            );
             if let (Some(a), Some(b)) = (&m0, &m1) {
                 try_set(masks, out, label::add(a, b), queue, system);
             }
@@ -177,7 +173,11 @@ fn propagate_gate(
         }
         Gate::Sub { in0, in1, out } => {
             // out = in0 - in1  ⇔  in0 = out + in1  ⇔  in1 = in0 - out
-            let (m0, m1, mo) = (masks[in0.wid].clone(), masks[in1.wid].clone(), masks[out.wid].clone());
+            let (m0, m1, mo) = (
+                masks[in0.wid].clone(),
+                masks[in1.wid].clone(),
+                masks[out.wid].clone(),
+            );
             if let (Some(a), Some(b)) = (&m0, &m1) {
                 try_set(masks, out, label::sub(a, b), queue, system);
             }
@@ -192,7 +192,13 @@ fn propagate_gate(
             // X_out = s · X_in. When s = 0 this is 0 regardless of X_in, so the
             // gate is fireable without its input being masked.
             if scalar == 0 {
-                try_set(masks, out, Label::zero(system.is_cf(out), system.modulus(out)), queue, system);
+                try_set(
+                    masks,
+                    out,
+                    Label::zero(system.is_cf(out), system.modulus(out)),
+                    queue,
+                    system,
+                );
             } else if let Some(a) = masks[in0.wid].clone() {
                 try_set(masks, out, label::scalar_mul(scalar, &a), queue, system);
             }

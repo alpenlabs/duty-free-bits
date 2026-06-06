@@ -1,21 +1,16 @@
-//! Label-aware CCRH facade for switch gates.
+//! Label-aware CCRH for switch gates.
 //!
-//! Wraps the `Label`-free CCRH core ([`crate::crypto`]) with the label↔block
-//! encoding and the per-output sizing the garbler/evaluator need:
-//!
-//!   * [`hash_solo`] — one switch's H output, sized for its output wire.
-//!   * [`hash_bulk`] — one wide H output for a switch group; sliced via
-//!     [`extract_ncf`] across NCF members.
-//!
-//! Switch controls are always CF Z_2, so the hash seed is exactly 128 bits.
-//! The `nonce` passed to the core is the gate id (solo) or the group id with the
-//! bulk flag set; the caller guarantees freshness (see [`crate::crypto::nonce`]).
+//! Wraps the `Label`-free CCRH core ([`crate::crypto`]) with the label↔block encoding.
 
 use crate::crypto::{Block, expand};
 use crate::label::{self, CfLabel, LAMBDA, Label, NcfLabel};
 use crate::types::GateId;
 
 /// `⌈log₂ modulus⌉` (number of bits needed to represent values < modulus).
+///
+/// TODO: For a non-power-of-two NCF modulus `p`, this
+/// tight width makes an extracted slice's `value % p` *non-uniform* — residues
+/// `0..(2^⌈log₂ p⌉ − p)` occur twice, the rest once, which might leak something.
 pub fn lg_modulus(modulus: u64) -> usize {
     if modulus <= 1 {
         0
@@ -24,42 +19,22 @@ pub fn lg_modulus(modulus: u64) -> usize {
     }
 }
 
-/// Compress a label down to a 128-bit block suitable as CCRND's `x` input.
+/// Convert a switch control label to a 128-bit block for CCRND's `x` input.
 ///
-/// In our protocol switch ctrls are always CF Z_2, so the input is exactly
-/// 128 bits and we just copy the bit-packed storage. (Wider inputs are folded
-/// by XOR'ing 16-byte chunks; in practice we never call H on those.)
+/// Switch controls are always CF Z_2, whose bit-packed storage is exactly
+/// 2 u64 = 16 bytes — so this is a direct copy. Any other label kind is a
+/// caller bug.
 fn label_to_block(l: &Label) -> Block {
-    match l {
-        Label::Cf(c) => {
-            let raw = c.raw_bits();
-            // Z_2 case: exactly 2 u64 = 16 bytes.
-            if raw.len() == 2 {
-                let mut bytes = [0u8; 16];
-                bytes[0..8].copy_from_slice(&raw[0].to_le_bytes());
-                bytes[8..16].copy_from_slice(&raw[1].to_le_bytes());
-                bytes
-            } else {
-                // Wider CF: XOR-fold the raw words into one 16-byte block.
-                // Not used by switches today, but defined to be deterministic.
-                let mut acc = [0u8; 16];
-                for (i, &w) in raw.iter().enumerate() {
-                    let lane = (i & 1) * 8;
-                    let bytes = w.to_le_bytes();
-                    for b in 0..8 {
-                        acc[lane + b] ^= bytes[b];
-                    }
-                }
-                acc
-            }
-        }
-        Label::Ncf(n) => {
-            let mut bytes = [0u8; 16];
-            bytes[0..8].copy_from_slice(&n.rep.to_le_bytes());
-            bytes[8..16].copy_from_slice(&n.modulus.to_le_bytes());
-            bytes
-        }
-    }
+    let Label::Cf(c) = l else {
+        panic!("label_to_block: switch control must be CF Z_2, got NCF");
+    };
+    debug_assert_eq!(c.modulus(), 2, "label_to_block: switch control must be Z_2");
+    let raw = c.raw_bits();
+    debug_assert_eq!(raw.len(), 2, "CF Z_2 label must be exactly 2 u64 words");
+    let mut bytes = [0u8; 16];
+    bytes[0..8].copy_from_slice(&raw[0].to_le_bytes());
+    bytes[8..16].copy_from_slice(&raw[1].to_le_bytes());
+    bytes
 }
 
 /// CCRH for a single switch gate.
@@ -70,7 +45,10 @@ pub fn hash_solo(ctrl_mask: &Label, gid: GateId, out_is_cf: bool, out_modulus: u
     );
     let seed = label_to_block(ctrl_mask);
     // Bit 63 is the solo/bulk domain flag, so the nonce must leave it clear.
-    debug_assert!((gid as u64) < (1u64 << 63), "switch gid uses the bulk-domain bit");
+    debug_assert!(
+        (gid as u64) < (1u64 << 63),
+        "switch gid uses the bulk-domain bit"
+    );
     let domain = gid as u64; // solo: bit 63 = 0.
     if out_is_cf {
         let k = out_modulus.trailing_zeros() as usize;
@@ -93,7 +71,11 @@ pub fn hash_solo(ctrl_mask: &Label, gid: GateId, out_is_cf: bool, out_modulus: u
             }
         }
         Label::Ncf(NcfLabel {
-            rep: if out_modulus == 0 { 0 } else { value % out_modulus },
+            rep: if out_modulus == 0 {
+                0
+            } else {
+                value % out_modulus
+            },
             modulus: out_modulus,
         })
     }
@@ -108,7 +90,10 @@ pub fn hash_bulk(ctrl_mask: &Label, group_id: usize, total_bits: usize) -> Vec<u
     let seed = label_to_block(ctrl_mask);
     // Bulk: set bit 63 of the domain to disambiguate from solo.
     // Below the solo/bulk flag bit, so distinct group ids stay in the bulk domain.
-    debug_assert!((group_id as u64) < (1u64 << 63), "group id uses the bulk-domain bit");
+    debug_assert!(
+        (group_id as u64) < (1u64 << 63),
+        "group id uses the bulk-domain bit"
+    );
     let domain = (group_id as u64) | (1u64 << 63);
     let mut out = vec![0u8; total_bits.div_ceil(8)];
     expand(seed, domain, &mut out);
@@ -118,7 +103,11 @@ pub fn hash_bulk(ctrl_mask: &Label, group_id: usize, total_bits: usize) -> Vec<u
 /// Extract member `idx`'s NCF label from a wide bulk-hash output.
 pub fn extract_ncf(wide: &[u8], idx: usize, modulus: u64) -> Label {
     let lg_m = lg_modulus(modulus);
-    debug_assert!(lg_m <= 64, "extract_ncf: modulus {} too large for u64", modulus);
+    debug_assert!(
+        lg_m <= 64,
+        "extract_ncf: modulus {} too large for u64",
+        modulus
+    );
     let bit_off = idx * lg_m;
     let mut acc: u64 = 0;
     for i in 0..lg_m {
@@ -127,6 +116,7 @@ pub fn extract_ncf(wide: &[u8], idx: usize, modulus: u64) -> Label {
         let b = (wide[bit / 8] >> (bit % 8)) & 1;
         acc |= (b as u64) << i;
     }
+    // TODO: `acc` is exactly `lg_m = ⌈log₂ modulus⌉` bits, so `acc % modulus` is slightly biased toward small residues for a non-power-of-two `modulus`.
     let rep = if modulus == 0 { 0 } else { acc % modulus };
     Label::Ncf(NcfLabel { rep, modulus })
 }

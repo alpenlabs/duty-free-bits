@@ -1,45 +1,42 @@
-// Crate lints (kept in source so the modern `[lints]` Cargo table doesn't trip
-// the editor's stale schema). The `rust_2018_idioms` group is denied first so a
-// later specific lint can still override it.
+// Crate lints
 #![deny(rust_2018_idioms)]
 #![deny(unused_crate_dependencies, unused_must_use)]
 #![warn(missing_debug_implementations, unreachable_pub, missing_docs)]
 #![warn(rustdoc::all)]
 #![warn(clippy::too_long_first_doc_paragraph)]
-//! Switch system framework for garbled arithmetic circuits.
+//! Switch system framework for Duty Free Bits.
 //!
-//! Layered to mirror the protocol — a computational GC composed with an
-//! information-theoretic GC across a CCRH bridge:
-//! * [`label`] — CF (computational, λ-fold) and NCF (IT, single element) labels. Leaf.
-//! * [`crypto`] — the Label-free CCRH core + nonce discipline (the bridge). Leaf.
-//! * [`hash`] — the label-aware CCRH facade over `crypto`.
-//! * [`system`] + [`comp_gc`] (with builders [`comp_gc::ohe`]/[`comp_gc::convert`])
-//!   — the computational Yao GC engine (Phase 1: `bin(x)` → one-hot CRT).
-//! * [`it_gc`] — the information-theoretic GC (Phase 3: one-hot → `a·x+b`).
-//! * [`affine`] — composes the two via the streaming [`pipeline::Pipeline`].
+//! Structured as a computational GC composed with an information-theoretic GC.
+//! * [`label`] — CF (computational, λ-fold) and NCF (IT, single element) labels.
+//! * [`crypto`] — the CCRH core + nonce rules.
+//! * [`hash`] — the label-aware CCRH built atop `crypto`.
+//! * [`system`] + [`comp_gc`] — the computational Yao GC engine (Phase 1: `bin(x)` → hot(CRT(x))).
+//! * [`it_gc`] — the information-theoretic GC (Phase 3: hot(CRT(x)) → `a·x+b`).
+//! * [`affine`] — composes the two via the streaming [`pipeline`].
+
+use mimalloc::MiMalloc;
 
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: MiMalloc = MiMalloc;
+
+pub mod crypto;
 
 /// The S_aff affine-map driver (composes comp_gc + it_gc via the pipeline).
 pub mod affine;
 
-/// Computational Yao GC over the gate System (Phase 1: bin(x) -> OHE-CRT).
+/// Computational Yao garbling (Phase 1).
 pub mod comp_gc;
 
-/// CRT parameters, reconstruction, and big-integer math (leaf).
+/// CRT parameters, reconstruction, and big-integer math.
 pub mod crt;
-
-/// CCRH core + nonce discipline (the bridge).
-pub mod crypto;
 
 /// Concrete cleartext execution of a system.
 pub mod exec;
 
-/// Label-aware CCRH facade.
+/// CCRH core + nonce rules.
 pub mod hash;
 
-/// Information-theoretic GC: the per-prime body.
+/// Information-theoretic GC (Phase 3).
 pub mod it_gc;
 
 /// CF and NCF garbled-circuit labels.
