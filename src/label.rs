@@ -1,13 +1,9 @@
 //! Garbled labels.
 //!
 //! A CF (control-friendly) label on a wire in Z_{2^k} stores LAMBDA coordinates
-//! of k bits each, bit-packed into `Vec<u64>`. Memory per CF label is
-//! ⌈LAMBDA · k / 64⌉ u64 words — tight to the paper's λ·k-bit budget (e.g. a
-//! Z_2 label fits in 2 u64s = 16 bytes, never the 1024 bytes of a naive
-//! one-coord-per-u64 layout).
+//! of k bits each, bit-packed.
 //!
-//! An NCF label is a single ring element; it stores `rep: u64` so the NCF path
-//! is not on a λ multiplier.
+//! An NCF label is a single ring element,
 
 /// Security parameter: number of coordinates in a control-friendly label.
 pub const LAMBDA: usize = 128;
@@ -45,7 +41,11 @@ pub enum Label {
 impl CfLabel {
     /// Zero label in Z_{modulus}. `modulus` must be a power of two in `[2, 2^62]`.
     pub fn zero(modulus: u64) -> Self {
-        assert!(modulus.is_power_of_two(), "CF modulus {} is not power of two", modulus);
+        assert!(
+            modulus.is_power_of_two(),
+            "CF modulus {} is not power of two",
+            modulus
+        );
         assert!((2..=(1u64 << 62)).contains(&modulus));
         let k = modulus.trailing_zeros() as usize;
         let words = (LAMBDA * k).div_ceil(64);
@@ -132,10 +132,13 @@ impl CfLabel {
     }
 
     /// Build a CF label from a raw u64-word storage. The buffer must have
-    /// exactly `⌈LAMBDA · k / 64⌉` words; bits beyond `LAMBDA · k` are masked
-    /// off so callers don't need to clear pseudorandom expansion tails.
+    /// exactly `⌈LAMBDA · k / 64⌉` words.
     pub fn from_raw_bits(mut bits: Vec<u64>, modulus: u64) -> Self {
-        assert!(modulus.is_power_of_two(), "CF modulus {} is not power of two", modulus);
+        assert!(
+            modulus.is_power_of_two(),
+            "CF modulus {} is not power of two",
+            modulus
+        );
         let k = modulus.trailing_zeros() as usize;
         let total_bits = LAMBDA * k;
         let words = total_bits.div_ceil(64);
@@ -154,8 +157,7 @@ fn coord_mask(k: u32) -> u64 {
 
 impl PartialEq for CfLabel {
     fn eq(&self, other: &Self) -> bool {
-        self.modulus == other.modulus
-            && (0..LAMBDA).all(|i| self.get(i) == other.get(i))
+        self.modulus == other.modulus && (0..LAMBDA).all(|i| self.get(i) == other.get(i))
     }
 }
 impl Eq for CfLabel {}
@@ -314,14 +316,18 @@ pub fn sub(x: &Label, y: &Label) -> Label {
             assert_eq!(a.modulus, b.modulus, "sub: modulus mismatch");
             // Same logic as NCF add: branch on the sign instead of `u128 % p`.
             let m = a.modulus;
-            let rep = if a.rep >= b.rep { a.rep - b.rep } else { a.rep + m - b.rep };
+            let rep = if a.rep >= b.rep {
+                a.rep - b.rep
+            } else {
+                a.rep + m - b.rep
+            };
             Label::Ncf(NcfLabel { rep, modulus: m })
         }
         _ => panic!("sub: CF/NCF mismatch"),
     }
 }
 
-/// Scalar multiplication by `s` (in each coord's ring).
+/// Scalar multiplication by `s` (in each coord's ring). TODO: Check if all this logic is necessary, Claude wrote it.
 ///
 /// Fast paths:
 /// * `s = 0` → zero label (no allocation for NCF; trivial vec for CF).
@@ -361,7 +367,11 @@ pub fn scalar_mul(s: u64, x: &Label) -> Label {
             let m = a.modulus;
             // Binding precondition for the single-u64 product below (matches
             // `it_gc::mod_mul`): with m ≤ 2^32 and rep < m, s_mod·rep < 2^64.
-            debug_assert!(m <= (1u64 << 32), "NCF scalar_mul modulus {} exceeds 2^32", m);
+            debug_assert!(
+                m <= (1u64 << 32),
+                "NCF scalar_mul modulus {} exceeds 2^32",
+                m
+            );
             let s_mod = if s < m { s } else { s % m };
             if s_mod == 0 {
                 return Label::Ncf(NcfLabel { rep: 0, modulus: m });
@@ -401,11 +411,9 @@ pub fn mod2k(x: &Label, k_out: u32) -> Label {
     }
 }
 
-/// Zero low k bits of each coordinate (subgroup φ) then divide by 2^k (iso).
+/// Zero low k bits of each coordinate then divide by 2^k.
 ///
-/// Output modulus = input_modulus / 2^k. This matches paper's Div2k, which is a
-/// subgroup gate composed with the natural isomorphism from the subgroup 2^k·Z_{2^c}
-/// onto Z_{2^c}.
+/// Output modulus = input_modulus / 2^k.
 pub fn div2k(x: &Label, k: u32) -> Label {
     match x {
         Label::Cf(a) => {
@@ -552,10 +560,7 @@ mod tests {
         let b = rand_cf(&mut r, m);
         let s = r.random_range(0..m);
         let lhs = scalar_mul(s, &add(&Label::Cf(a.clone()), &Label::Cf(b.clone())));
-        let rhs = add(
-            &scalar_mul(s, &Label::Cf(a)),
-            &scalar_mul(s, &Label::Cf(b)),
-        );
+        let rhs = add(&scalar_mul(s, &Label::Cf(a)), &scalar_mul(s, &Label::Cf(b)));
         assert_eq!(lhs, rhs);
     }
 

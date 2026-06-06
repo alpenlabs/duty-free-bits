@@ -6,8 +6,6 @@
 //! * one **join diff** (`X_in0 − X_in1`) per `Join` gate, letting the evaluator
 //!   translate between the two sides' masks.
 //! * one **output mask** per declared NCF output wire.
-//!
-//! `total_bits()` is exactly the paper's `join_width(S) + |Gout|`.
 
 use crate::label::Label;
 use crate::types::GateId;
@@ -87,8 +85,8 @@ pub fn label_bits(l: &Label) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use crate::label::{CfLabel, Label, NcfLabel};
     use super::*;
+    use crate::label::{CfLabel, Label, NcfLabel};
 
     #[test]
     fn test_empty() {

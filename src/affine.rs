@@ -7,18 +7,20 @@
 //!      a word in Z_{2^ℓ} via `bin_to_word`.
 //!   2. Free accumulation + fold: for each prime p_i, compute r_i ≡ x (mod p_i),
 //!      sub-chunk-extract, and fold to a length-p_i binary one-hot `h_p` of
-//!      x mod p_i (the computational GC, Phase 1).
+//!      x mod p_i (the computational GC).
 //!   3. Residue evaluation: the information-theoretic GC ([`crate::it_gc`])
-//!      delivers a · (x mod p_i) + b from `h_p` (Phase 3).
+//!      delivers a · (x mod p_i) + b from `h_p`.
 //!
 //! [`build_s_aff_streaming`] runs these phase-by-phase via a [`Pipeline`],
 //! dropping intermediate state at each boundary.
 
-use crate::comp_gc::convert::{bin_to_word, compute_sub_widths, fold_to_mod_ohe, sub_chunk_extract};
+use crate::comp_gc::convert::{
+    bin_to_word, compute_sub_widths, fold_to_mod_ohe, sub_chunk_extract,
+};
 use crate::crt::{CrtParams, pow2_mod};
 use crate::crypto::nonce;
-use crate::pipeline::{CarryId, Pipeline};
 use crate::it_gc::{body_batch_eval, body_batch_garble};
+use crate::pipeline::{CarryId, Pipeline};
 use crate::types::*;
 
 /// Maximum sub-chunk width for the sub-chunk extraction optimization.
@@ -114,11 +116,7 @@ pub fn build_s_aff_streaming(
     let mut all_outputs: Vec<Vec<u64>> = Vec::with_capacity(params.num_primes);
 
     // CCRH nonce windows for the body switches. A body switch's pad is
-    // `H(h_p[i], nonce)`; reusing a `(seed, nonce)` pair across batches reuses the
-    // one-time pad masking `a_j` — a two-time-pad break leaking differences of the
-    // secret coefficients (paper §1.3). We give each prime a disjoint window
-    // (`num_batches · p_i` nonces) computed up front, so legality holds by
-    // construction and primes are independent (no shared running counter).
+    // `H(h_p[i], nonce)`.
     let num_batches = s_dim.div_ceil(RESIDUE_BATCH_SIZE);
     let prime_window_sizes: Vec<u64> = params
         .primes
@@ -161,8 +159,6 @@ pub fn build_s_aff_streaming(
             },
         );
 
-        // Snapshot h_p masks/labels once per prime; the kernel calls per body
-        // batch borrow them.
         let h_p_masks: Vec<_> = h_p_ids
             .iter()
             .map(|&id| pipeline.carry(id).mask.clone())
@@ -173,7 +169,6 @@ pub fn build_s_aff_streaming(
             .collect();
 
         // -- Body batches: each consumes h_p + a batch of (a, b) → batch outputs.
-        //    Run on the System-bypass kernel rather than Pipeline::run_phase. --
         let identity_table: Vec<u64> = (0..p_i).collect();
         let mut prime_outputs: Vec<u64> = Vec::with_capacity(s_dim);
 
@@ -188,8 +183,14 @@ pub fn build_s_aff_streaming(
 
             // Garbler kernel: emits join diffs, output masks, and the batch cost.
             let t_garble = std::time::Instant::now();
-            let g_out =
-                body_batch_garble(p_i, &h_p_masks, &a_batch, &b_batch, &identity_table, nonce_base);
+            let g_out = body_batch_garble(
+                p_i,
+                &h_p_masks,
+                &a_batch,
+                &b_batch,
+                &identity_table,
+                nonce_base,
+            );
             let garble_secs = t_garble.elapsed().as_secs_f64();
             // Evaluator kernel: consumes the garbler's join diffs, using the same
             // nonce base. `hot_i` comes from cleartext `x_bits`; no reveal.

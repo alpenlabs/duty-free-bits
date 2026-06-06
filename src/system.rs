@@ -6,31 +6,20 @@ use crate::types::*;
 pub struct System {
     pub(crate) gates: Vec<Gate>,
     pub(crate) values: Vec<Val>,
-    /// Per-wire subscription lists (gates that reference this wire). Inline
-    /// `SmallVec` capacity covers the common case (most wires are referenced
-    /// by 2-3 gates) without per-wire heap allocation.
-    pub(crate) subscriptions: Vec<smallvec::SmallVec<[GateId; 4]>>,
-    /// Per-wire control-friendliness flag (parallel to `values`).
-    ///
-    /// The paper distinguishes **control-friendly** wires (whose labels are
-    /// λ-fold to support hash security when used as switch controls) from
-    /// **non-control-friendly** wires (single-element labels). This is a *type*
-    /// annotation fixed at wire allocation time, not a property of the modulus:
-    /// we routinely have CF Z_{2^k} wires and NCF Z_p wires, but the output of
-    /// hot-to-ring style constructions over Z_2 can also legitimately be NCF.
+    /// Per-wire subscription lists (gates that reference this wire).
+    pub(crate) subscriptions: Vec<Vec<GateId>>,
+    /// Per-wire control-friendliness flag.
     pub(crate) is_cf_flags: Vec<bool>,
-    /// NCF switch groups: members sharing a single control wire whose hash is
-    /// derived from one bulk CCRH call and sliced across members. Populated by
-    /// [`register_ncf_switch_group`]; read by the garbler/evaluator.
+    /// Reduces hash count by grouping switches that share the same control wire.
     pub(crate) switch_groups: Vec<SwitchGroup>,
-    /// For each gate, the (group_index, member_index) it belongs to (if any).
-    /// Sized to `num_gates` lazily on first registration.
+    /// For each gate, the (group_index, member_index) it belongs to (if any),
+    /// reverse-lookup table for switch groups.
     pub(crate) gate_to_group: Vec<Option<(u32, u32)>>,
 }
 
-/// Communication + hash cost of a circuit — a pure fold over its gates and
-/// switch groups (see [`System::cost`]). Switches contribute no communication
-/// (zero reveal); only joins do.
+/// Communication + hash cost of a circuit.
+/// Switches contribute no communication as the evaluator
+/// learns all controls from the cleartext input.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Cost {
     /// Join width over control-friendly joins, in `lg|G|` units (each bit pays λ).
@@ -45,14 +34,13 @@ pub struct Cost {
 }
 
 impl Cost {
-    /// Total join width in `lg|G|` units (CF + NCF). Communication in bits is
-    /// `λ·join_complexity_cf + join_complexity_ncf`.
+    /// Total communication in bits.
     pub fn join_complexity(&self) -> usize {
         self.join_complexity_cf + self.join_complexity_ncf
     }
 }
 
-/// A group of NCF switches that share one control wire.
+/// A group of NCF switches that share one control wire. TODO: maybe the better abstraction is arbitrary payload in (Z_p1 x ... x Z_pn)
 ///
 /// The garbler/evaluator derives all members' hashes from a single wide CCRH
 /// call keyed on the shared control label and the group id, slicing the
@@ -87,9 +75,7 @@ impl System {
         }
     }
 
-    /// Compute the circuit's communication + hash cost by folding over its gates
-    /// and switch groups. Pure (no mutation), so it is independent of the order
-    /// gates and groups were added.
+    /// Compute the circuit's communication + hash cost.
     pub fn cost(&self) -> Cost {
         let mut c = Cost::default();
         for (gid, &g) in self.gates.iter().enumerate() {
@@ -97,7 +83,11 @@ impl System {
                 Gate::Switch { out, .. } => {
                     if self.is_cf(out) {
                         let m = self.modulus(out);
-                        c.hash_count_cf += if m <= 1 { 0 } else { m.trailing_zeros() as usize };
+                        c.hash_count_cf += if m <= 1 {
+                            0
+                        } else {
+                            m.trailing_zeros() as usize
+                        };
                     } else if self.gate_group(gid).is_none() {
                         // Solo NCF switch; grouped ones are counted via the group.
                         c.hash_count_ncf += 1;
@@ -105,7 +95,11 @@ impl System {
                 }
                 Gate::Join { a, .. } => {
                     let m = self.modulus(a);
-                    let bits = if m <= 1 { 0 } else { (m as u128 - 1).ilog2() as usize + 1 };
+                    let bits = if m <= 1 {
+                        0
+                    } else {
+                        (m as u128 - 1).ilog2() as usize + 1
+                    };
                     if self.is_cf(a) {
                         c.join_complexity_cf += bits;
                     } else {
@@ -128,8 +122,7 @@ impl System {
 
     /// Allocate a wire with explicit CF/NCF kind.
     ///
-    /// CF wires require a power-of-two modulus (they must live in a product of
-    /// integer rings Z_{2^k}). NCF wires can have any finite modulus.
+    /// CF wires require a power-of-two modulus. NCF wires can have any finite modulus.
     pub fn alloc_wire_kind(&mut self, modulus: u64, is_cf: bool) -> Wire {
         if is_cf {
             assert!(
@@ -139,7 +132,7 @@ impl System {
             );
         }
         let wid = self.values.len();
-        self.subscriptions.push(smallvec::SmallVec::new());
+        self.subscriptions.push(Vec::new());
         self.values.push(Val::none(modulus));
         self.is_cf_flags.push(is_cf);
         Wire { wid }
@@ -148,7 +141,7 @@ impl System {
     /// Allocate a fresh wire in Z_modulus (initially undefined).
     ///
     /// Defaults: CF iff `modulus` is a power of two. Use [`alloc_wire_kind`] to
-    /// override — e.g. to allocate a NCF Z_{2^k} wire.
+    /// override — e.g. to allocate a NCF Z_{2^k} wire. TODO: maybe this should be the default?
     pub fn alloc_wire(&mut self, modulus: u64) -> Wire {
         self.alloc_wire_kind(modulus, modulus.is_power_of_two())
     }
@@ -224,14 +217,21 @@ impl System {
             assert!(!self.is_cf(out), "switch group is NCF-only");
             assert_eq!(self.modulus(out), modulus, "group member moduli mismatch");
             assert_eq!(gate_ctrl.wid, ctrl.wid, "group member control mismatch");
-            assert!(self.gate_to_group[gid].is_none(), "gate {gid} already grouped");
+            assert!(
+                self.gate_to_group[gid].is_none(),
+                "gate {gid} already grouped"
+            );
         }
 
         let group_idx = self.switch_groups.len();
         for (member_idx, &gid) in members.iter().enumerate() {
             self.gate_to_group[gid] = Some((group_idx as u32, member_idx as u32));
         }
-        self.switch_groups.push(SwitchGroup { ctrl, members, modulus });
+        self.switch_groups.push(SwitchGroup {
+            ctrl,
+            members,
+            modulus,
+        });
         group_idx
     }
 
@@ -341,7 +341,11 @@ impl System {
         assert_eq!(self.modulus(s), 2, "switch control must be binary (Z_2)");
         assert!(self.is_cf(s), "switch control must be CF");
         let out = self.alloc_wire_kind(self.modulus(x), self.is_cf(x));
-        self.add_gate(Gate::Switch { data: x, ctrl: s, out });
+        self.add_gate(Gate::Switch {
+            data: x,
+            ctrl: s,
+            out,
+        });
         out
     }
 
@@ -368,7 +372,11 @@ impl System {
         assert_eq!(self.modulus(x), self.modulus(y));
         assert_eq!(self.is_cf(x), self.is_cf(y), "add: kind mismatch");
         let out = self.alloc_wire_kind(self.modulus(x), self.is_cf(x));
-        self.add_gate(Gate::Add { in0: x, in1: y, out });
+        self.add_gate(Gate::Add {
+            in0: x,
+            in1: y,
+            out,
+        });
         out
     }
 
@@ -377,14 +385,22 @@ impl System {
         assert_eq!(self.modulus(x), self.modulus(y));
         assert_eq!(self.is_cf(x), self.is_cf(y), "sub: kind mismatch");
         let out = self.alloc_wire_kind(self.modulus(x), self.is_cf(x));
-        self.add_gate(Gate::Sub { in0: x, in1: y, out });
+        self.add_gate(Gate::Sub {
+            in0: x,
+            in1: y,
+            out,
+        });
         out
     }
 
     /// Scalar multiplication by constant s (mod wire's modulus). Output inherits kind.
     pub fn mul(&mut self, s: u64, x: Wire) -> Wire {
         let out = self.alloc_wire_kind(self.modulus(x), self.is_cf(x));
-        self.add_gate(Gate::Mul { in0: x, scalar: s, out });
+        self.add_gate(Gate::Mul {
+            in0: x,
+            scalar: s,
+            out,
+        });
         out
     }
 

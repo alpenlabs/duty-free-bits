@@ -1,10 +1,7 @@
 //! Cleartext execution of a [`System`] — the ground-truth semantics.
 //!
 //! `Exec` propagates concrete wire values through the gates (forward and
-//! backward) to fixpoint. It is used two production-relevant ways: the evaluator
-//! runs it on its known input `x` to read switch controls in cleartext (no
-//! reveal — see [`crate::comp_gc::evaluator`]), and the tests use it as the
-//! correctness oracle.
+//! backward) to fixpoint. The evaluator runs it on its known input `x` to read switch controls in cleartext.
 
 use crate::system::System;
 use crate::types::*;
@@ -30,8 +27,7 @@ impl<'a> Exec<'a> {
         self.values[w.wid]
     }
 
-    /// All wire values (indexed by wire id) — used by the evaluator to read
-    /// switch controls in cleartext.
+    /// All wire values (indexed by wire id).
     pub fn values(&self) -> &[Val] {
         &self.values
     }
