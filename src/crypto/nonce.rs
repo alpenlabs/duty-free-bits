@@ -19,10 +19,7 @@ impl NonceAllocator {
     /// Reserve a contiguous block of `count` nonces; returns its base.
     pub fn reserve(&mut self, count: u64) -> u64 {
         let base = self.next;
-        self.next = self
-            .next
-            .checked_add(count)
-            .expect("CCRH nonce space exhausted");
+        self.next += count;
         base
     }
 
