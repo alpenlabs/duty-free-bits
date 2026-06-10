@@ -1,3 +1,11 @@
+//! The switch-system constraint graph: wires, gates, and derived operations.
+//!
+//! A [`System`] is built once per streaming phase (wires allocated, gates
+//! appended, constants set) and then garbled/evaluated by the engines in
+//! [`crate::comp_gc`]. It also tracks the circuit's communication and hash
+//! footprint ([`Cost`]) and per-wire subscription lists (compiled to a CSR on
+//! first propagation).
+
 use crate::label::LAMBDA;
 use crate::types::*;
 use std::sync::OnceLock;
@@ -219,7 +227,7 @@ impl System {
 
     /// Allocate a fresh wire in Z_modulus (initially undefined).
     ///
-    /// Defaults: CF iff `modulus` is a power of two. Use [`alloc_wire_kind`] to
+    /// Defaults: CF iff `modulus` is a power of two. Use [`alloc_wire_kind`](Self::alloc_wire_kind) to
     /// override — e.g. to allocate a NCF Z_{2^k} wire. TODO: maybe this should be the default?
     pub fn alloc_wire(&mut self, modulus: u64) -> Wire {
         self.alloc_wire_kind(modulus, modulus.is_power_of_two())

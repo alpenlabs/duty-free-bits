@@ -1,9 +1,11 @@
 //! Garbled labels.
 //!
-//! A CF (control-friendly) label on a wire in Z_{2^k} stores LAMBDA coordinates
-//! of k bits each, bit-packed.
+//! A CF (control-friendly) label on a wire in Z_{2^k} holds LAMBDA
+//! coordinates of k bits each. The *wire format* is bit-packed; in memory,
+//! Z_2 labels keep that packed form inline while wider labels store one
+//! coordinate per u32 lane (see [`CfLabel`]).
 //!
-//! An NCF label is a single ring element,
+//! An NCF label is a single ring element.
 
 /// Security parameter: number of coordinates in a control-friendly label.
 pub const LAMBDA: usize = 128;
@@ -88,7 +90,7 @@ impl CfLabel {
         l
     }
 
-    /// Unpack coordinates into a Vec<u64>.
+    /// Unpack coordinates into a `Vec<u64>`.
     pub fn to_coords(&self) -> Vec<u64> {
         (0..LAMBDA).map(|i| self.get(i)).collect()
     }
@@ -476,7 +478,7 @@ pub fn sub(x: &Label, y: &Label) -> Label {
     }
 }
 
-/// Scalar multiplication by `s` (in each coord's ring). TODO: Check if all this logic is necessary, Claude wrote it.
+/// Scalar multiplication by `s` (in each coord's ring).
 ///
 /// Fast paths:
 /// * `s = 0` → zero label (no allocation for NCF; trivial vec for CF).

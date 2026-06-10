@@ -1,26 +1,52 @@
 //! Streaming garble + eval pipeline.
 //!
 //! Garbling the whole computation as one `System` would hold every wire's mask
-//! and label in memory at once. Instead, `Pipeline` executes the computation as a sequence of *phases*:
+//! and label in memory at once. Instead, `Pipeline` executes the computation
+//! as a sequence of *phases*:
 //!
-//! 1. Allocate a fresh `System` for the phase.
+//! 1. Allocate a fresh `System` for the phase (buffers pooled across phases).
 //! 2. Re-bind a small carry-forward set of `(mask, label, value)` triples from
 //!    previous phases as the new System's input wires.
 //! 3. Run the caller's gate-construction closure.
-//! 4. Garble + evaluate the sub-System (the evaluator runs a cleartext `Exec`
-//!    pass over the carried values to read switch controls).
+//! 4. Garble + evaluate the sub-System (see "execution paths" below).
 //! 5. Extract `(mask, label, value)` for the wires the caller declares as outputs.
-//! 6. Drop the System; only the new carry items survive.
+//! 6. Only the small carry items survive the phase.
 //!
-//! Peak memory collapses to the largest single phase plus the carry set. Δ is global.
+//! Peak memory collapses to the largest single phase plus the carry set. Δ is
+//! global.
+//!
+//! # Execution paths
+//!
+//! Phases run through [`run_phase_keyed`](Pipeline::run_phase_keyed) declare a
+//! *shape key*: all phases sharing a key build structurally-identical Systems
+//! (the per-prime extract phases and the chunk phases do). For those:
+//!
+//! * **Garbling** records its worklist schedule on the shape's first phase
+//!   ([`garble_recorded`]), compiles it into a typed instruction stream on the
+//!   second (`compile_garble`), and runs the compiled program from then on
+//!   (`garble_compiled`) — no `System` access except `Mul` scalar loads.
+//!   Setting `DFB_DIFF=1` re-derives every compiled phase through
+//!   [`garble_replay`] and asserts bit-equality.
+//! * **Evaluation** runs `fused_eval_arena`: one worklist pass deriving
+//!   cleartext values and labels together against flat label arenas.
+//!
+//! Unkeyed phases (and shapes the arena cannot host, e.g. with NCF wires) use
+//! the `Label`-path engines: worklist [`garble`], and a cleartext [`Exec`]
+//! pass whose recorded journal drives [`replay_with_labels`]. Those engines
+//! double as the checked references the differential tests pin the fast paths
+//! against.
+//!
+//! Every phase reserves a fresh window of solo-domain CCRH nonces, so no two
+//! switch hashes anywhere in the pipeline share a nonce (paper App. A,
+//! Def. 4).
 
+use crate::comp_gc::Program;
 use crate::comp_gc::arena::{
     CompiledGarble, LabelArena, WireLayout, compile_garble, fused_eval_arena, garble_compiled,
 };
 use crate::comp_gc::garbler::{garble, garble_recorded, garble_replay};
 use crate::comp_gc::replay_with_labels;
-use crate::exec::Exec;
-use crate::exec::JournalEntry;
+use crate::exec::{Exec, JournalEntry};
 use crate::label::{self, CfLabel, LAMBDA, Label};
 use crate::system::System;
 use crate::types::{Val, Wire};
@@ -315,169 +341,38 @@ impl Pipeline {
             "solo nonce space exhausted"
         );
 
-        // Garble: worklist for unkeyed/first-of-shape phases (recording the
-        // schedule when keyed), linear tape replay for later same-shape ones.
+        // Garble (see the module-level "execution paths" overview).
         let input_masks: Vec<Label> = inputs
             .iter()
             .map(|&id| self.carry(id).mask.clone())
             .collect();
         let t_garble = std::time::Instant::now();
-        let program = match shape_key {
-            None => garble(
-                &sys,
-                &input_wires,
-                &input_masks,
-                &output_wires,
-                self.delta,
-                nonce_base,
-            ),
-            Some(key) => match self.garble_tapes.get_mut(key) {
-                Some(cache) => {
-                    // Hard assert: a shape-key collision (e.g. a Pipeline
-                    // reused across parameter sets) must not reach replay.
-                    assert_eq!(
-                        (cache.num_gates, cache.num_wires),
-                        (sys.num_gates(), sys.num_wires()),
-                        "phase shape diverged for key {key:?}"
-                    );
-                    match &cache.layout {
-                        Some(layout) => {
-                            // First replay compiles (full structural
-                            // validation); later phases run the compiled
-                            // program with no System access.
-                            let compiled = cache.compiled.get_or_insert_with(|| {
-                                compile_garble(
-                                    &sys,
-                                    layout,
-                                    &cache.tape,
-                                    &input_wires,
-                                    &output_wires,
-                                )
-                            });
-                            let prog = garble_compiled(
-                                &sys,
-                                compiled,
-                                &mut self.garble_arena,
-                                &input_masks,
-                                self.delta,
-                                nonce_base,
-                            );
-                            if std::env::var("DFB_DIFF").is_ok() {
-                                let reference = garble_replay(
-                                    &sys,
-                                    &input_wires,
-                                    &input_masks,
-                                    &output_wires,
-                                    self.delta,
-                                    &cache.tape,
-                                    nonce_base,
-                                );
-                                assert_eq!(
-                                    reference.output_masks(),
-                                    prog.output_masks(),
-                                    "compiled output masks diverge"
-                                );
-                                for gid in 0..sys.num_gates() {
-                                    assert_eq!(
-                                        reference.join_diff(gid),
-                                        prog.join_diff(gid),
-                                        "compiled join diff diverges at gid {gid}"
-                                    );
-                                }
-                            }
-                            prog
-                        }
-                        None => garble_replay(
-                            &sys,
-                            &input_wires,
-                            &input_masks,
-                            &output_wires,
-                            self.delta,
-                            &cache.tape,
-                            nonce_base,
-                        ),
-                    }
-                }
-                None => {
-                    let (program, tape) = garble_recorded(
-                        &sys,
-                        &input_wires,
-                        &input_masks,
-                        &output_wires,
-                        self.delta,
-                        nonce_base,
-                    );
-                    self.garble_tapes.insert(
-                        key.to_string(),
-                        ShapeCache {
-                            num_gates: sys.num_gates(),
-                            num_wires: sys.num_wires(),
-                            tape,
-                            layout: WireLayout::build(&sys),
-                            compiled: None,
-                        },
-                    );
-                    program
-                }
-            },
-        };
+        let program = self.garble_phase(
+            &sys,
+            shape_key,
+            &input_wires,
+            &input_masks,
+            &output_wires,
+            nonce_base,
+        );
         let garble_secs = t_garble.elapsed().as_secs_f64();
         self.garble_secs += garble_secs;
 
-        // Evaluate. The evaluator knows x. On arena-eligible shapes one fused
-        // worklist pass derives cleartext values and labels together (see
-        // `fused_eval_arena`); otherwise a cleartext `Exec` pass records the
-        // derivation journal and `replay_with_labels` replays it.
+        // Evaluate (see the module-level "execution paths" overview).
         let input_labels: Vec<Label> = inputs
             .iter()
             .map(|&id| self.carry(id).label.clone())
             .collect();
-        let cached_layout = shape_key
-            .and_then(|key| self.garble_tapes.get(key))
-            .and_then(|c| c.layout.as_ref());
-        let (exec_secs, label_eval_secs, output_labels, output_values) = match cached_layout {
-            Some(layout) => {
-                let input_values: Vec<u64> =
-                    inputs.iter().map(|&id| self.carry(id).value).collect();
-                let t_eval = std::time::Instant::now();
-                let (labels, values) = fused_eval_arena(
-                    &sys,
-                    layout,
-                    &mut self.eval_arena,
-                    &mut self.fused_vals,
-                    &input_wires,
-                    &input_labels,
-                    &input_values,
-                    &program,
-                    &output_wires,
-                    nonce_base,
-                );
-                (0.0, t_eval.elapsed().as_secs_f64(), labels, values)
-            }
-            None => {
-                let t_exec = std::time::Instant::now();
-                let mut exec = Exec::new(&sys);
-                for (&w, &id) in input_wires.iter().zip(inputs) {
-                    let item = self.carry(id);
-                    exec.set(w, Val::new(item.value, item.modulus));
-                }
-                exec.run_recorded();
-                let exec_secs = t_exec.elapsed().as_secs_f64();
-                let t_eval = std::time::Instant::now();
-                let labels = replay_with_labels(
-                    &sys,
-                    &input_wires,
-                    &input_labels,
-                    exec.values(),
-                    &program,
-                    exec.journal(),
-                    &output_wires,
-                    nonce_base,
-                );
-                let values: Vec<u64> = output_wires.iter().map(|&w| exec.get(w).v).collect();
-                (exec_secs, t_eval.elapsed().as_secs_f64(), labels, values)
-            }
-        };
+        let (exec_secs, label_eval_secs, output_labels, output_values) = self.eval_phase(
+            &sys,
+            shape_key,
+            inputs,
+            &input_wires,
+            &input_labels,
+            &program,
+            &output_wires,
+            nonce_base,
+        );
         self.eval_secs += exec_secs + label_eval_secs;
 
         // Output masks live in the program in declaration order.
@@ -564,6 +459,177 @@ impl Pipeline {
         self.total_program_bits += cost.program_bits;
         self.join_complexity_cf += cost.join_complexity_cf;
         self.hash_count_cf += cost.hash_count_cf;
+    }
+
+    /// Garble one phase: the compiled fast path for cached shapes (recording
+    /// and compiling on a shape's first uses), the `Label`-path worklist
+    /// otherwise. `DFB_DIFF=1` re-derives every compiled phase through
+    /// [`garble_replay`] and asserts bit-equality.
+    fn garble_phase(
+        &mut self,
+        sys: &System,
+        shape_key: Option<&str>,
+        input_wires: &[Wire],
+        input_masks: &[Label],
+        output_wires: &[Wire],
+        nonce_base: u64,
+    ) -> Program {
+        match shape_key {
+            None => garble(
+                sys,
+                input_wires,
+                input_masks,
+                output_wires,
+                self.delta,
+                nonce_base,
+            ),
+            Some(key) => match self.garble_tapes.get_mut(key) {
+                Some(cache) => {
+                    // Hard assert: a shape-key collision (e.g. a Pipeline
+                    // reused across parameter sets) must not reach replay.
+                    assert_eq!(
+                        (cache.num_gates, cache.num_wires),
+                        (sys.num_gates(), sys.num_wires()),
+                        "phase shape diverged for key {key:?}"
+                    );
+                    match &cache.layout {
+                        Some(layout) => {
+                            // First replay compiles (full structural
+                            // validation); later phases run the compiled
+                            // program with no System access.
+                            let compiled = cache.compiled.get_or_insert_with(|| {
+                                compile_garble(sys, layout, &cache.tape, input_wires, output_wires)
+                            });
+                            let prog = garble_compiled(
+                                sys,
+                                compiled,
+                                &mut self.garble_arena,
+                                input_masks,
+                                self.delta,
+                                nonce_base,
+                            );
+                            if std::env::var("DFB_DIFF").is_ok() {
+                                let reference = garble_replay(
+                                    sys,
+                                    input_wires,
+                                    input_masks,
+                                    output_wires,
+                                    self.delta,
+                                    &cache.tape,
+                                    nonce_base,
+                                );
+                                assert_eq!(
+                                    reference.output_masks(),
+                                    prog.output_masks(),
+                                    "compiled output masks diverge"
+                                );
+                                for gid in 0..sys.num_gates() {
+                                    assert_eq!(
+                                        reference.join_diff(gid),
+                                        prog.join_diff(gid),
+                                        "compiled join diff diverges at gid {gid}"
+                                    );
+                                }
+                            }
+                            prog
+                        }
+                        None => garble_replay(
+                            sys,
+                            input_wires,
+                            input_masks,
+                            output_wires,
+                            self.delta,
+                            &cache.tape,
+                            nonce_base,
+                        ),
+                    }
+                }
+                None => {
+                    let (program, tape) = garble_recorded(
+                        sys,
+                        input_wires,
+                        input_masks,
+                        output_wires,
+                        self.delta,
+                        nonce_base,
+                    );
+                    self.garble_tapes.insert(
+                        key.to_string(),
+                        ShapeCache {
+                            num_gates: sys.num_gates(),
+                            num_wires: sys.num_wires(),
+                            tape,
+                            layout: WireLayout::build(sys),
+                            compiled: None,
+                        },
+                    );
+                    program
+                }
+            },
+        }
+    }
+
+    /// Evaluate one phase: the fused value+label arena pass for cached
+    /// shapes, a cleartext `Exec` pass + journal replay otherwise. Returns
+    /// `(exec_secs, label_eval_secs, output_labels, output_values)`.
+    #[allow(clippy::too_many_arguments)]
+    fn eval_phase(
+        &mut self,
+        sys: &System,
+        shape_key: Option<&str>,
+        inputs: &[CarryId],
+        input_wires: &[Wire],
+        input_labels: &[Label],
+        program: &Program,
+        output_wires: &[Wire],
+        nonce_base: u64,
+    ) -> (f64, f64, Vec<Label>, Vec<u64>) {
+        let cached_layout = shape_key
+            .and_then(|key| self.garble_tapes.get(key))
+            .and_then(|c| c.layout.as_ref());
+        match cached_layout {
+            Some(layout) => {
+                let input_values: Vec<u64> =
+                    inputs.iter().map(|&id| self.carry(id).value).collect();
+                let t_eval = std::time::Instant::now();
+                let (labels, values) = fused_eval_arena(
+                    sys,
+                    layout,
+                    &mut self.eval_arena,
+                    &mut self.fused_vals,
+                    input_wires,
+                    input_labels,
+                    &input_values,
+                    program,
+                    output_wires,
+                    nonce_base,
+                );
+                (0.0, t_eval.elapsed().as_secs_f64(), labels, values)
+            }
+            None => {
+                let t_exec = std::time::Instant::now();
+                let mut exec = Exec::new(sys);
+                for (&w, &id) in input_wires.iter().zip(inputs) {
+                    let item = self.carry(id);
+                    exec.set(w, Val::new(item.value, item.modulus));
+                }
+                exec.run_recorded();
+                let exec_secs = t_exec.elapsed().as_secs_f64();
+                let t_eval = std::time::Instant::now();
+                let labels = replay_with_labels(
+                    sys,
+                    input_wires,
+                    input_labels,
+                    exec.values(),
+                    program,
+                    exec.journal(),
+                    output_wires,
+                    nonce_base,
+                );
+                let values: Vec<u64> = output_wires.iter().map(|&w| exec.get(w).v).collect();
+                (exec_secs, t_eval.elapsed().as_secs_f64(), labels, values)
+            }
+        }
     }
 
     fn push_carry(&mut self, item: CarryItem) -> CarryId {

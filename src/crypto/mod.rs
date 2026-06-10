@@ -31,7 +31,6 @@ pub type Block = [u8; 16];
 
 /// Fixed AES-128 key (public permutation key for the CCRH). Bytes from the
 /// fractional part of the golden ratio — a "nothing-up-my-sleeve" constant.
-/// ^ This was written by Claude, wow that's such a cool concept.
 const CCRH_KEY: [u8; 16] = [
     0x9e, 0x37, 0x79, 0xb9, 0x7f, 0x4a, 0x7c, 0x15, 0xf3, 0x9c, 0xc0, 0x60, 0x5c, 0xed, 0xc8, 0x34,
 ];
