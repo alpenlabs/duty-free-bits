@@ -114,6 +114,10 @@ pub struct Pipeline {
     pub kernel_garble_secs: f64,
     /// Portion of `eval_secs` spent in the System-bypass IT-GC kernel.
     pub kernel_eval_secs: f64,
+    /// Portion of `garble_secs` spent in the System-bypass fold kernel.
+    pub fold_garble_secs: f64,
+    /// Portion of `eval_secs` spent in the System-bypass fold kernel.
+    pub fold_eval_secs: f64,
 }
 
 impl Pipeline {
@@ -143,6 +147,8 @@ impl Pipeline {
             eval_secs: 0.0,
             kernel_garble_secs: 0.0,
             kernel_eval_secs: 0.0,
+            fold_garble_secs: 0.0,
+            fold_eval_secs: 0.0,
         }
     }
 
@@ -331,6 +337,24 @@ impl Pipeline {
         self.total_program_bits += cost.program_bits;
         self.join_complexity_ncf += cost.join_complexity_ncf;
         self.hash_count_ncf += cost.hash_count_ncf;
+    }
+
+    /// Fold one externally-garbled fold-kernel run into the aggregate
+    /// counters (the fold analogue of
+    /// [`record_kernel_batch`](Pipeline::record_kernel_batch)).
+    pub fn record_fold_batch(
+        &mut self,
+        garble_secs: f64,
+        eval_secs: f64,
+        cost: crate::comp_gc::fold::FoldCost,
+    ) {
+        self.garble_secs += garble_secs;
+        self.eval_secs += eval_secs;
+        self.fold_garble_secs += garble_secs;
+        self.fold_eval_secs += eval_secs;
+        self.total_program_bits += cost.program_bits;
+        self.join_complexity_cf += cost.join_complexity_cf;
+        self.hash_count_cf += cost.hash_count_cf;
     }
 
     fn push_carry(&mut self, item: CarryItem) -> CarryId {

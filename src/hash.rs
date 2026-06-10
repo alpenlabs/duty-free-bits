@@ -124,6 +124,27 @@ pub fn hash_bulk_into(ctrl_mask: &Label, group_id: usize, total_bits: usize, out
     expand(seed, domain, &mut out[..len]);
 }
 
+/// CCRH for one Z₂-payload kernel switch, allocation-free.
+///
+/// 128 pseudorandom bits keyed on a packed CF Z₂ control label, in the bulk
+/// domain — byte-identical to [`hash_bulk`] on the same control and
+/// `group_id` with `total_bits = 128`, reinterpreted as two little-endian
+/// words. For kernels whose working representation is bare label words.
+/// `group_id` must be fresh per control (see [`crate::crypto::nonce`]).
+pub fn hash_z2(ctrl_words: &[u64; 2], group_id: u64) -> [u64; 2] {
+    debug_assert!(group_id < (1u64 << 63), "group id uses the bulk-domain bit");
+    let mut seed = [0u8; 16];
+    seed[0..8].copy_from_slice(&ctrl_words[0].to_le_bytes());
+    seed[8..16].copy_from_slice(&ctrl_words[1].to_le_bytes());
+    let domain = group_id | (1u64 << 63);
+    let mut out = [0u8; 16];
+    expand(seed, domain, &mut out);
+    [
+        u64::from_le_bytes(out[0..8].try_into().unwrap()),
+        u64::from_le_bytes(out[8..16].try_into().unwrap()),
+    ]
+}
+
 /// Extract member `idx`'s NCF label from a wide bulk-hash output.
 pub fn extract_ncf(wide: &[u8], idx: usize, modulus: u64) -> Label {
     let lg_m = lg_modulus(modulus);

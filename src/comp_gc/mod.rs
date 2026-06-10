@@ -5,6 +5,7 @@
 
 pub mod convert;
 pub mod evaluator;
+pub mod fold;
 pub mod garbler;
 pub mod ohe;
 pub mod program;
