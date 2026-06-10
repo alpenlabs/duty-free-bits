@@ -9,7 +9,7 @@
 
 use crate::affine::build_s_aff_streaming;
 use crate::crt::bigint::{FIRST_80_PRIMES, U576};
-use crate::crt::{CrtParams, crt_reconstruct};
+use crate::crt::{CrtParams, GarnerDecoder};
 use crate::exec::Exec;
 use crate::pipeline::Pipeline;
 use crate::system::System;
@@ -679,14 +679,20 @@ fn test_s_aff_scaling() {
             pipeline.kernel_eval_secs,
         );
 
-        // Verify outputs reconstruct correctly.
+        // Verify outputs reconstruct correctly (decoder precomputed once for
+        // the prime set, as the production decode path would).
+        let t_decode = std::time::Instant::now();
+        let decoder = GarnerDecoder::new(&params.primes);
         for s in 0..s_dim {
             let residues: Vec<u64> = outputs.iter().map(|prime_outs| prime_outs[s]).collect();
-            let reconstructed = crt_reconstruct(&residues, &params.primes);
+            let reconstructed = decoder.reconstruct(&residues);
             let expected = a_vals[s] * x + b_vals[s];
             assert_eq!(reconstructed, U576::from_u64(expected));
         }
-        eprintln!("ok: streaming reconstructed all {s_dim} affine maps");
+        eprintln!(
+            "ok: streaming reconstructed all {s_dim} affine maps (decode {:.3}s)",
+            t_decode.elapsed().as_secs_f64()
+        );
     }
 }
 
@@ -909,6 +915,80 @@ fn bench_primitives() {
     bench("alloc Vec<u64> 44 words (k=22 label)", 500_000, || {
         black_box(vec![0u64; 44]);
     });
+}
+
+#[test]
+fn test_replay_matches_worklist_eval() {
+    // The journal-replay evaluator must agree with the worklist evaluator
+    // (the reference fixpoint) on every output label. Exercise the gnarliest
+    // header circuitry: bin_to_word -> sub_chunk_extract (circular
+    // word_to_hot, backward propagation, Mul(0) seeding) -> fold_to_mod_ohe
+    // (switch-heavy), across several primes and inputs.
+    use crate::comp_gc::convert::{compute_sub_widths, fold_to_mod_ohe, sub_chunk_extract};
+    use crate::comp_gc::{eval_with_labels, garble, replay_with_labels};
+    use crate::label::{self, Label};
+    use crate::pipeline::sample_cf_mask;
+
+    let mut rng = rng();
+    let ell: u32 = 8;
+    let sub_widths = compute_sub_widths(ell, 4); // [4, 4]: forces a peel
+    for p in [2u64, 5, 7] {
+        for _ in 0..3 {
+            let input: u64 = rng.random_range(0..(1u64 << ell));
+            let delta: u128 = rng.random();
+
+            let mut sys = System::new();
+            let bit_wires: Vec<Wire> = (0..ell).map(|_| sys.input(2)).collect();
+            let x = crate::comp_gc::convert::bin_to_word(&mut sys, &bit_wires, ell);
+            let extraction = sub_chunk_extract(&mut sys, x, &sub_widths);
+            let h_p = fold_to_mod_ohe(&mut sys, &extraction, p);
+
+            // Garble with random input masks; labels = mask + bit·Δ_2.
+            let input_masks: Vec<Label> = bit_wires
+                .iter()
+                .map(|_| sample_cf_mask(&mut rng, 2))
+                .collect();
+            let program = garble(&sys, &bit_wires, &input_masks, &h_p, delta);
+            let d2 = Label::Cf(label::delta_r(delta, 2));
+            let input_labels: Vec<Label> = input_masks
+                .iter()
+                .enumerate()
+                .map(|(j, m)| {
+                    let bit = (input >> j) & 1;
+                    label::add(m, &label::scalar_mul(bit, &d2))
+                })
+                .collect();
+
+            let mut exec = Exec::new(&sys);
+            for (j, &w) in bit_wires.iter().enumerate() {
+                exec.set(w, Val::new((input >> j) & 1, 2));
+            }
+            exec.run_recorded();
+            let journal = exec.journal().to_vec();
+
+            let via_worklist = eval_with_labels(
+                &sys,
+                &bit_wires,
+                &input_labels,
+                exec.values(),
+                &program,
+                &h_p,
+            );
+            let via_replay = replay_with_labels(
+                &sys,
+                &bit_wires,
+                &input_labels,
+                exec.values(),
+                &program,
+                &journal,
+                &h_p,
+            );
+            assert_eq!(
+                via_worklist, via_replay,
+                "replay/worklist divergence: p={p}, input={input}"
+            );
+        }
+    }
 }
 
 #[test]

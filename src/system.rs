@@ -1,13 +1,20 @@
 use crate::label::LAMBDA;
 use crate::types::*;
+use std::cell::OnceCell;
 
 /// The constraint system: holds wires, gates, and propagation queue.
 #[derive(Debug)]
 pub struct System {
     pub(crate) gates: Vec<Gate>,
     pub(crate) values: Vec<Val>,
-    /// Per-wire subscription lists (gates that reference this wire).
-    pub(crate) subscriptions: Vec<Vec<GateId>>,
+    /// Wire→gate subscription edges, as built (one `(wid, gid)` per gate-wire
+    /// reference). Read through [`subscriptions`](System::subscriptions),
+    /// which compiles them into a CSR on first use.
+    sub_edges: Vec<(u32, u32)>,
+    /// Lazily-built CSR over `sub_edges` (one flat allocation instead of a
+    /// heap `Vec` per wire — the engines walk subscription lists on every
+    /// wire update).
+    sub_csr: OnceCell<SubscriptionCsr>,
     /// Per-wire control-friendliness flag.
     pub(crate) is_cf_flags: Vec<bool>,
     /// Reduces hash count by grouping switches that share the same control wire.
@@ -15,6 +22,42 @@ pub struct System {
     /// For each gate, the (group_index, member_index) it belongs to (if any),
     /// reverse-lookup table for switch groups.
     pub(crate) gate_to_group: Vec<Option<(u32, u32)>>,
+}
+
+/// Per-wire subscription lists in compressed-sparse-row form: wire `w`'s
+/// subscribers are `gids[offsets[w] .. offsets[w + 1]]`.
+#[derive(Debug)]
+pub(crate) struct SubscriptionCsr {
+    offsets: Vec<u32>,
+    gids: Vec<u32>,
+}
+
+impl SubscriptionCsr {
+    fn build(num_wires: usize, edges: &[(u32, u32)]) -> Self {
+        // Counting sort by wire id; gate order within a wire is preserved
+        // (matches the old push order).
+        let mut offsets = vec![0u32; num_wires + 1];
+        for &(wid, _) in edges {
+            offsets[wid as usize + 1] += 1;
+        }
+        for w in 0..num_wires {
+            offsets[w + 1] += offsets[w];
+        }
+        let mut cursor = offsets.clone();
+        let mut gids = vec![0u32; edges.len()];
+        for &(wid, gid) in edges {
+            let c = &mut cursor[wid as usize];
+            gids[*c as usize] = gid;
+            *c += 1;
+        }
+        SubscriptionCsr { offsets, gids }
+    }
+
+    /// Gates subscribed to wire `w`.
+    #[inline]
+    pub(crate) fn of(&self, w: usize) -> &[u32] {
+        &self.gids[self.offsets[w] as usize..self.offsets[w + 1] as usize]
+    }
 }
 
 /// Communication + hash cost of a circuit.
@@ -68,11 +111,28 @@ impl System {
         System {
             gates: Vec::new(),
             values: Vec::new(),
-            subscriptions: Vec::new(),
+            sub_edges: Vec::new(),
+            sub_csr: OnceCell::new(),
             is_cf_flags: Vec::new(),
             switch_groups: Vec::new(),
             gate_to_group: Vec::new(),
         }
+    }
+
+    /// Per-wire subscription lists (gates that reference each wire), compiled
+    /// to CSR on first use. Construction must be finished before the first
+    /// call (the propagation engines run on a fully-built system).
+    pub(crate) fn subscriptions(&self) -> &SubscriptionCsr {
+        debug_assert!(
+            self.sub_csr.get().is_none() || self.sub_edges.len() == self.csr_edge_count(),
+            "subscriptions() used before construction finished"
+        );
+        self.sub_csr
+            .get_or_init(|| SubscriptionCsr::build(self.values.len(), &self.sub_edges))
+    }
+
+    fn csr_edge_count(&self) -> usize {
+        self.sub_csr.get().map_or(0, |c| c.gids.len())
     }
 
     /// Compute the circuit's communication + hash cost.
@@ -132,7 +192,6 @@ impl System {
             );
         }
         let wid = self.values.len();
-        self.subscriptions.push(Vec::new());
         self.values.push(Val::none(modulus));
         self.is_cf_flags.push(is_cf);
         Wire { wid }
@@ -147,7 +206,11 @@ impl System {
     }
 
     fn subscribe(&mut self, w: Wire, gid: GateId) {
-        self.subscriptions[w.wid].push(gid);
+        debug_assert!(
+            self.sub_csr.get().is_none(),
+            "subscribe after the CSR was built"
+        );
+        self.sub_edges.push((w.wid as u32, gid as u32));
     }
 
     /// Get the modulus for a wire.
