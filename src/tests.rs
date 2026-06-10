@@ -1017,6 +1017,61 @@ fn test_replay_matches_worklist_eval() {
 }
 
 #[test]
+#[ignore]
+fn bench_stream_loop() {
+    // Repeats the production stream so a sampling profiler has a long window.
+    // Run: N=256 S=1536 REPS=30 cargo test --release bench_stream_loop -- --ignored --nocapture
+    let n: u32 = std::env::var("N")
+        .unwrap_or_else(|_| "256".into())
+        .parse()
+        .unwrap();
+    let s_dim: usize = std::env::var("S")
+        .unwrap_or_else(|_| "1536".into())
+        .parse()
+        .unwrap();
+    let reps: usize = std::env::var("REPS")
+        .unwrap_or_else(|_| "30".into())
+        .parse()
+        .unwrap();
+    let params = CrtParams::from_primes(&FIRST_80_PRIMES, n);
+    let mut rng = rng();
+    let a_residues: Vec<Vec<u64>> = params
+        .primes
+        .iter()
+        .map(|&pi| (0..s_dim).map(|_| rng.random_range(0..pi)).collect())
+        .collect();
+    let b_residues: Vec<Vec<u64>> = params
+        .primes
+        .iter()
+        .map(|&pi| (0..s_dim).map(|_| rng.random_range(0..pi)).collect())
+        .collect();
+    let t = std::time::Instant::now();
+    for _ in 0..reps {
+        let x: u64 = rng.random_range(0..u64::MAX >> (64 - n.min(63)));
+        let x_bits: Vec<u64> = (0..n).map(|j| (x >> j) & 1).collect();
+        let mut pipeline = Pipeline::new(&mut rng);
+        let bit_ids: Vec<_> = x_bits
+            .iter()
+            .map(|&b| pipeline.seed_input_cf_value(&mut rng, 2, b))
+            .collect();
+        let outputs = build_s_aff_streaming(
+            &mut pipeline,
+            &bit_ids,
+            &x_bits,
+            &params,
+            &a_residues,
+            &b_residues,
+        );
+        std::hint::black_box(&outputs);
+    }
+    eprintln!(
+        "{} reps, {:.4}s/rep",
+        reps,
+        t.elapsed().as_secs_f64() / reps as f64
+    );
+}
+
+#[test]
 fn test_streaming_sweep() {
     // Sweep S around the RESIDUE_BATCH_SIZE=128 body-batch boundary (the path the
     // nonce advance touches) and several x, asserting the streaming pipeline
