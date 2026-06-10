@@ -219,8 +219,10 @@ pub fn replay_with_labels(
                 label::div2k(lbl(in0), k)
             }
             Gate::Switch { data, ctrl, out } => {
-                // Exec fires a switch only when its control value is 0.
-                debug_assert_eq!(values[ctrl.wid].v, 0, "replay: switch {gid} open");
+                // Exec fires a switch only when its control value is 0; a
+                // journal from a different Exec/input would silently produce
+                // garbage labels here, so check unconditionally.
+                assert_eq!(values[ctrl.wid].v, 0, "replay: switch {gid} open");
                 let h = switch_hash(system, gid, lbl(ctrl), &mut bulk_cache);
                 if wid == out.wid {
                     label::add(lbl(data), &h) // out = data + H
@@ -252,7 +254,7 @@ pub fn replay_with_labels(
             system.modulus(Wire { wid }),
             "modulus mismatch setting wire {wid}"
         );
-        debug_assert!(labels[wid].is_none(), "replay: wire {wid} already labeled");
+        assert!(labels[wid].is_none(), "replay: wire {wid} already labeled");
         labels[wid] = Some(v);
     }
 

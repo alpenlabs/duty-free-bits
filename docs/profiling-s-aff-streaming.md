@@ -7,8 +7,24 @@ This documents where the 1 s garble / 1 s eval actually went, the experiments
 that localized each cost, the optimizations applied (with measured effect), and
 the remaining gap to the genuine instruction floor.
 
-**Headline: total wall time went 2.33 s → 0.51 s (4.6×) with no protocol or
+**Headline (after two rounds): the stream went 2.33 s → ~0.22 s at matched
+clocks — 9.6× fewer CPU cycles, 11.2× fewer instructions — with no protocol or
 wire-format changes. Hashing was never the bottleneck; label bookkeeping was.**
+§§1–7 document round 1 (2.33 s → 0.51 s); §8 documents round 2
+(0.51 s → ~0.22 s) and the updated roadmap.
+
+Interleaved three-way benchmark, identical machine state (clock-independent
+counters are the trustworthy columns — this machine throttles under ambient
+load, which scales wall time but not instructions/cycles):
+
+| commit | [stream] wall* | instructions | cycles |
+|---|---|---|---|
+| pre-round-1 (`10a1a7e`) | 3.45 s | 41.40 G | 6.85 G |
+| round-1 (`55557a3`) | 0.83 s | 7.36 G | 1.81 G |
+| round-2 (HEAD) | 0.36 s | **3.71 G** | **0.71 G** |
+
+*wall at a ~2.0 GHz effective clock; at the M1's full 3.2 GHz the round-2
+stream is ~0.20–0.22 s (≈105 ms garble + ≈105 ms eval).
 
 ---
 
@@ -220,3 +236,94 @@ Ranked next steps (none attempted yet):
   separately; `PhaseStats` now does.
 * Streaming batching already achieves its memory goal: nothing is DRAM-bound,
   peak phase fits L2, kernel state fits L1, IPC 4.15.
+
+## 8. Round 2: 0.51 s → ~0.22 s (full-clock equivalent)
+
+Round 2 attacked the §6 roadmap. Everything remains semantics-preserving (the
+wire format, hash bytes, masks, labels, join diffs and decoded outputs are
+unchanged for all inputs); 152 tests pass in debug and release, and the diff
+survived an adversarial multi-agent review (4 subsystem reviewers + independent
+verifiers re-deriving bounds and running probe tests against both commits).
+
+### What landed
+
+**IT-GC kernel** (`it_gc.rs`, `hash.rs`) — 0.20 s → 0.086 s:
+* one contiguous padded `HashSlab` per batch (stride rounded to 8 B, 8 B tail
+  pad) instead of a `Vec<u8>` per slot (~270 k allocations gone);
+* `extract_pad` is branchless: one unaligned little-endian u64 load + shift +
+  lg p-bit mask + compare-subtract. The previous version's variable-length
+  tail copy compiled to a branchy memcpy in a ~34 M-iteration loop;
+* `hash_bulk_into` writes into caller storage; `hash_bulk` delegates to it, so
+  the two cannot drift (golden vectors pinned).
+
+**Worklist engines** (`exec.rs`, `garbler.rs`, `evaluator.rs`) — a shared
+`Worklist` with three bitsets: *known-wire* (definedness checks never touch
+the 48 B/entry label arrays), *done-gate* (a gate provably unable to derive a
+new wire is dropped at pop and never re-enqueued), and *in-queue* (a gate
+woken by several wire updates is visited once). Firing gates don't re-enqueue
+themselves. The garbler also stopped blanket-seeding all gates — only
+subscribers of seeded wires plus `Mul(scalar = 0)` gates (the one shape that
+fires with no known input) are seeded.
+
+**Journal replay for the evaluator** — the structural win. The cleartext
+`Exec` pass (which must run anyway — it supplies switch controls) records the
+set-order journal `(gate, wire)`. Label propagation derives wires through
+exactly the same gate directions as value propagation (joins via the program
+diff, switches only when ctrl = 0), so the journal **is** a valid label
+schedule: `replay_with_labels` re-derives every label on a linear tape with no
+queue, no wakeups, and no definedness checks. A differential test pins
+replay == worklist on the circular `word_to_hot` + fold circuitry. (The
+garbler cannot reuse the journal: masks cross switches unconditionally but do
+not cross joins — different reachability.)
+
+**Labels & hashing** (`label.rs`, `hash.rs`):
+* Z₂ labels (the most numerous object in the system) store their 2 words
+  inline — `Repr::Bits([u64; 2])` — no heap allocation anywhere on a Z₂ path;
+* `hash_solo` uses stack buffers and `from_packed_bytes` (PRG bytes → lanes
+  directly, branchless u128 windows over a padded word array; k = 8 lanes are
+  just the bytes);
+* `delta_r` cached per modulus in garble's constant seeding.
+
+**Allocation/structure trims**: sparse sorted join-diff storage in `Program`
+(was a zeroed 1.4 MB `Vec<Option<Label>>` per phase for ~2 k joins);
+subscriptions as a lazily-compiled CSR (one flat allocation instead of one
+`Vec` per wire — build cost halved); `GarnerDecoder` precomputes Garner
+prefix products and inverses once per prime set (decode of 1280 components:
+67 ms → 3 ms); `Val` ops use compare-subtract / u64 paths (no u128 division).
+
+### Review findings (fixed)
+
+The adversarial review confirmed one real (major) regression — the CSR could
+go *silently stale* in release if a `System` was extended after its first
+propagation pass, a public-API sequence the old per-wire lists handled
+correctly. Fixed: `subscriptions()` hard-asserts the edge count matches the
+frozen CSR (loud panic at the next propagation; regression test added).
+Minor fixes from the same review: `OnceLock` instead of `OnceCell` (keeps
+`System: Sync`), `Exec::run_recorded` clears the journal per run,
+`GarnerDecoder::new` hard-asserts its delayed-reduction bound (decode runs in
+release; debug-only guards are not enough on public decode paths), replay's
+journal-misuse checks promoted to hard asserts, u32-narrowing guards on CSR
+build and journal recording, packed-word round-trip coverage extended to
+k = 32, and `body_batch_eval` got the same overflow `debug_assert` as garble.
+
+### Where the remaining ~0.22 s (full-clock) lives
+
+| bucket | @2 GHz measured | ≈@3.2 GHz | note |
+|---|---|---|---|
+| header garble (worklist) | 0.116 s | 72 ms | the last fixpoint engine standing |
+| header exec + label replay | 0.114 s | 71 ms | exec discovery + replay math |
+| IT-GC kernel | 0.086 s | 54 ms | ~1.6 ns per (slot, member); near scalar floor |
+| chunks + build + misc | 0.06 s | 38 ms | |
+
+Updated roadmap, in descending value:
+1. **Straight-line header kernels** — garble/eval the extract+fold circuits as
+   array code bypassing `System` entirely, the way the body kernel already
+   does (~50–70 ms; the remaining interpreter cost is irreducible otherwise).
+2. **NEON pad extraction** in the IT-GC kernel — TBL-gather 8 pads per 16 B
+   window + vector MLA (~25 ms; unsafe intrinsics + per-lg p tables).
+3. **Garbler dry-run + replay** — a bitset-only discovery pass journaling its
+   own schedule, then math-only replay (~15–25 ms; superseded by 1).
+4. **Thread-level parallelism** — the 80 primes are independent given the
+   chunk-word carries; scoped threads over primes would cut wall time ~4–6×
+   on M1 without touching single-core cost (orthogonal to all of the above;
+   changes the measurement semantics, so kept out of these numbers).

@@ -158,6 +158,10 @@ pub fn body_batch_eval(
     let g_hot = truth_table[hot] % p_i;
 
     // Delayed reduction, mirroring `body_batch_garble` (see the bound there).
+    debug_assert!(
+        (p_i as u128) * (p_i as u128) * (p_i as u128) < (1u128 << 63),
+        "delayed-reduction accumulators would overflow for p = {p_i}"
+    );
     let mut pad_sum_raw = vec![0u64; b]; // Σ_{i≠hot} pad_i  (every pad we can recompute)
     let mut readout_raw = vec![0u64; b]; // Σ_{i≠hot} g(i)·pad_i
     for (i, &t) in truth_table.iter().enumerate() {

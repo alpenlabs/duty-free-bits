@@ -175,6 +175,11 @@ impl<'a> Exec<'a> {
     /// Seeds (`set` calls and constants) are not journaled — only derived
     /// wires, in derivation order.
     pub fn run_recorded(&mut self) {
+        assert!(
+            self.values.len() <= u32::MAX as usize && self.system.num_gates() <= u32::MAX as usize,
+            "journal entries use u32 ids"
+        );
+        self.journal.clear();
         self.record = true;
         self.run();
         self.record = false;
