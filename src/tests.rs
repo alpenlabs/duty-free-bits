@@ -622,6 +622,63 @@ fn test_s_aff_scaling() {
             pipeline.hash_count_ncf,
         );
 
+        // ---- Per-phase-class timing breakdown ----
+        struct Class {
+            n: usize,
+            build: f64,
+            garble: f64,
+            exec: f64,
+            label_eval: f64,
+            wires: usize,
+            gates: usize,
+        }
+        let mut classes: std::collections::BTreeMap<&str, Class> = Default::default();
+        for ps in &pipeline.phase_stats {
+            let class = if ps.name.starts_with("chunk[") {
+                "chunk conversion"
+            } else if ps.name.ends_with("/header") {
+                "prime header"
+            } else {
+                "other"
+            };
+            let c = classes.entry(class).or_insert(Class {
+                n: 0,
+                build: 0.0,
+                garble: 0.0,
+                exec: 0.0,
+                label_eval: 0.0,
+                wires: 0,
+                gates: 0,
+            });
+            c.n += 1;
+            c.build += ps.build_secs;
+            c.garble += ps.garble_secs;
+            c.exec += ps.exec_secs;
+            c.label_eval += ps.label_eval_secs;
+            c.wires += ps.wires;
+            c.gates += ps.gates;
+        }
+        eprintln!("          ---- phase classes ----");
+        eprintln!(
+            "          {:<18} {:>4} {:>8} {:>8} {:>8} {:>8} {:>10} {:>10}",
+            "class", "n", "build", "garble", "exec", "lbl-eval", "wires", "gates"
+        );
+        for (name, c) in &classes {
+            eprintln!(
+                "          {:<18} {:>4} {:>7.3}s {:>7.3}s {:>7.3}s {:>7.3}s {:>10} {:>10}",
+                name, c.n, c.build, c.garble, c.exec, c.label_eval, c.wires, c.gates
+            );
+        }
+        eprintln!(
+            "          {:<18} {:>4} {:>8} {:>7.3}s {:>8} {:>7.3}s",
+            "it-gc body kernel",
+            "-",
+            "-",
+            pipeline.kernel_garble_secs,
+            "-",
+            pipeline.kernel_eval_secs,
+        );
+
         // Verify outputs reconstruct correctly.
         for s in 0..s_dim {
             let residues: Vec<u64> = outputs.iter().map(|prime_outs| prime_outs[s]).collect();
@@ -631,6 +688,227 @@ fn test_s_aff_scaling() {
         }
         eprintln!("ok: streaming reconstructed all {s_dim} affine maps");
     }
+}
+
+#[test]
+#[ignore]
+fn bench_header_decomposition() {
+    // Decompose one prime-header phase into its two sub-circuits and time each:
+    //   A: r_i accumulation + sub_chunk_extract   (k=8/22 CF label arithmetic)
+    //   B: fold_to_mod_ohe                        (p·(ell−8) Z_2 gates + hashes)
+    //
+    // Run with: cargo test --release bench_header_decomposition -- --ignored --nocapture
+    use crate::comp_gc::convert::{
+        SubChunkExtraction, bin_to_word, compute_sub_widths, fold_to_mod_ohe, sub_chunk_extract,
+    };
+    use crate::crt::pow2_mod;
+
+    let n: u32 = 256;
+    let params = CrtParams::from_primes(&FIRST_80_PRIMES, n);
+    let ell = params.ell;
+    let chunk_size = params.chunk_size as usize;
+    let work_mod = 1u64 << ell;
+    let sub_widths = compute_sub_widths(ell, 8);
+
+    let mut rng = rng();
+    let x_bits: Vec<u64> = (0..n).map(|_| rng.random_range(0..2u64)).collect();
+
+    let mut pipeline = Pipeline::new(&mut rng);
+    let bit_ids: Vec<_> = x_bits
+        .iter()
+        .map(|&b| pipeline.seed_input_cf_value(&mut rng, 2, b))
+        .collect();
+
+    // Chunk conversion (as in production).
+    let mut chunk_word_ids = Vec::new();
+    for c in 0..params.num_chunks {
+        let start = c * chunk_size;
+        let end = (start + chunk_size).min(n as usize);
+        let ids = &bit_ids[start..end];
+        let outs = pipeline.run_phase(format!("chunk[{c}]"), ids, move |sys, ws| {
+            let mut bits = ws.to_vec();
+            if bits.len() < chunk_size {
+                let zero = sys.constant(0, 2);
+                while bits.len() < chunk_size {
+                    bits.push(zero);
+                }
+            }
+            vec![bin_to_word(sys, &bits, ell)]
+        });
+        chunk_word_ids.push(outs[0]);
+    }
+
+    // For a few representative primes, run extract and fold as separate phases.
+    for &p_i in &[2u64, 101, 257, 409] {
+        let sw = sub_widths.clone();
+        // Phase A: r_i + sub_chunk_extract. Outputs: flattened bits then first_bin_hot.
+        let a_ids = pipeline.run_phase(
+            format!("p{}/extract", p_i),
+            &chunk_word_ids,
+            move |sys, chunk_wires| {
+                let mut r_i = sys.constant(0, work_mod);
+                for (c, &w_c) in chunk_wires.iter().enumerate() {
+                    let coeff = pow2_mod((c * chunk_size) as u32, p_i);
+                    if coeff > 0 {
+                        let term = sys.mul(coeff, w_c);
+                        r_i = sys.add(r_i, term);
+                    }
+                }
+                let ex = sub_chunk_extract(sys, r_i, &sw);
+                let mut outs: Vec<Wire> = ex.bits.iter().flatten().copied().collect();
+                outs.extend_from_slice(&ex.first_bin_hot);
+                outs
+            },
+        );
+        let sw = sub_widths.clone();
+        let n_bits: usize = sw.iter().map(|&w| w as usize).sum();
+        // Phase B: fold. Rebuild the extraction struct from carried wires.
+        let _h_p = pipeline.run_phase(format!("p{}/fold", p_i), &a_ids, move |sys, ws| {
+            let (bit_ws, hot_ws) = ws.split_at(n_bits);
+            let mut bits = Vec::new();
+            let mut off = 0;
+            for &w in &sw {
+                bits.push(bit_ws[off..off + w as usize].to_vec());
+                off += w as usize;
+            }
+            let ex = SubChunkExtraction {
+                bits,
+                first_bin_hot: hot_ws.to_vec(),
+                sub_widths: sw.clone(),
+            };
+            fold_to_mod_ohe(sys, &ex, p_i)
+        });
+    }
+
+    eprintln!(
+        "{:<14} {:>8} {:>8} {:>8} {:>8} {:>9} {:>9}",
+        "phase", "build", "garble", "exec", "lbl-eval", "wires", "gates"
+    );
+    for ps in &pipeline.phase_stats {
+        if ps.name.starts_with("chunk") {
+            continue;
+        }
+        eprintln!(
+            "{:<14} {:>7.4}s {:>7.4}s {:>7.4}s {:>7.4}s {:>9} {:>9}",
+            ps.name,
+            ps.build_secs,
+            ps.garble_secs,
+            ps.exec_secs,
+            ps.label_eval_secs,
+            ps.wires,
+            ps.gates
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn bench_primitives() {
+    // Microbenchmark the primitive ops the garble/eval inner loops are made of.
+    // Run with: cargo test --release bench_primitives -- --ignored --nocapture
+    use crate::crypto::expand;
+    use crate::hash::{extract_ncf, hash_bulk, hash_solo};
+    use crate::label::{self, CfLabel, LAMBDA, Label};
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    let mut rng = rng();
+    let mut rand_cf = |modulus: u64| {
+        let coords: Vec<u64> = (0..LAMBDA).map(|_| rng.random_range(0..modulus)).collect();
+        Label::Cf(CfLabel::from_coords(&coords, modulus))
+    };
+
+    fn bench(name: &str, iters: usize, mut f: impl FnMut()) {
+        // Warmup.
+        for _ in 0..iters / 10 + 1 {
+            f();
+        }
+        let t = Instant::now();
+        for _ in 0..iters {
+            f();
+        }
+        let ns = t.elapsed().as_nanos() as f64 / iters as f64;
+        eprintln!("{name:<42} {ns:>10.1} ns/op");
+    }
+
+    // CF label arithmetic at the moduli the header actually uses.
+    for k in [1u32, 8, 14, 22] {
+        let m = 1u64 << k;
+        let a = rand_cf(m);
+        let b = rand_cf(m);
+        bench(&format!("label::add        CF k={k}"), 200_000, || {
+            black_box(label::add(black_box(&a), black_box(&b)));
+        });
+        bench(
+            &format!("label::scalar_mul CF k={k} (s=3)"),
+            200_000,
+            || {
+                black_box(label::scalar_mul(black_box(3), black_box(&a)));
+            },
+        );
+        let big = rand_cf(1u64 << 22);
+        if k < 22 {
+            bench(&format!("label::mod2k      22->k={k}"), 200_000, || {
+                black_box(label::mod2k(black_box(&big), k));
+            });
+        }
+    }
+    // Clone (the propagation engine clones labels on every gate visit).
+    let a22 = rand_cf(1u64 << 22);
+    let a1 = rand_cf(2);
+    bench("Label::clone      CF k=22", 200_000, || {
+        black_box(black_box(&a22).clone());
+    });
+    bench("Label::clone      CF k=1", 200_000, || {
+        black_box(black_box(&a1).clone());
+    });
+
+    // CCRH paths.
+    let ctrl = rand_cf(2);
+    bench("hash_solo -> CF k=1   (1 AES block)", 200_000, || {
+        black_box(hash_solo(black_box(&ctrl), 12345, true, 2));
+    });
+    bench("hash_solo -> CF k=8   (8 AES blocks)", 100_000, || {
+        black_box(hash_solo(black_box(&ctrl), 12345, true, 1 << 8));
+    });
+    bench("hash_solo -> CF k=22  (22 AES blocks)", 50_000, || {
+        black_box(hash_solo(black_box(&ctrl), 12345, true, 1 << 22));
+    });
+    bench("hash_solo -> NCF p=409", 200_000, || {
+        black_box(hash_solo(black_box(&ctrl), 12345, false, 409));
+    });
+    let mut buf16 = [0u8; 16];
+    bench("expand 16B (raw AES block)", 500_000, || {
+        expand(black_box([7u8; 16]), black_box(99), &mut buf16);
+        black_box(&buf16);
+    });
+    let mut buf144 = [0u8; 144];
+    bench("expand 144B (9 blocks: bulk 128x9bit)", 200_000, || {
+        expand(black_box([7u8; 16]), black_box(99), &mut buf144);
+        black_box(&buf144);
+    });
+    bench("hash_bulk 128 members p=409 (1152 bits)", 200_000, || {
+        black_box(hash_bulk(black_box(&ctrl), 7, 128 * 9));
+    });
+
+    // IT-GC kernel inner ops.
+    let wide = hash_bulk(&ctrl, 7, 128 * 9);
+    bench("extract_ncf p=409 (9-bit slice)", 1_000_000, || {
+        black_box(extract_ncf(black_box(&wide), black_box(64), 409));
+    });
+    bench("u64 mod_mul (a*b)%p", 1_000_000, || {
+        let a = black_box(123u64);
+        let b = black_box(371u64);
+        black_box((a * b) % black_box(409u64));
+    });
+
+    // Allocation: what one Vec<u64> label allocation costs.
+    bench("alloc Vec<u64> 2 words (k=1 label)", 500_000, || {
+        black_box(vec![0u64; 2]);
+    });
+    bench("alloc Vec<u64> 44 words (k=22 label)", 500_000, || {
+        black_box(vec![0u64; 44]);
+    });
 }
 
 #[test]

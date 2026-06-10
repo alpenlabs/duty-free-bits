@@ -8,14 +8,28 @@
 /// Security parameter: number of coordinates in a control-friendly label.
 pub const LAMBDA: usize = 128;
 
-/// A control-friendly label: LAMBDA coordinates in Z_{2^k}, bit-packed.
+/// A control-friendly label: LAMBDA coordinates in Z_{2^k}.
+///
+/// The *wire format* (communication, hashing) is always the bit-packed string
+/// where coordinate `i` occupies bits `[i*k .. (i+1)*k)` LSB-first — see
+/// [`CfLabel::from_raw_bits`] / [`CfLabel::to_packed_words`]. In memory, k = 1
+/// keeps that packed form (2 words, XOR-friendly), while k > 1 stores one
+/// coordinate per u32 lane so the λ-wide ring ops are plain vectorizable loops
+/// instead of per-coordinate bit surgery.
 #[derive(Clone, Debug)]
 pub struct CfLabel {
-    /// Bit-packed coordinates. Coordinate `i` occupies bits `[i*k .. (i+1)*k)`
-    /// of the concatenated bit string, stored LSB-first in `bits[bit/64]`.
-    bits: Vec<u64>,
-    /// Ring modulus; must be a power of two in `[2, 2^62]`.
+    repr: Repr,
+    /// Ring modulus; must be a power of two in `[2, 2^32]`.
     modulus: u64,
+}
+
+/// In-memory coordinate storage (see [`CfLabel`]).
+#[derive(Clone, Debug)]
+enum Repr {
+    /// k == 1: λ bits packed into ⌈λ/64⌉ u64 words (the wire format itself).
+    Bits(Vec<u64>),
+    /// 2 ≤ k ≤ 32: one coordinate per u32 lane, length λ.
+    Lanes(Vec<u32>),
 }
 
 /// A non-control-friendly label: a single coordinate in Z_modulus.
@@ -39,20 +53,21 @@ pub enum Label {
 // ---- CfLabel construction / accessors ----
 
 impl CfLabel {
-    /// Zero label in Z_{modulus}. `modulus` must be a power of two in `[2, 2^62]`.
+    /// Zero label in Z_{modulus}. `modulus` must be a power of two in `[2, 2^32]`.
     pub fn zero(modulus: u64) -> Self {
         assert!(
             modulus.is_power_of_two(),
             "CF modulus {} is not power of two",
             modulus
         );
-        assert!((2..=(1u64 << 62)).contains(&modulus));
+        assert!((2..=(1u64 << 32)).contains(&modulus));
         let k = modulus.trailing_zeros() as usize;
-        let words = (LAMBDA * k).div_ceil(64);
-        CfLabel {
-            bits: vec![0u64; words],
-            modulus,
-        }
+        let repr = if k == 1 {
+            Repr::Bits(vec![0u64; LAMBDA.div_ceil(64)])
+        } else {
+            Repr::Lanes(vec![0u32; LAMBDA])
+        };
+        CfLabel { repr, modulus }
     }
 
     /// Build from an explicit coord list (length LAMBDA).
@@ -88,50 +103,64 @@ impl CfLabel {
     /// Read coordinate `i`.
     pub fn get(&self, i: usize) -> u64 {
         debug_assert!(i < LAMBDA);
-        let k = self.k() as usize;
-        if k == 0 {
-            return 0;
-        }
-        let bit_pos = i * k;
-        let word = bit_pos / 64;
-        let shift = bit_pos % 64;
-        let mask = coord_mask(k as u32);
-        if shift + k <= 64 {
-            (self.bits[word] >> shift) & mask
-        } else {
-            let lo = self.bits[word] >> shift;
-            let hi = self.bits[word + 1] << (64 - shift);
-            (lo | hi) & mask
+        match &self.repr {
+            Repr::Bits(bits) => (bits[i / 64] >> (i % 64)) & 1,
+            Repr::Lanes(lanes) => lanes[i] as u64,
         }
     }
 
     /// Write coordinate `i`.
     pub fn set(&mut self, i: usize, v: u64) {
         debug_assert!(i < LAMBDA);
-        let k = self.k() as usize;
-        if k == 0 {
-            return;
-        }
-        let bit_pos = i * k;
-        let word = bit_pos / 64;
-        let shift = bit_pos % 64;
-        let mask = coord_mask(k as u32);
+        let mask = coord_mask(self.modulus.trailing_zeros());
         let v = v & mask;
-        self.bits[word] = (self.bits[word] & !(mask << shift)) | (v << shift);
-        if shift + k > 64 {
-            let high_bits = (shift + k) - 64;
-            let high_mask = (1u64 << high_bits) - 1;
-            self.bits[word + 1] =
-                (self.bits[word + 1] & !high_mask) | ((v >> (64 - shift)) & high_mask);
+        match &mut self.repr {
+            Repr::Bits(bits) => {
+                bits[i / 64] = (bits[i / 64] & !(1u64 << (i % 64))) | (v << (i % 64));
+            }
+            Repr::Lanes(lanes) => lanes[i] = v as u32,
         }
     }
 
-    /// Raw bit-packed storage (primarily for tests / serialization).
+    /// Raw bit-packed words of a Z_2 label (the wire format). Z_2 only — wider
+    /// labels store lanes; serialize those with
+    /// [`to_packed_words`](CfLabel::to_packed_words).
     pub fn raw_bits(&self) -> &[u64] {
-        &self.bits
+        match &self.repr {
+            Repr::Bits(bits) => bits,
+            Repr::Lanes(_) => panic!("raw_bits: only Z_2 labels are stored bit-packed"),
+        }
     }
 
-    /// Build a CF label from a raw u64-word storage. The buffer must have
+    /// Serialize to the canonical bit-packed wire format: coordinate `i` at
+    /// bits `[i*k .. (i+1)*k)` LSB-first, `⌈λ·k/64⌉` words.
+    pub fn to_packed_words(&self) -> Vec<u64> {
+        match &self.repr {
+            Repr::Bits(bits) => bits.clone(),
+            Repr::Lanes(lanes) => {
+                let k = self.k() as usize;
+                let mask = coord_mask(k as u32);
+                let words = (LAMBDA * k).div_ceil(64);
+                let mut bits = vec![0u64; words];
+                let (mut word, mut shift) = (0usize, 0usize);
+                for &c in lanes {
+                    let v = (c as u64) & mask;
+                    bits[word] |= v << shift;
+                    if shift + k > 64 {
+                        bits[word + 1] |= v >> (64 - shift);
+                    }
+                    shift += k;
+                    if shift >= 64 {
+                        shift -= 64;
+                        word += 1;
+                    }
+                }
+                bits
+            }
+        }
+    }
+
+    /// Build a CF label from the bit-packed wire format. The buffer must have
     /// exactly `⌈LAMBDA · k / 64⌉` words.
     pub fn from_raw_bits(mut bits: Vec<u64>, modulus: u64) -> Self {
         assert!(
@@ -143,16 +172,66 @@ impl CfLabel {
         let total_bits = LAMBDA * k;
         let words = total_bits.div_ceil(64);
         assert_eq!(bits.len(), words, "raw bits length mismatch");
-        let last_used = total_bits % 64;
-        if last_used != 0 {
-            bits[words - 1] &= (1u64 << last_used) - 1;
+        if k == 1 {
+            let last_used = total_bits % 64;
+            if last_used != 0 {
+                bits[words - 1] &= (1u64 << last_used) - 1;
+            }
+            return CfLabel {
+                repr: Repr::Bits(bits),
+                modulus,
+            };
         }
-        CfLabel { bits, modulus }
+        // Unpack the packed coordinates into lanes with a sequential cursor.
+        assert!(k <= 32, "CF modulus 2^{k} exceeds the u32 lane width");
+        let mask = coord_mask(k as u32);
+        let mut lanes = vec![0u32; LAMBDA];
+        let (mut word, mut shift) = (0usize, 0usize);
+        for lane in lanes.iter_mut() {
+            let lo = bits[word] >> shift;
+            let v = if shift + k <= 64 {
+                lo
+            } else {
+                lo | (bits[word + 1] << (64 - shift))
+            };
+            *lane = (v & mask) as u32;
+            shift += k;
+            if shift >= 64 {
+                shift -= 64;
+                word += 1;
+            }
+        }
+        CfLabel {
+            repr: Repr::Lanes(lanes),
+            modulus,
+        }
     }
 }
 
 fn coord_mask(k: u32) -> u64 {
     if k >= 64 { !0u64 } else { (1u64 << k) - 1 }
+}
+
+/// Word-wise XOR of two equal-length packed-bit buffers (Z_2 add/sub).
+fn xor_words(a: &[u64], b: &[u64]) -> Vec<u64> {
+    debug_assert_eq!(a.len(), b.len());
+    a.iter().zip(b).map(|(&x, &y)| x ^ y).collect()
+}
+
+/// Pack bit `bit` of every u32 lane into a Z_2 packed-bit buffer.
+/// Accumulates each 64-lane half in a register to avoid per-lane
+/// read-modify-write through memory.
+fn pack_lane_bit(lanes: &[u32], bit: u32) -> Vec<u64> {
+    debug_assert_eq!(lanes.len(), LAMBDA);
+    let mut out = vec![0u64; LAMBDA.div_ceil(64)];
+    for (w, chunk) in lanes.chunks_exact(64).enumerate() {
+        let mut acc = 0u64;
+        for (i, &l) in chunk.iter().enumerate() {
+            acc |= (((l >> bit) & 1) as u64) << i;
+        }
+        out[w] = acc;
+    }
+    out
 }
 
 impl PartialEq for CfLabel {
@@ -243,40 +322,29 @@ impl Eq for Label {}
 
 // ---- Arithmetic ----
 
-fn add_mod_pow2(a: u64, b: u64, k: u32) -> u64 {
-    let mask = coord_mask(k);
-    a.wrapping_add(b) & mask
-}
-
-fn sub_mod_pow2(a: u64, b: u64, k: u32) -> u64 {
-    let mask = coord_mask(k);
-    a.wrapping_sub(b) & mask
-}
-
-fn mul_mod_pow2(s: u64, a: u64, k: u32) -> u64 {
-    let mask = coord_mask(k);
-    s.wrapping_mul(a) & mask
-}
-
 /// Coordinate-wise addition.
 pub fn add(x: &Label, y: &Label) -> Label {
     match (x, y) {
         (Label::Cf(a), Label::Cf(b)) => {
             assert_eq!(a.modulus, b.modulus, "add: modulus mismatch");
-            let k = a.k();
-            // Fast path for k=1: XOR the raw packed words directly.
-            if k == 1 {
-                let mut out = CfLabel::zero(a.modulus);
-                for i in 0..a.bits.len() {
-                    out.bits[i] = a.bits[i] ^ b.bits[i];
+            let out = match (&a.repr, &b.repr) {
+                // k = 1: addition mod 2 is XOR on the packed words.
+                (Repr::Bits(wa), Repr::Bits(wb)) => Repr::Bits(xor_words(wa, wb)),
+                (Repr::Lanes(la), Repr::Lanes(lb)) => {
+                    let mask = coord_mask(a.k()) as u32;
+                    Repr::Lanes(
+                        la.iter()
+                            .zip(lb)
+                            .map(|(&x, &y)| x.wrapping_add(y) & mask)
+                            .collect(),
+                    )
                 }
-                return Label::Cf(out);
-            }
-            let mut out = CfLabel::zero(a.modulus);
-            for i in 0..LAMBDA {
-                out.set(i, add_mod_pow2(a.get(i), b.get(i), k));
-            }
-            Label::Cf(out)
+                _ => unreachable!("repr is determined by the (equal) modulus"),
+            };
+            Label::Cf(CfLabel {
+                repr: out,
+                modulus: a.modulus,
+            })
         }
         (Label::Ncf(a), Label::Ncf(b)) => {
             assert_eq!(a.modulus, b.modulus, "add: modulus mismatch");
@@ -298,19 +366,24 @@ pub fn sub(x: &Label, y: &Label) -> Label {
     match (x, y) {
         (Label::Cf(a), Label::Cf(b)) => {
             assert_eq!(a.modulus, b.modulus, "sub: modulus mismatch");
-            let k = a.k();
-            if k == 1 {
-                let mut out = CfLabel::zero(a.modulus);
-                for i in 0..a.bits.len() {
-                    out.bits[i] = a.bits[i] ^ b.bits[i];
+            let out = match (&a.repr, &b.repr) {
+                // k = 1: subtraction mod 2 is also XOR.
+                (Repr::Bits(wa), Repr::Bits(wb)) => Repr::Bits(xor_words(wa, wb)),
+                (Repr::Lanes(la), Repr::Lanes(lb)) => {
+                    let mask = coord_mask(a.k()) as u32;
+                    Repr::Lanes(
+                        la.iter()
+                            .zip(lb)
+                            .map(|(&x, &y)| x.wrapping_sub(y) & mask)
+                            .collect(),
+                    )
                 }
-                return Label::Cf(out);
-            }
-            let mut out = CfLabel::zero(a.modulus);
-            for i in 0..LAMBDA {
-                out.set(i, sub_mod_pow2(a.get(i), b.get(i), k));
-            }
-            Label::Cf(out)
+                _ => unreachable!("repr is determined by the (equal) modulus"),
+            };
+            Label::Cf(CfLabel {
+                repr: out,
+                modulus: a.modulus,
+            })
         }
         (Label::Ncf(a), Label::Ncf(b)) => {
             assert_eq!(a.modulus, b.modulus, "sub: modulus mismatch");
@@ -341,21 +414,24 @@ pub fn scalar_mul(s: u64, x: &Label) -> Label {
             if s == 0 {
                 return Label::Cf(CfLabel::zero(a.modulus));
             }
-            // s ≡ 1 mod 2^k → identity.
-            let mask_k = coord_mask(k);
-            if (s & mask_k) == 1 {
+            // s ≡ 1 mod 2^k → identity. For k = 1 this covers every nonzero s
+            // (the s = 0 path already returned), so only Lanes reach the loop.
+            let mask = coord_mask(k);
+            if (s & mask) == 1 {
                 return Label::Cf(a.clone());
             }
-            let mut out = CfLabel::zero(a.modulus);
-            if k == 1 {
-                // (s & 1) is 1 here (the s=0 path already returned), so just copy.
-                out.bits.copy_from_slice(&a.bits);
-                return Label::Cf(out);
-            }
-            for i in 0..LAMBDA {
-                out.set(i, mul_mod_pow2(s, a.get(i), k));
-            }
-            Label::Cf(out)
+            let Repr::Lanes(la) = &a.repr else {
+                unreachable!("k = 1 scalars are 0 or 1 and both returned above");
+            };
+            let s32 = (s & mask) as u32;
+            let lanes = la
+                .iter()
+                .map(|&x| s32.wrapping_mul(x) & mask as u32)
+                .collect();
+            Label::Cf(CfLabel {
+                repr: Repr::Lanes(lanes),
+                modulus: a.modulus,
+            })
         }
         Label::Ncf(a) => {
             // For our parameter range (p ≤ 409) the product s·rep fits in u64
@@ -389,15 +465,20 @@ pub fn scalar_mul(s: u64, x: &Label) -> Label {
 pub fn mod2k(x: &Label, k_out: u32) -> Label {
     match x {
         Label::Cf(a) => {
-            assert!(k_out <= a.k());
+            assert!(k_out >= 1 && k_out <= a.k());
             let out_mod = 1u64 << k_out;
-            let m_in = coord_mask(a.k());
-            let m_out = coord_mask(k_out);
-            let mut out = CfLabel::zero(out_mod);
-            for i in 0..LAMBDA {
-                out.set(i, (a.get(i) & m_in) & m_out);
-            }
-            Label::Cf(out)
+            let repr = match &a.repr {
+                Repr::Bits(w) => Repr::Bits(w.clone()), // k_in = k_out = 1
+                Repr::Lanes(lanes) if k_out == 1 => Repr::Bits(pack_lane_bit(lanes, 0)),
+                Repr::Lanes(lanes) => {
+                    let mask = coord_mask(k_out) as u32;
+                    Repr::Lanes(lanes.iter().map(|&l| l & mask).collect())
+                }
+            };
+            Label::Cf(CfLabel {
+                repr,
+                modulus: out_mod,
+            })
         }
         Label::Ncf(a) => {
             assert!(a.modulus.is_power_of_two());
@@ -418,13 +499,20 @@ pub fn div2k(x: &Label, k: u32) -> Label {
     match x {
         Label::Cf(a) => {
             assert!(a.modulus > (1u64 << k));
-            let low_mask = (1u64 << k) - 1;
             let out_mod = a.modulus >> k;
-            let mut out = CfLabel::zero(out_mod);
-            for i in 0..LAMBDA {
-                out.set(i, (a.get(i) & !low_mask) >> k);
-            }
-            Label::Cf(out)
+            let Repr::Lanes(lanes) = &a.repr else {
+                unreachable!("div2k requires modulus > 2, so the input is Lanes");
+            };
+            let repr = if out_mod == 2 {
+                // Wide → Z_2: pack each lane's surviving bit.
+                Repr::Bits(pack_lane_bit(lanes, k))
+            } else {
+                Repr::Lanes(lanes.iter().map(|&l| l >> k).collect())
+            };
+            Label::Cf(CfLabel {
+                repr,
+                modulus: out_mod,
+            })
         }
         Label::Ncf(a) => {
             assert!(a.modulus > (1u64 << k));
@@ -482,11 +570,26 @@ mod tests {
     }
 
     #[test]
-    fn test_z22_label_is_44_words() {
-        // k=22, 128*22 = 2816 bits, ceil / 64 = 44 words.
+    fn test_z22_label_is_44_packed_words() {
+        // k=22, 128*22 = 2816 bits, ceil / 64 = 44 words on the wire.
         let l = CfLabel::zero(1 << 22);
-        assert_eq!(l.raw_bits().len(), 44);
+        assert_eq!(l.to_packed_words().len(), 44);
         assert_eq!(l.bit_len(), 2816);
+    }
+
+    #[test]
+    fn test_packed_words_roundtrip() {
+        // from_raw_bits ∘ to_packed_words must be the identity for every k:
+        // the packed form is the wire format, the lane form is in-memory only.
+        let mut r = rng();
+        for k in 1u32..=22 {
+            let m = 1u64 << k;
+            let l = rand_cf(&mut r, m);
+            let packed = l.to_packed_words();
+            assert_eq!(packed.len(), (LAMBDA * k as usize).div_ceil(64));
+            let back = CfLabel::from_raw_bits(packed, m);
+            assert_eq!(back, l, "k={k}");
+        }
     }
 
     #[test]

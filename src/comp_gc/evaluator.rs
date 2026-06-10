@@ -129,39 +129,53 @@ fn fire_gate(
 ) {
     match system.gates[gid] {
         Gate::Add { in0, in1, out } => {
-            let (l0, l1, lo) = (
-                labels[in0.wid].clone(),
-                labels[in1.wid].clone(),
-                labels[out.wid].clone(),
-            );
-            if let (Some(a), Some(b)) = (&l0, &l1) {
-                try_set(labels, out, label::add(a, b), queue, system); // out = in0 + in1
+            // Compute a direction only if its target is still unset: label ops
+            // allocate and (for k>1) walk all λ coordinates, so speculative
+            // recomputation on every wakeup dominated eval time.
+            if labels[out.wid].is_none()
+                && let (Some(a), Some(b)) = (&labels[in0.wid], &labels[in1.wid])
+            {
+                let v = label::add(a, b); // out = in0 + in1
+                try_set(labels, out, v, queue, system);
             }
-            if let (Some(o), Some(b)) = (&lo, &l1) {
-                try_set(labels, in0, label::sub(o, b), queue, system); // in0 = out - in1
+            if labels[in0.wid].is_none()
+                && let (Some(o), Some(b)) = (&labels[out.wid], &labels[in1.wid])
+            {
+                let v = label::sub(o, b); // in0 = out - in1
+                try_set(labels, in0, v, queue, system);
             }
-            if let (Some(o), Some(a)) = (&lo, &l0) {
-                try_set(labels, in1, label::sub(o, a), queue, system); // in1 = out - in0
+            if labels[in1.wid].is_none()
+                && let (Some(o), Some(a)) = (&labels[out.wid], &labels[in0.wid])
+            {
+                let v = label::sub(o, a); // in1 = out - in0
+                try_set(labels, in1, v, queue, system);
             }
         }
         Gate::Sub { in0, in1, out } => {
-            let (l0, l1, lo) = (
-                labels[in0.wid].clone(),
-                labels[in1.wid].clone(),
-                labels[out.wid].clone(),
-            );
-            if let (Some(a), Some(b)) = (&l0, &l1) {
-                try_set(labels, out, label::sub(a, b), queue, system); // out = in0 - in1
+            if labels[out.wid].is_none()
+                && let (Some(a), Some(b)) = (&labels[in0.wid], &labels[in1.wid])
+            {
+                let v = label::sub(a, b); // out = in0 - in1
+                try_set(labels, out, v, queue, system);
             }
-            if let (Some(o), Some(b)) = (&lo, &l1) {
-                try_set(labels, in0, label::add(o, b), queue, system); // in0 = out + in1
+            if labels[in0.wid].is_none()
+                && let (Some(o), Some(b)) = (&labels[out.wid], &labels[in1.wid])
+            {
+                let v = label::add(o, b); // in0 = out + in1
+                try_set(labels, in0, v, queue, system);
             }
-            if let (Some(a), Some(o)) = (&l0, &lo) {
-                try_set(labels, in1, label::sub(a, o), queue, system); // in1 = in0 - out
+            if labels[in1.wid].is_none()
+                && let (Some(a), Some(o)) = (&labels[in0.wid], &labels[out.wid])
+            {
+                let v = label::sub(a, o); // in1 = in0 - out
+                try_set(labels, in1, v, queue, system);
             }
         }
         Gate::Mul { in0, scalar, out } => {
             // label_out = s · label_in; when s = 0 the output label is 0 regardless.
+            if labels[out.wid].is_some() {
+                return;
+            }
             if scalar == 0 {
                 try_set(
                     labels,
@@ -170,19 +184,26 @@ fn fire_gate(
                     queue,
                     system,
                 );
-            } else if let Some(a) = labels[in0.wid].clone() {
-                try_set(labels, out, label::scalar_mul(scalar, &a), queue, system);
+            } else if let Some(a) = &labels[in0.wid] {
+                let v = label::scalar_mul(scalar, a);
+                try_set(labels, out, v, queue, system);
             }
         }
         Gate::Mod2k { in0, k, out } => {
             // Forward only; low-bit dropping is not invertible.
-            if let Some(a) = labels[in0.wid].clone() {
-                try_set(labels, out, label::mod2k(&a, k), queue, system);
+            if labels[out.wid].is_none()
+                && let Some(a) = &labels[in0.wid]
+            {
+                let v = label::mod2k(a, k);
+                try_set(labels, out, v, queue, system);
             }
         }
         Gate::Div2k { in0, k, out } => {
-            if let Some(a) = labels[in0.wid].clone() {
-                try_set(labels, out, label::div2k(&a, k), queue, system);
+            if labels[out.wid].is_none()
+                && let Some(a) = &labels[in0.wid]
+            {
+                let v = label::div2k(a, k);
+                try_set(labels, out, v, queue, system);
             }
         }
         Gate::Switch { data, ctrl, out } => {
@@ -193,17 +214,25 @@ fn fire_gate(
             if cv.v != 0 {
                 return; // switch open: no label propagation
             }
+            // Skip the hash entirely once both sides are determined.
+            let need_out = labels[out.wid].is_none() && labels[data.wid].is_some();
+            let need_data = labels[data.wid].is_none() && labels[out.wid].is_some();
+            if !(need_out || need_data) {
+                return;
+            }
             // ctrl = 0: we still need the ctrl *label* to form H. Wait for it.
             let Some(ctrl_label) = labels[ctrl.wid].clone() else {
                 return;
             };
             // For grouped switches, H is sliced from a single wide bulk call.
             let h = switch_hash(system, gid, &ctrl_label, bulk_cache);
-            if let Some(d) = labels[data.wid].clone() {
-                try_set(labels, out, label::add(&d, &h), queue, system); // out = data + H
+            if need_out && let Some(d) = &labels[data.wid] {
+                let v = label::add(d, &h); // out = data + H
+                try_set(labels, out, v, queue, system);
             }
-            if let Some(o) = labels[out.wid].clone() {
-                try_set(labels, data, label::sub(&o, &h), queue, system); // data = out - H
+            if need_data && let Some(o) = &labels[out.wid] {
+                let v = label::sub(o, &h); // data = out - H
+                try_set(labels, data, v, queue, system);
             }
         }
         Gate::Join { a: aw, b: bw } => {
