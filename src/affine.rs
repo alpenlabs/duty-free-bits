@@ -92,8 +92,11 @@ pub fn build_s_aff_streaming(
         let end = (start + chunk_size).min(n);
         let chunk_input_ids = &input_bit_ids[start..end];
 
-        let outs = pipeline.run_phase(
+        // All full chunks share one System shape; a short last chunk (padded
+        // with a constant wire) is its own shape.
+        let outs = pipeline.run_phase_keyed(
             format!("chunk[{c}]"),
+            &format!("chunk/{}", chunk_input_ids.len()),
             chunk_input_ids,
             move |sys, chunk_wires| {
                 let mut bits: Vec<Wire> = chunk_wires.to_vec();
@@ -170,25 +173,39 @@ pub fn build_s_aff_streaming(
 
         // -- Extract phase: r_i + sub_chunk_extract. Carries out the first
         // sub-chunk's binary OHE and the remaining fold bits.
+        // For odd primes every r_i coefficient is nonzero, so the extract
+        // System is structurally identical across them (only Mul scalar
+        // values differ) and one recorded garble schedule serves all; p = 2
+        // skips zero-coefficient gates and garbles unkeyed.
         let sub_widths_local = sub_widths.clone();
-        let extract_ids = pipeline.run_phase(
-            format!("prime[{i}]/extract"),
-            &chunk_word_ids,
-            move |sys, chunk_wires| {
-                let mut r_i = sys.constant(0, work_mod);
-                for (c, &w_c) in chunk_wires.iter().enumerate() {
-                    let coeff = pow2_mod((c * chunk_size) as u32, p_i);
-                    if coeff > 0 {
-                        let term = sys.mul(coeff, w_c);
-                        r_i = sys.add(r_i, term);
-                    }
+        let build_extract = move |sys: &mut crate::system::System, chunk_wires: &[Wire]| {
+            let mut r_i = sys.constant(0, work_mod);
+            for (c, &w_c) in chunk_wires.iter().enumerate() {
+                let coeff = pow2_mod((c * chunk_size) as u32, p_i);
+                if coeff > 0 {
+                    let term = sys.mul(coeff, w_c);
+                    r_i = sys.add(r_i, term);
                 }
-                let ex = sub_chunk_extract(sys, r_i, &sub_widths_local);
-                let mut outs = ex.first_bin_hot;
-                outs.extend(ex.bits[1..].iter().flatten().copied());
-                outs
-            },
-        );
+            }
+            let ex = sub_chunk_extract(sys, r_i, &sub_widths_local);
+            let mut outs = ex.first_bin_hot;
+            outs.extend(ex.bits[1..].iter().flatten().copied());
+            outs
+        };
+        let extract_ids = if p_i == 2 {
+            pipeline.run_phase(
+                format!("prime[{i}]/extract"),
+                &chunk_word_ids,
+                build_extract,
+            )
+        } else {
+            pipeline.run_phase_keyed(
+                format!("prime[{i}]/extract"),
+                "extract/odd",
+                &chunk_word_ids,
+                build_extract,
+            )
+        };
         let ohe_len = 1usize << first_width;
         let (fbh_ids, bit_ids) = extract_ids.split_at(ohe_len);
 

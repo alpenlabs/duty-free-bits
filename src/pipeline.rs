@@ -14,13 +14,15 @@
 //!
 //! Peak memory collapses to the largest single phase plus the carry set. Δ is global.
 
-use crate::comp_gc::garble;
+use crate::comp_gc::garbler::{garble, garble_recorded, garble_replay};
 use crate::comp_gc::replay_with_labels;
 use crate::exec::Exec;
+use crate::exec::JournalEntry;
 use crate::label::{self, CfLabel, LAMBDA, Label};
 use crate::system::System;
 use crate::types::{Val, Wire};
 use rand::Rng;
+use std::collections::HashMap;
 
 /// Identifier for a carry-forward wire in the pipeline.
 pub type CarryId = usize;
@@ -118,6 +120,11 @@ pub struct Pipeline {
     pub fold_garble_secs: f64,
     /// Portion of `eval_secs` spent in the System-bypass fold kernel.
     pub fold_eval_secs: f64,
+
+    /// Recorded garble schedules, keyed by phase shape (see
+    /// [`run_phase_keyed`](Pipeline::run_phase_keyed)): `(num_gates,
+    /// num_wires, tape)`.
+    garble_tapes: HashMap<String, (usize, usize, Vec<JournalEntry>)>,
 }
 
 impl Pipeline {
@@ -149,6 +156,7 @@ impl Pipeline {
             kernel_eval_secs: 0.0,
             fold_garble_secs: 0.0,
             fold_eval_secs: 0.0,
+            garble_tapes: HashMap::new(),
         }
     }
 
@@ -216,6 +224,41 @@ impl Pipeline {
     where
         F: FnOnce(&mut System, &[Wire]) -> Vec<Wire>,
     {
+        self.run_phase_impl(phase_name, None, inputs, build)
+    }
+
+    /// [`run_phase`](Pipeline::run_phase) with garble-schedule caching.
+    ///
+    /// All phases sharing a `shape_key` must build structurally-identical
+    /// Systems — same gate kinds, wire ids and subscriptions, same `Mul`
+    /// scalar zero/nonzero pattern (the [`garble_replay`] validity contract;
+    /// scalar values, masks and inputs may differ). The first phase records
+    /// the garbler's firing schedule; the rest replay it linearly with no
+    /// worklist. A replay against a structurally-different System fails
+    /// loudly (debug builds also check the gate/wire counts).
+    pub fn run_phase_keyed<F>(
+        &mut self,
+        phase_name: impl Into<String>,
+        shape_key: &str,
+        inputs: &[CarryId],
+        build: F,
+    ) -> Vec<CarryId>
+    where
+        F: FnOnce(&mut System, &[Wire]) -> Vec<Wire>,
+    {
+        self.run_phase_impl(phase_name, Some(shape_key), inputs, build)
+    }
+
+    fn run_phase_impl<F>(
+        &mut self,
+        phase_name: impl Into<String>,
+        shape_key: Option<&str>,
+        inputs: &[CarryId],
+        build: F,
+    ) -> Vec<CarryId>
+    where
+        F: FnOnce(&mut System, &[Wire]) -> Vec<Wire>,
+    {
         let mut sys = System::new();
 
         // Bind inputs as fresh wires of matching kind + modulus.
@@ -231,13 +274,45 @@ impl Pipeline {
         let output_wires = build(&mut sys, &input_wires);
         let build_secs = t_build.elapsed().as_secs_f64();
 
-        // Garble.
+        // Garble: worklist for unkeyed/first-of-shape phases (recording the
+        // schedule when keyed), linear tape replay for later same-shape ones.
         let input_masks: Vec<Label> = inputs
             .iter()
             .map(|&id| self.carry(id).mask.clone())
             .collect();
         let t_garble = std::time::Instant::now();
-        let program = garble(&sys, &input_wires, &input_masks, &output_wires, self.delta);
+        let program = match shape_key {
+            None => garble(&sys, &input_wires, &input_masks, &output_wires, self.delta),
+            Some(key) => match self.garble_tapes.get(key) {
+                Some((num_gates, num_wires, tape)) => {
+                    debug_assert_eq!(
+                        (*num_gates, *num_wires),
+                        (sys.num_gates(), sys.num_wires()),
+                        "phase shape diverged for key {key:?}"
+                    );
+                    garble_replay(
+                        &sys,
+                        &input_wires,
+                        &input_masks,
+                        &output_wires,
+                        self.delta,
+                        tape,
+                    )
+                }
+                None => {
+                    let (program, tape) = garble_recorded(
+                        &sys,
+                        &input_wires,
+                        &input_masks,
+                        &output_wires,
+                        self.delta,
+                    );
+                    self.garble_tapes
+                        .insert(key.to_string(), (sys.num_gates(), sys.num_wires(), tape));
+                    program
+                }
+            },
+        };
         let garble_secs = t_garble.elapsed().as_secs_f64();
         self.garble_secs += garble_secs;
 
