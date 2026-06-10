@@ -23,6 +23,7 @@ fn switch_hash(
     gid: GateId,
     ctrl_label: &Label,
     bulk_cache: &mut BulkCache,
+    nonce_base: u64,
 ) -> Label {
     if let Some((group_idx, member_idx)) = system.gate_group(gid) {
         let group = system.switch_group(group_idx);
@@ -40,7 +41,12 @@ fn switch_hash(
         let Gate::Switch { out, .. } = system.gates[gid] else {
             unreachable!("switch_hash on non-switch gate {gid}");
         };
-        hash::hash_solo(ctrl_label, gid, system.is_cf(out), system.modulus(out))
+        hash::hash_solo(
+            ctrl_label,
+            nonce_base + gid as u64,
+            system.is_cf(out),
+            system.modulus(out),
+        )
     }
 }
 
@@ -57,6 +63,7 @@ pub fn eval_with_labels(
     values: &[Val],
     program: &Program,
     output_wires: &[Wire],
+    nonce_base: u64,
 ) -> Vec<Label> {
     assert_eq!(input_wires.len(), input_labels.len());
     assert_eq!(
@@ -108,6 +115,7 @@ pub fn eval_with_labels(
             program,
             &mut wl,
             &mut bulk_cache,
+            nonce_base,
         ) {
             wl.mark_done(gid);
         }
@@ -137,6 +145,7 @@ pub fn eval_with_labels(
 /// wakeups, no definedness checks.
 ///
 /// [`Exec::run_recorded`]: crate::exec::Exec::run_recorded
+#[allow(clippy::too_many_arguments)]
 pub fn replay_with_labels(
     system: &System,
     input_wires: &[Wire],
@@ -145,6 +154,7 @@ pub fn replay_with_labels(
     program: &Program,
     journal: &[JournalEntry],
     output_wires: &[Wire],
+    nonce_base: u64,
 ) -> Vec<Label> {
     assert_eq!(input_wires.len(), input_labels.len());
     assert_eq!(
@@ -245,7 +255,7 @@ pub fn replay_with_labels(
                     bad_wid()
                 }
                 assert_eq!(values[ctrl.wid].v, 0, "replay: switch {gid} open");
-                let h = switch_hash(system, gid, lbl(ctrl), &mut bulk_cache);
+                let h = switch_hash(system, gid, lbl(ctrl), &mut bulk_cache, nonce_base);
                 if wid == out.wid {
                     label::add(lbl(data), &h) // out = data + H
                 } else {
@@ -297,6 +307,7 @@ pub fn replay_with_labels(
 /// Fire gate `gid` once; returns true when the gate can never derive a new
 /// wire. Invariant: `wl.wire_known(w)` ⇔ `labels[w].is_some()` — definedness is
 /// read from the bitset; `labels` is loaded only for operands.
+#[allow(clippy::too_many_arguments)]
 fn fire_gate(
     system: &System,
     gid: GateId,
@@ -305,6 +316,7 @@ fn fire_gate(
     program: &Program,
     wl: &mut Worklist,
     bulk_cache: &mut BulkCache,
+    nonce_base: u64,
 ) -> bool {
     match system.gates[gid] {
         Gate::Add { in0, in1, out } => {
@@ -408,7 +420,13 @@ fn fire_gate(
             // ctrl = 0: we still need the ctrl *label* to form H. Wait for it.
             if (need_out || need_data) && wl.wire_known(ctrl.wid) {
                 // For grouped switches, H is sliced from a single wide bulk call.
-                let h = switch_hash(system, gid, labels[ctrl.wid].as_ref().unwrap(), bulk_cache);
+                let h = switch_hash(
+                    system,
+                    gid,
+                    labels[ctrl.wid].as_ref().unwrap(),
+                    bulk_cache,
+                    nonce_base,
+                );
                 if need_out {
                     let v = label::add(labels[data.wid].as_ref().unwrap(), &h); // out = data + H
                     try_set(labels, out, v, gid, wl, system);

@@ -123,6 +123,19 @@ impl System {
         }
     }
 
+    /// Clear all construction state, keeping allocations for reuse (the
+    /// streaming pipeline builds one System per phase; pooling avoids
+    /// re-growing the gate/wire vectors every time).
+    pub fn reset(&mut self) {
+        self.gates.clear();
+        self.values.clear();
+        self.sub_edges.clear();
+        self.is_cf_flags.clear();
+        self.switch_groups.clear();
+        self.gate_to_group.clear();
+        self.sub_csr = OnceLock::new();
+    }
+
     /// Per-wire subscription lists (gates that reference each wire), compiled
     /// to CSR on first use. Construction must be finished before the first
     /// call (the propagation engines run on a fully-built system).

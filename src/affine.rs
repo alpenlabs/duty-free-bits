@@ -63,6 +63,15 @@ const KERNEL_NONCE_FLOOR: u64 = 1 << 32;
 /// privacy-preserving switch-private/data-public setting. They derive
 /// `hot_i = x mod p_i` directly for the body kernel; switches reveal nothing.
 ///
+/// **Statistical smudging (paper Thm. 5.2):** this function evaluates the
+/// affine maps exactly as given. When the evaluator will CRT-reconstruct
+/// `a·x + b` over Z_M, the garbler must pre-smudge each `b` as
+/// `b' = b + μ·p` with `μ` uniform over a 2^ρ-sized domain *before* deriving
+/// `b_residues` — otherwise the reconstructed integer leaks more about
+/// `(a, b)` than `a·x + b mod p` does. Smudging is the caller's
+/// responsibility; it is parameter preparation, not part of the switch
+/// system.
+///
 /// `input_bit_ids` are carry ids for the n input bits (seed them with
 /// [`Pipeline::seed_input_cf_value`]).
 ///

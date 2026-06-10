@@ -47,6 +47,12 @@ fn round_keys() -> &'static RoundKeys {
     C.get_or_init(|| backend::expand_key(&CCRH_KEY))
 }
 
+/// Build the CTR tweak for block `counter`: `nonce` low 64 bits, counter high.
+#[inline]
+fn ctr_tweak(nonce: u64, counter: u64) -> Block {
+    ((nonce as u128) | ((counter as u128) << 64)).to_le_bytes()
+}
+
 /// AES-CTR expansion under CCRND: fill `output` from `(seed, nonce)`.
 ///
 /// Each 16-byte block uses a tweak with `nonce` in the low 64 bits and a per-block
@@ -55,9 +61,23 @@ pub fn expand(seed: Block, nonce: u64, output: &mut [u8]) {
     let keys = round_keys();
     let mut counter: u64 = 0;
     let mut written = 0;
+
+    // Grouped path (aarch64): `INTERLEAVE` independent CTR blocks in flight
+    // through the round-major kernel. Same tweak sequence as the tail loop,
+    // and each block is byte-identical to `backend::ccrnd`, so output bytes
+    // match the one-block-at-a-time loop exactly.
+    #[cfg(target_arch = "aarch64")]
+    {
+        const W: usize = backend::INTERLEAVE;
+        let blocks =
+            backend::ccrnd_ctr_fill::<W>(seed, nonce, counter, keys, CCRH_PUBLIC_S, output);
+        counter += blocks as u64;
+        written += blocks * 16;
+    }
+
+    // Tail (and the whole output on portable targets): one block at a time.
     while written < output.len() {
-        let tweak = ((nonce as u128) | ((counter as u128) << 64)).to_le_bytes();
-        let h = backend::ccrnd(seed, tweak, keys, CCRH_PUBLIC_S);
+        let h = backend::ccrnd(seed, ctr_tweak(nonce, counter), keys, CCRH_PUBLIC_S);
         let take = (output.len() - written).min(16);
         output[written..written + take].copy_from_slice(&h[..take]);
         written += take;
@@ -65,8 +85,187 @@ pub fn expand(seed: Block, nonce: u64, output: &mut [u8]) {
     }
 }
 
+/// One CCRND block for each of 4 independent `(seed, nonce)` pairs (counter 0).
+///
+/// `outs[i]` is byte-identical to `expand(seeds[i], nonces[i], &mut outs[i])`.
+/// On aarch64 all 4 AES states run interleaved, so kernels that hash many
+/// distinct single-block controls can batch through this instead of paying
+/// 4 serial AES latencies.
+pub fn expand4(seeds: &[Block; 4], nonces: &[u64; 4], outs: &mut [Block; 4]) {
+    let keys = round_keys();
+    let tweaks = nonces.map(|n| ctr_tweak(n, 0));
+    #[cfg(target_arch = "aarch64")]
+    {
+        *outs = backend::ccrnd_wide(seeds, &tweaks, keys, CCRH_PUBLIC_S);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    for i in 0..4 {
+        outs[i] = backend::ccrnd(seeds[i], tweaks[i], keys, CCRH_PUBLIC_S);
+    }
+}
+
+#[cfg(test)]
+mod expand_tests {
+    use super::*;
+
+    /// The pre-interleaving `expand` loop (one CCRND block at a time), inlined
+    /// here verbatim as the differential oracle for the grouped path.
+    fn expand_oracle(seed: Block, nonce: u64, output: &mut [u8]) {
+        let keys = round_keys();
+        let mut counter: u64 = 0;
+        let mut written = 0;
+        while written < output.len() {
+            let tweak = ((nonce as u128) | ((counter as u128) << 64)).to_le_bytes();
+            let h = backend::ccrnd(seed, tweak, keys, CCRH_PUBLIC_S);
+            let take = (output.len() - written).min(16);
+            output[written..written + take].copy_from_slice(&h[..take]);
+            written += take;
+            counter += 1;
+        }
+    }
+
+    #[test]
+    fn test_expand_matches_single_block_oracle() {
+        let seeds: [Block; 4] = [
+            [0u8; 16],
+            [0xff; 16],
+            std::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(11)),
+            std::array::from_fn(|i| 0xa5u8.rotate_left(i as u32)),
+        ];
+        let nonces = [0u64, 1, 0xdead_beef_cafe_f00d, u64::MAX];
+        for &seed in &seeds {
+            for &nonce in &nonces {
+                for len in [1usize, 8, 15, 16, 17, 64, 144, 145, 352, 512] {
+                    // Distinct fill bytes so untouched bytes can't match by luck.
+                    let mut got = vec![0xAAu8; len];
+                    let mut want = vec![0x55u8; len];
+                    expand(seed, nonce, &mut got);
+                    expand_oracle(seed, nonce, &mut want);
+                    assert_eq!(
+                        got, want,
+                        "expand mismatch: seed={seed:02x?} nonce={nonce:#x} len={len}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_expand4_matches_four_expand_calls() {
+        for round in 0..8u64 {
+            let seeds: [Block; 4] = std::array::from_fn(|i| {
+                std::array::from_fn(|j| {
+                    (round as u8) ^ (i as u8).wrapping_mul(0x1f) ^ (j as u8).wrapping_mul(73)
+                })
+            });
+            let nonces: [u64; 4] = std::array::from_fn(|i| {
+                round
+                    .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                    .wrapping_add(i as u64)
+            });
+            let mut got = [[0u8; 16]; 4];
+            expand4(&seeds, &nonces, &mut got);
+            for i in 0..4 {
+                let mut want = [0u8; 16];
+                expand(seeds[i], nonces[i], &mut want);
+                assert_eq!(got[i], want, "expand4 lane {i} mismatch (round {round})");
+            }
+        }
+    }
+}
+
 #[cfg(all(test, target_arch = "aarch64"))]
 mod tests {
+    /// Indicative ns/block for the single vs interleaved CCRND paths.
+    /// Run: `cargo test --release bench_ccrnd -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_ccrnd_single_vs_interleaved() {
+        use super::{Block, CCRH_PUBLIC_S, backend, expand, round_keys};
+        use backend::RoundKeys;
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const BLOCKS: usize = 1 << 20; // ~1M blocks per timed leg.
+        // 4096-block (64 KiB) buffer per fill: keeps the stores in L1 so we
+        // time the AES pipes, not memory bandwidth.
+        const BUF_BLOCKS: usize = 4096;
+
+        // The kernel alone, one block per call (still overlapped across loop
+        // iterations by the out-of-order core — blocks are independent).
+        fn bench_single_kernel(keys: &RoundKeys) -> f64 {
+            let seed = black_box([0x42u8; 16]);
+            let mut sink = 0u8;
+            let t = Instant::now();
+            for c in 0..BLOCKS as u64 {
+                let tweak = (7u128 | ((c as u128) << 64)).to_le_bytes();
+                sink ^= backend::ccrnd(seed, tweak, keys, CCRH_PUBLIC_S)[0];
+            }
+            black_box(sink);
+            t.elapsed().as_nanos() as f64 / BLOCKS as f64
+        }
+
+        // The interleaved kernel at width `W`.
+        fn bench_fill<const W: usize>(keys: &RoundKeys) -> f64 {
+            let mut buf = vec![0u8; BUF_BLOCKS * 16];
+            let seed = black_box([0x42u8; 16]);
+            let mut blocks = 0usize;
+            let t = Instant::now();
+            for i in 0..BLOCKS / BUF_BLOCKS {
+                blocks += backend::ccrnd_ctr_fill::<W>(
+                    seed,
+                    7,
+                    (i * BUF_BLOCKS) as u64,
+                    keys,
+                    CCRH_PUBLIC_S,
+                    &mut buf,
+                );
+                black_box(&buf);
+            }
+            t.elapsed().as_nanos() as f64 / blocks as f64
+        }
+
+        // The full `expand` entry point, old (one-block loop, inlined oracle
+        // from `expand_tests`) vs new (grouped path).
+        fn bench_expand(old: bool, keys: &RoundKeys) -> f64 {
+            let mut buf = vec![0u8; BUF_BLOCKS * 16];
+            let seed = black_box([0x42u8; 16]);
+            let t = Instant::now();
+            for i in 0..BLOCKS / BUF_BLOCKS {
+                if old {
+                    let mut counter: u64 = 0;
+                    let mut written = 0;
+                    while written < buf.len() {
+                        let tweak = ((i as u128) | ((counter as u128) << 64)).to_le_bytes();
+                        let h: Block = backend::ccrnd(seed, tweak, keys, CCRH_PUBLIC_S);
+                        let take = (buf.len() - written).min(16);
+                        buf[written..written + take].copy_from_slice(&h[..take]);
+                        written += take;
+                        counter += 1;
+                    }
+                } else {
+                    expand(seed, i as u64, &mut buf);
+                }
+                black_box(&buf);
+            }
+            t.elapsed().as_nanos() as f64 / BLOCKS as f64
+        }
+
+        let keys = round_keys();
+        // Warmup + measure.
+        for _ in 0..2 {
+            let single = bench_single_kernel(keys);
+            let wide4 = bench_fill::<4>(keys);
+            let wide8 = bench_fill::<8>(keys);
+            let old = bench_expand(true, keys);
+            let new = bench_expand(false, keys);
+            eprintln!(
+                "kernel single: {single:>6.3} ns/block | kernel x4: {wide4:>6.3} | kernel x8: \
+                 {wide8:>6.3} | expand old: {old:>6.3} | expand new: {new:>6.3}",
+            );
+        }
+    }
+
     /// The portable software backend must be byte-identical to the NEON/AES-NI
     /// backend — otherwise the off-aarch64 build runs different crypto.
     #[test]

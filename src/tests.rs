@@ -973,7 +973,7 @@ fn test_replay_matches_worklist_eval() {
                 .iter()
                 .map(|_| sample_cf_mask(&mut rng, 2))
                 .collect();
-            let program = garble(&sys, &bit_wires, &input_masks, &h_p, delta);
+            let program = garble(&sys, &bit_wires, &input_masks, &h_p, delta, 0);
             let d2 = Label::Cf(label::delta_r(delta, 2));
             let input_labels: Vec<Label> = input_masks
                 .iter()
@@ -998,6 +998,7 @@ fn test_replay_matches_worklist_eval() {
                 exec.values(),
                 &program,
                 &h_p,
+                0,
             );
             let via_replay = replay_with_labels(
                 &sys,
@@ -1007,6 +1008,7 @@ fn test_replay_matches_worklist_eval() {
                 &program,
                 &journal,
                 &h_p,
+                0,
             );
             assert_eq!(
                 via_worklist, via_replay,

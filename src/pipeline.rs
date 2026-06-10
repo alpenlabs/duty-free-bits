@@ -14,6 +14,9 @@
 //!
 //! Peak memory collapses to the largest single phase plus the carry set. Δ is global.
 
+use crate::comp_gc::arena::{
+    CompiledGarble, LabelArena, WireLayout, compile_garble, eval_journal_arena, garble_compiled,
+};
 use crate::comp_gc::garbler::{garble, garble_recorded, garble_replay};
 use crate::comp_gc::replay_with_labels;
 use crate::exec::Exec;
@@ -45,6 +48,18 @@ pub struct CarryItem {
     pub label: Label,
     /// Cleartext value of the wire.
     pub value: u64,
+}
+
+/// Cached state for one phase shape: the recorded garble tape plus the
+/// arena wire layout (when the shape is arena-eligible — all-CF wires).
+#[derive(Debug)]
+struct ShapeCache {
+    num_gates: usize,
+    num_wires: usize,
+    tape: Vec<JournalEntry>,
+    layout: Option<WireLayout>,
+    /// Fully compiled garbler program (built on the shape's first replay).
+    compiled: Option<CompiledGarble>,
 }
 
 /// Per-phase telemetry.
@@ -121,10 +136,20 @@ pub struct Pipeline {
     /// Portion of `eval_secs` spent in the System-bypass fold kernel.
     pub fold_eval_secs: f64,
 
-    /// Recorded garble schedules, keyed by phase shape (see
-    /// [`run_phase_keyed`](Pipeline::run_phase_keyed)): `(num_gates,
-    /// num_wires, tape)`.
-    garble_tapes: HashMap<String, (usize, usize, Vec<JournalEntry>)>,
+    /// Recorded garble schedules + arena layouts, keyed by phase shape (see
+    /// [`run_phase_keyed`](Pipeline::run_phase_keyed)).
+    garble_tapes: HashMap<String, ShapeCache>,
+    /// The garbler's flat mask storage (persistent across phases).
+    garble_arena: LabelArena,
+    /// The evaluator's flat label storage (persistent across phases; the
+    /// parties never share an arena).
+    eval_arena: LabelArena,
+    /// Pooled System buffers, reset and reused each phase.
+    sys_pool: Option<System>,
+    /// Next fresh solo-domain CCRH nonce. Each phase reserves
+    /// `num_gates` ids so no two switch hashes anywhere in the pipeline share
+    /// a nonce (paper App. A, Def. 4 demands globally fresh nonces).
+    solo_nonce_next: u64,
 }
 
 impl Pipeline {
@@ -157,6 +182,10 @@ impl Pipeline {
             fold_garble_secs: 0.0,
             fold_eval_secs: 0.0,
             garble_tapes: HashMap::new(),
+            garble_arena: LabelArena::default(),
+            eval_arena: LabelArena::default(),
+            sys_pool: None,
+            solo_nonce_next: 0,
         }
     }
 
@@ -259,7 +288,8 @@ impl Pipeline {
     where
         F: FnOnce(&mut System, &[Wire]) -> Vec<Wire>,
     {
-        let mut sys = System::new();
+        let mut sys = self.sys_pool.take().unwrap_or_default();
+        sys.reset();
 
         // Bind inputs as fresh wires of matching kind + modulus.
         let input_wires: Vec<Wire> = inputs
@@ -274,6 +304,14 @@ impl Pipeline {
         let output_wires = build(&mut sys, &input_wires);
         let build_secs = t_build.elapsed().as_secs_f64();
 
+        // This phase's window of solo-domain CCRH nonces (Def-4 freshness).
+        let nonce_base = self.solo_nonce_next;
+        self.solo_nonce_next += sys.num_gates() as u64;
+        assert!(
+            self.solo_nonce_next < (1u64 << 62),
+            "solo nonce space exhausted"
+        );
+
         // Garble: worklist for unkeyed/first-of-shape phases (recording the
         // schedule when keyed), linear tape replay for later same-shape ones.
         let input_masks: Vec<Label> = inputs
@@ -282,24 +320,80 @@ impl Pipeline {
             .collect();
         let t_garble = std::time::Instant::now();
         let program = match shape_key {
-            None => garble(&sys, &input_wires, &input_masks, &output_wires, self.delta),
-            Some(key) => match self.garble_tapes.get(key) {
-                Some((num_gates, num_wires, tape)) => {
+            None => garble(
+                &sys,
+                &input_wires,
+                &input_masks,
+                &output_wires,
+                self.delta,
+                nonce_base,
+            ),
+            Some(key) => match self.garble_tapes.get_mut(key) {
+                Some(cache) => {
                     // Hard assert: a shape-key collision (e.g. a Pipeline
                     // reused across parameter sets) must not reach replay.
                     assert_eq!(
-                        (*num_gates, *num_wires),
+                        (cache.num_gates, cache.num_wires),
                         (sys.num_gates(), sys.num_wires()),
                         "phase shape diverged for key {key:?}"
                     );
-                    garble_replay(
-                        &sys,
-                        &input_wires,
-                        &input_masks,
-                        &output_wires,
-                        self.delta,
-                        tape,
-                    )
+                    match &cache.layout {
+                        Some(layout) => {
+                            // First replay compiles (full structural
+                            // validation); later phases run the compiled
+                            // program with no System access.
+                            let compiled = cache.compiled.get_or_insert_with(|| {
+                                compile_garble(
+                                    &sys,
+                                    layout,
+                                    &cache.tape,
+                                    &input_wires,
+                                    &output_wires,
+                                )
+                            });
+                            let prog = garble_compiled(
+                                &sys,
+                                compiled,
+                                &mut self.garble_arena,
+                                &input_masks,
+                                self.delta,
+                                nonce_base,
+                            );
+                            if std::env::var("DFB_DIFF").is_ok() {
+                                let reference = garble_replay(
+                                    &sys,
+                                    &input_wires,
+                                    &input_masks,
+                                    &output_wires,
+                                    self.delta,
+                                    &cache.tape,
+                                    nonce_base,
+                                );
+                                assert_eq!(
+                                    reference.output_masks(),
+                                    prog.output_masks(),
+                                    "compiled output masks diverge"
+                                );
+                                for gid in 0..sys.num_gates() {
+                                    assert_eq!(
+                                        reference.join_diff(gid),
+                                        prog.join_diff(gid),
+                                        "compiled join diff diverges at gid {gid}"
+                                    );
+                                }
+                            }
+                            prog
+                        }
+                        None => garble_replay(
+                            &sys,
+                            &input_wires,
+                            &input_masks,
+                            &output_wires,
+                            self.delta,
+                            &cache.tape,
+                            nonce_base,
+                        ),
+                    }
                 }
                 None => {
                     let (program, tape) = garble_recorded(
@@ -308,9 +402,18 @@ impl Pipeline {
                         &input_masks,
                         &output_wires,
                         self.delta,
+                        nonce_base,
                     );
-                    self.garble_tapes
-                        .insert(key.to_string(), (sys.num_gates(), sys.num_wires(), tape));
+                    self.garble_tapes.insert(
+                        key.to_string(),
+                        ShapeCache {
+                            num_gates: sys.num_gates(),
+                            num_wires: sys.num_wires(),
+                            tape,
+                            layout: WireLayout::build(&sys),
+                            compiled: None,
+                        },
+                    );
                     program
                 }
             },
@@ -336,15 +439,33 @@ impl Pipeline {
         exec.run_recorded();
         let exec_secs = t_exec.elapsed().as_secs_f64();
         let t_eval = std::time::Instant::now();
-        let output_labels = replay_with_labels(
-            &sys,
-            &input_wires,
-            &input_labels,
-            exec.values(),
-            &program,
-            exec.journal(),
-            &output_wires,
-        );
+        let cached_layout = shape_key
+            .and_then(|key| self.garble_tapes.get(key))
+            .and_then(|c| c.layout.as_ref());
+        let output_labels = match cached_layout {
+            Some(layout) => eval_journal_arena(
+                &sys,
+                layout,
+                &mut self.eval_arena,
+                exec.journal(),
+                &input_wires,
+                &input_labels,
+                exec.values(),
+                &program,
+                &output_wires,
+                nonce_base,
+            ),
+            None => replay_with_labels(
+                &sys,
+                &input_wires,
+                &input_labels,
+                exec.values(),
+                &program,
+                exec.journal(),
+                &output_wires,
+                nonce_base,
+            ),
+        };
         let output_values: Vec<u64> = output_wires.iter().map(|&w| exec.get(w).v).collect();
         let label_eval_secs = t_eval.elapsed().as_secs_f64();
         self.eval_secs += exec_secs + label_eval_secs;
@@ -396,7 +517,8 @@ impl Pipeline {
             })
             .collect();
 
-        // `sys` and `program` are dropped here.
+        // `program` is dropped here; the System's buffers return to the pool.
+        self.sys_pool = Some(sys);
         new_ids
     }
 
