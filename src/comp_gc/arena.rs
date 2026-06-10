@@ -27,7 +27,7 @@
 
 use super::program::Program;
 use crate::crypto::expand;
-use crate::exec::JournalEntry;
+use crate::exec::{JournalEntry, Worklist};
 use crate::label::{CfLabel, LAMBDA, Label};
 use crate::system::System;
 use crate::types::{Gate, Val, Wire};
@@ -354,22 +354,14 @@ impl LabelArena {
                                 as u32;
                     }
                 }
-                _ => {
-                    // Branchless unpack via padded two-word windows (cf. label.rs).
-                    let mut padded = [0u64; LAMBDA * 32 / 64 + 1];
-                    for (w, slot) in padded.iter_mut().enumerate().take(bytes / 8) {
-                        *slot = u64::from_le_bytes(
-                            self.scratch[w * 8..(w + 1) * 8].try_into().unwrap(),
-                        );
-                    }
-                    let mask = lane_mask(dst.k()) as u64;
-                    for (i, lane) in d.iter_mut().enumerate() {
-                        let bit = i * k;
-                        let window =
-                            (padded[bit >> 6] as u128) | ((padded[(bit >> 6) + 1] as u128) << 64);
-                        *lane = ((window >> (bit & 63)) as u64 & mask) as u32;
-                    }
+                #[cfg(target_arch = "aarch64")]
+                _ if neon_unpack_ok(k) => {
+                    // Even k: every 4-lane group starts byte-aligned
+                    // (4k ≡ 0 mod 8), so one static byte-gather/shift pattern
+                    // serves all 32 groups.
+                    unpack_even_k_neon(&self.scratch, k, d);
                 }
+                _ => unpack_generic(&self.scratch[..bytes], k, d),
             }
         }
     }
@@ -452,6 +444,77 @@ impl LabelArena {
 #[inline]
 fn lane_mask(k: u32) -> u32 {
     if k >= 32 { u32::MAX } else { (1u32 << k) - 1 }
+}
+
+/// Scalar unpack of LAMBDA packed `k`-bit coordinates from little-endian
+/// bytes into u32 lanes (branchless two-word windows; cf. label.rs).
+fn unpack_generic(bytes: &[u8], k: usize, dst: &mut [u32; LAMBDA]) {
+    let mut padded = [0u64; LAMBDA * 32 / 64 + 1];
+    for (w, slot) in padded.iter_mut().enumerate().take(bytes.len() / 8) {
+        *slot = u64::from_le_bytes(bytes[w * 8..(w + 1) * 8].try_into().unwrap());
+    }
+    let mask = lane_mask(k as u32) as u64;
+    for (i, lane) in dst.iter_mut().enumerate() {
+        let bit = i * k;
+        let window = (padded[bit >> 6] as u128) | ((padded[(bit >> 6) + 1] as u128) << 64);
+        *lane = ((window >> (bit & 63)) as u64 & mask) as u32;
+    }
+}
+
+/// True iff [`unpack_even_k_neon`] handles width `k`: even (group bases stay
+/// byte-aligned) and every lane's `shift + k` fits the 32-bit gather window
+/// (this excludes exactly k = 30, whose lane-1 shift of 6 overflows it).
+#[cfg(target_arch = "aarch64")]
+fn neon_unpack_ok(k: usize) -> bool {
+    if !k.is_multiple_of(2) || !(2..=32).contains(&k) {
+        return false;
+    }
+    (0..4).all(|j| ((j * k) & 7) + k <= 32)
+}
+
+/// NEON unpack for even `k` (2 ≤ k ≤ 32): per 4-lane group, one unaligned
+/// 16-byte load at the group's (byte-aligned) base, a TBL byte-gather of each
+/// lane's 4-byte window, per-lane right shifts and a mask.
+///
+/// Even k makes every group base byte-aligned (`4k ≡ 0 (mod 8)`), so the
+/// gather indices and shifts are group-invariant. `scratch` must be at least
+/// `(124·k)/8 + 16` bytes (the 512-byte hash scratch always is for k ≤ 32);
+/// lane 3's window ends at byte 3k/8 + 4 ≤ 16 within each load.
+#[cfg(target_arch = "aarch64")]
+fn unpack_even_k_neon(scratch: &[u8], k: usize, dst: &mut [u32; LAMBDA]) {
+    use std::arch::aarch64::*;
+    debug_assert!(neon_unpack_ok(k));
+    assert!(
+        scratch.len() >= (124 * k) / 8 + 16,
+        "unpack scratch too short"
+    );
+
+    // Lane j of a group reads bytes (j·k)/8 .. +4, then shifts by (j·k) % 8.
+    let mut idx = [0u8; 16];
+    let mut shifts = [0i32; 4];
+    for j in 0..4 {
+        let bit = j * k;
+        for b in 0..4 {
+            idx[j * 4 + b] = ((bit >> 3) + b) as u8;
+        }
+        shifts[j] = -((bit & 7) as i32);
+    }
+    // SAFETY: NEON is part of the crate's aarch64 baseline (the CCRH core
+    // already requires it). All loads are in-bounds: group g loads 16 bytes
+    // at (g·4·k)/8 with g ≤ 31, bounded by the assert above.
+    unsafe {
+        let idx_v = vld1q_u8(idx.as_ptr());
+        let shift_v = vld1q_s32(shifts.as_ptr());
+        let mask_v = vdupq_n_u32(lane_mask(k as u32));
+        for g in 0..(LAMBDA / 4) {
+            let base = (g * 4 * k) >> 3;
+            let window = vld1q_u8(scratch.as_ptr().add(base));
+            let gathered = vreinterpretq_u32_u8(vqtbl1q_u8(window, idx_v));
+            let aligned = vshlq_u32(gathered, shift_v);
+            let lanes = vandq_u32(aligned, mask_v);
+            vst1q_u32(dst.as_mut_ptr().add(g * 4), lanes);
+        }
+    }
 }
 
 /// One compiled garbler instruction. Operand fields are arena indices (the
@@ -1052,7 +1115,285 @@ pub(crate) fn garble_tape_arena(
     program
 }
 
-/// Evaluate by replaying the cleartext-execution journal against the arena.
+/// Evaluate a garbled system in a single fused pass: cleartext values and
+/// labels derive together through one worklist.
+///
+/// Replaces the two-stage evaluator (an `Exec` discovery pass recording a
+/// journal, then a label replay of that journal): a direction fires when its
+/// *value* operands are known, and inductively every value-known wire is also
+/// label-known (seeds set both, and label propagation follows the same gate
+/// directions — joins via the program diff, switches only when the cleartext
+/// control is 0). Fusing pays the worklist machinery once and never
+/// materializes the journal.
+///
+/// CF-only shapes mean every wire's modulus is `2^k` with `k` in the layout
+/// slot, so value arithmetic needs no `Val` or modulus loads. Returns the
+/// output wires' labels and cleartext values.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fused_eval_arena(
+    system: &System,
+    layout: &WireLayout,
+    arena: &mut LabelArena,
+    vals: &mut Vec<u64>,
+    input_wires: &[Wire],
+    input_labels: &[Label],
+    input_values: &[u64],
+    program: &Program,
+    output_wires: &[Wire],
+    nonce_base: u64,
+) -> (Vec<Label>, Vec<u64>) {
+    assert_eq!(input_wires.len(), input_labels.len());
+    assert_eq!(input_wires.len(), input_values.len());
+    arena.begin_phase(layout);
+    vals.clear();
+    vals.resize(system.num_wires(), 0);
+
+    let mut wl = Worklist::new(system.num_wires(), system.num_gates());
+
+    // Constants: label 0, value c.
+    for (wid, v) in system.values.iter().enumerate() {
+        if v.defined {
+            let w = Wire { wid };
+            arena.zero(layout.slot(w));
+            arena.mark(w);
+            vals[wid] = v.v;
+            wl.mark_known(wid);
+        }
+    }
+    for ((&w, l), &v) in input_wires.iter().zip(input_labels).zip(input_values) {
+        arena.store_label(layout.slot(w), l);
+        arena.mark(w);
+        vals[w.wid] = v;
+        wl.mark_known(w.wid);
+    }
+
+    let subs = system.subscriptions();
+    for wid in 0..system.num_wires() {
+        if wl.wire_known(wid) {
+            wl.enqueue_all(subs.of(wid));
+        }
+    }
+
+    while let Some(gid) = wl.pop_live() {
+        if fused_fire(
+            system, layout, arena, vals, &mut wl, gid, nonce_base, program,
+        ) {
+            wl.mark_done(gid);
+        }
+    }
+
+    let labels = output_wires
+        .iter()
+        .map(|&w| {
+            assert!(arena.is_defined(w), "no label on output wire {}", w.wid);
+            arena.load_label(layout.slot(w))
+        })
+        .collect();
+    let values = output_wires.iter().map(|&w| vals[w.wid]).collect();
+    (labels, values)
+}
+
+/// Value mask for a slot's ring: `2^k − 1`.
+#[inline]
+fn val_mask(slot: Slot) -> u64 {
+    if slot.is_z2() {
+        1
+    } else {
+        (1u64 << slot.k()) - 1
+    }
+}
+
+/// Fire one gate of the fused pass: for each derivable direction whose value
+/// operands are known, set the target's value and label together. Returns
+/// true when the gate can never derive a new wire (same done rules as the
+/// `Exec`/evaluator worklists).
+#[allow(clippy::too_many_arguments)]
+fn fused_fire(
+    system: &System,
+    layout: &WireLayout,
+    arena: &mut LabelArena,
+    vals: &mut [u64],
+    wl: &mut Worklist,
+    gid: usize,
+    nonce_base: u64,
+    program: &Program,
+) -> bool {
+    // One fused write: value + label + bookkeeping + wakeups.
+    macro_rules! set {
+        ($w:expr, $v:expr, $label:expr) => {{
+            let w = $w;
+            debug_assert!(!wl.wire_known(w.wid));
+            vals[w.wid] = $v;
+            $label;
+            arena.mark(w);
+            wl.mark_known(w.wid);
+            wl.wake_subscribers(system.subscriptions().of(w.wid), gid);
+        }};
+    }
+    let known = |wl: &Worklist, w: Wire| wl.wire_known(w.wid);
+    match system.gates[gid] {
+        Gate::Add { in0, in1, out } | Gate::Sub { in0, in1, out } => {
+            let is_sub = matches!(system.gates[gid], Gate::Sub { .. });
+            // Fire every still-underived direction of out = in0 ± in1 whose
+            // operands are known (same as Exec; at most one fires per visit,
+            // after which the remaining targets are known).
+            let dirs: [(Wire, Wire, Wire, bool); 3] = [
+                (out, in0, in1, is_sub),  // out = in0 ± in1
+                (in0, out, in1, !is_sub), // in0 = out ∓ in1
+                if is_sub {
+                    (in1, in0, out, true)
+                } else {
+                    (in1, out, in0, true)
+                },
+            ];
+            for (dst, a, b, sub) in dirs {
+                if !known(wl, dst) && known(wl, a) && known(wl, b) {
+                    let ds = layout.slot(dst);
+                    let m = val_mask(ds);
+                    let v = if sub {
+                        vals[a.wid].wrapping_sub(vals[b.wid]) & m
+                    } else {
+                        vals[a.wid].wrapping_add(vals[b.wid]) & m
+                    };
+                    set!(dst, v, {
+                        if ds.is_z2() {
+                            arena.xor_z2(ds, layout.slot(a), layout.slot(b));
+                        } else {
+                            arena.addsub_lanes(ds, layout.slot(a), layout.slot(b), sub);
+                        }
+                    });
+                }
+            }
+            known(wl, in0) && known(wl, in1) && known(wl, out)
+        }
+        Gate::Mul { in0, scalar, out } => {
+            if !known(wl, out) && known(wl, in0) {
+                let ds = layout.slot(out);
+                let v = scalar.wrapping_mul(vals[in0.wid]) & val_mask(ds);
+                set!(out, v, {
+                    let src = layout.slot(in0);
+                    if scalar == 0 {
+                        arena.zero(ds);
+                    } else if ds.is_z2() {
+                        if scalar & 1 == 1 {
+                            arena.copy(ds, src);
+                        } else {
+                            arena.zero(ds);
+                        }
+                    } else {
+                        arena.mul_lanes(ds, src, scalar);
+                    }
+                });
+            }
+            known(wl, out)
+        }
+        Gate::Mod2k { in0, out, .. } => {
+            if !known(wl, out) && known(wl, in0) {
+                let ds = layout.slot(out);
+                let v = vals[in0.wid] & val_mask(ds);
+                set!(out, v, {
+                    let src = layout.slot(in0);
+                    if src.is_z2() {
+                        arena.copy(ds, src);
+                    } else {
+                        arena.shift_mask(ds, src, 0);
+                    }
+                });
+            }
+            known(wl, out)
+        }
+        Gate::Div2k { in0, k, out } => {
+            if !known(wl, out) && known(wl, in0) {
+                let ds = layout.slot(out);
+                debug_assert!(
+                    k == 0 || vals[in0.wid] & ((1u64 << k) - 1) == 0,
+                    "div2k: {} not divisible by 2^{}",
+                    vals[in0.wid],
+                    k
+                );
+                let v = (vals[in0.wid] >> k) & val_mask(ds);
+                set!(out, v, {
+                    let src = layout.slot(in0);
+                    if k == 0 {
+                        arena.copy(ds, src);
+                    } else {
+                        arena.shift_mask(ds, src, k);
+                    }
+                });
+            }
+            known(wl, out)
+        }
+        Gate::Switch { data, ctrl, out } => {
+            if !known(wl, ctrl) {
+                return false;
+            }
+            if vals[ctrl.wid] != 0 {
+                return true; // open forever: values are fixed mid-run
+            }
+            let domain = nonce_base + gid as u64;
+            if !known(wl, out) && known(wl, data) {
+                let v = vals[data.wid];
+                set!(out, v, {
+                    arena.hash_addsub(
+                        layout.slot(out),
+                        layout.slot(data),
+                        layout.slot(ctrl),
+                        domain,
+                        false,
+                    )
+                });
+            }
+            if !known(wl, data) && known(wl, out) {
+                let v = vals[out.wid];
+                set!(data, v, {
+                    arena.hash_addsub(
+                        layout.slot(data),
+                        layout.slot(out),
+                        layout.slot(ctrl),
+                        domain,
+                        true,
+                    )
+                });
+            }
+            known(wl, data) && known(wl, out)
+        }
+        Gate::Join { a, b } => {
+            let (ka, kb) = (known(wl, a), known(wl, b));
+            if ka != kb {
+                // diff = X_a − X_b ⇒ label_b = label_a − diff, label_a = label_b + diff.
+                let diff = program
+                    .join_diff(gid)
+                    .unwrap_or_else(|| panic!("missing join diff for gate {gid}"));
+                if ka {
+                    set!(b, vals[a.wid], {
+                        arena.diff_addsub(layout.slot(b), layout.slot(a), diff, true)
+                    });
+                } else {
+                    set!(a, vals[b.wid], {
+                        arena.diff_addsub(layout.slot(a), layout.slot(b), diff, false)
+                    });
+                }
+            }
+            known(wl, a) && known(wl, b)
+        }
+        Gate::SameWire { a, b } => {
+            if !known(wl, b) && known(wl, a) {
+                set!(b, vals[a.wid], arena.copy(layout.slot(b), layout.slot(a)));
+            }
+            if !known(wl, a) && known(wl, b) {
+                set!(a, vals[b.wid], arena.copy(layout.slot(a), layout.slot(b)));
+            }
+            known(wl, a) && known(wl, b)
+        }
+    }
+}
+
+/// Evaluate by replaying the cleartext-execution journal against the arena
+/// (production evaluation runs [`fused_eval_arena`]; this is the checked
+/// reference the differential tests compare against).
+#[allow(dead_code)]
+#[doc(hidden)]
+/// Original doc:
 /// Equivalent to [`super::evaluator::replay_with_labels`] (same journal
 /// contract and misuse net), with labels in flat storage.
 #[allow(clippy::too_many_arguments)]
@@ -1274,6 +1615,27 @@ mod tests {
     use crate::label::{self};
     use crate::pipeline::sample_cf_mask;
     use rand::Rng;
+
+    /// The NEON even-k unpacker must agree with the scalar window loop on
+    /// every even width and arbitrary bytes.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_unpack_even_k_neon_matches_generic() {
+        let mut rng = rand::rng();
+        let mut scratch = vec![0u8; 512];
+        for round in 0..8 {
+            rng.fill(&mut scratch[..]);
+            for k in (2..=32).step_by(2).filter(|&k| neon_unpack_ok(k)) {
+                let bytes = (LAMBDA * k).div_ceil(64) * 8;
+                let mut want = [0u32; LAMBDA];
+                unpack_generic(&scratch[..bytes], k, &mut want);
+                let mut got = [0u32; LAMBDA];
+                unpack_even_k_neon(&scratch, k, &mut got);
+                assert_eq!(want, got, "k={k}, round={round}");
+            }
+            assert!(!neon_unpack_ok(30) && !neon_unpack_ok(7));
+        }
+    }
 
     /// Arena garble + eval must agree bit-for-bit with the `Label`-path
     /// reference on the real header circuitry (circular word_to_hot, Mul(0)

@@ -15,7 +15,7 @@
 //! Peak memory collapses to the largest single phase plus the carry set. Δ is global.
 
 use crate::comp_gc::arena::{
-    CompiledGarble, LabelArena, WireLayout, compile_garble, eval_journal_arena, garble_compiled,
+    CompiledGarble, LabelArena, WireLayout, compile_garble, fused_eval_arena, garble_compiled,
 };
 use crate::comp_gc::garbler::{garble, garble_recorded, garble_replay};
 use crate::comp_gc::replay_with_labels;
@@ -146,6 +146,8 @@ pub struct Pipeline {
     eval_arena: LabelArena,
     /// Pooled System buffers, reset and reused each phase.
     sys_pool: Option<System>,
+    /// Pooled cleartext-value buffer for the fused evaluator.
+    fused_vals: Vec<u64>,
     /// Next fresh solo-domain CCRH nonce. Each phase reserves
     /// `num_gates` ids so no two switch hashes anywhere in the pipeline share
     /// a nonce (paper App. A, Def. 4 demands globally fresh nonces).
@@ -185,6 +187,7 @@ impl Pipeline {
             garble_arena: LabelArena::default(),
             eval_arena: LabelArena::default(),
             sys_pool: None,
+            fused_vals: Vec::new(),
             solo_nonce_next: 0,
         }
     }
@@ -421,53 +424,60 @@ impl Pipeline {
         let garble_secs = t_garble.elapsed().as_secs_f64();
         self.garble_secs += garble_secs;
 
-        // Evaluate. The evaluator knows x, so it runs a cleartext `Exec` pass
-        // to obtain every switch control — recording the set order — then
-        // replays that journal at the label level (the journal is a valid
-        // label schedule; see `replay_with_labels`). The same pass yields the
-        // output wires' cleartext values.
+        // Evaluate. The evaluator knows x. On arena-eligible shapes one fused
+        // worklist pass derives cleartext values and labels together (see
+        // `fused_eval_arena`); otherwise a cleartext `Exec` pass records the
+        // derivation journal and `replay_with_labels` replays it.
         let input_labels: Vec<Label> = inputs
             .iter()
             .map(|&id| self.carry(id).label.clone())
             .collect();
-        let t_exec = std::time::Instant::now();
-        let mut exec = Exec::new(&sys);
-        for (&w, &id) in input_wires.iter().zip(inputs) {
-            let item = self.carry(id);
-            exec.set(w, Val::new(item.value, item.modulus));
-        }
-        exec.run_recorded();
-        let exec_secs = t_exec.elapsed().as_secs_f64();
-        let t_eval = std::time::Instant::now();
         let cached_layout = shape_key
             .and_then(|key| self.garble_tapes.get(key))
             .and_then(|c| c.layout.as_ref());
-        let output_labels = match cached_layout {
-            Some(layout) => eval_journal_arena(
-                &sys,
-                layout,
-                &mut self.eval_arena,
-                exec.journal(),
-                &input_wires,
-                &input_labels,
-                exec.values(),
-                &program,
-                &output_wires,
-                nonce_base,
-            ),
-            None => replay_with_labels(
-                &sys,
-                &input_wires,
-                &input_labels,
-                exec.values(),
-                &program,
-                exec.journal(),
-                &output_wires,
-                nonce_base,
-            ),
+        let (exec_secs, label_eval_secs, output_labels, output_values) = match cached_layout {
+            Some(layout) => {
+                let input_values: Vec<u64> =
+                    inputs.iter().map(|&id| self.carry(id).value).collect();
+                let t_eval = std::time::Instant::now();
+                let (labels, values) = fused_eval_arena(
+                    &sys,
+                    layout,
+                    &mut self.eval_arena,
+                    &mut self.fused_vals,
+                    &input_wires,
+                    &input_labels,
+                    &input_values,
+                    &program,
+                    &output_wires,
+                    nonce_base,
+                );
+                (0.0, t_eval.elapsed().as_secs_f64(), labels, values)
+            }
+            None => {
+                let t_exec = std::time::Instant::now();
+                let mut exec = Exec::new(&sys);
+                for (&w, &id) in input_wires.iter().zip(inputs) {
+                    let item = self.carry(id);
+                    exec.set(w, Val::new(item.value, item.modulus));
+                }
+                exec.run_recorded();
+                let exec_secs = t_exec.elapsed().as_secs_f64();
+                let t_eval = std::time::Instant::now();
+                let labels = replay_with_labels(
+                    &sys,
+                    &input_wires,
+                    &input_labels,
+                    exec.values(),
+                    &program,
+                    exec.journal(),
+                    &output_wires,
+                    nonce_base,
+                );
+                let values: Vec<u64> = output_wires.iter().map(|&w| exec.get(w).v).collect();
+                (exec_secs, t_eval.elapsed().as_secs_f64(), labels, values)
+            }
         };
-        let output_values: Vec<u64> = output_wires.iter().map(|&w| exec.get(w).v).collect();
-        let label_eval_secs = t_eval.elapsed().as_secs_f64();
         self.eval_secs += exec_secs + label_eval_secs;
 
         // Output masks live in the program in declaration order.
