@@ -424,3 +424,81 @@ another ~4–6× on this machine without changing per-core cost.
 * All protocol-visible quantities — communication bits, CF/NCF hash counts,
   decoded outputs — are pinned identical to the original System-only
   implementation by ledger-parity and known-answer tests.
+
+## 10. Round 4: the flat-arena compiled VM, AES ILP, and the corrected workload
+
+The reference workload moves to **N = 256, S = 6·256 = 1536** (the average of
+the application's x side, S = 5·256, and y side, S = 7·256); the full
+application costs 2× the single-workload numbers below. The aspirational
+floor, counting CCRH invocations only at 5 ns each, is **12.5 ms per party**
+per single workload (25 ms each for the doubled application).
+
+### What landed
+
+* **Flat-arena VM** (`comp_gc/arena.rs`): masks/labels for the chunk and
+  extract phases live in dense typed arenas — `Vec<[u64; 2]>` for Z₂,
+  `Vec<[u32; 128]>` for lane wires — addressed through a per-shape
+  `WireLayout`. No `Label`, no `Option`, no allocation anywhere in phase
+  execution; hash outputs expand directly into arena slots (k = 8/16 byte
+  fast paths). Conversions to `Label` happen only at carry boundaries.
+* **Compiled garbling** (`compile_garble`/`garble_compiled`): the recorded
+  garble tape compiles once per shape into a typed instruction stream,
+  validated at compile time exactly as a checked replay (wire membership +
+  definedness simulation). The 78 repeat phases garble with *zero* System
+  access except dynamic `Mul`-scalar loads — the r_i coefficients legally
+  vary across same-shape phases, and baking them in produced wrong masks,
+  caught immediately by the in-pipeline differential (`DFB_DIFF=1` verifies
+  compiled ≡ reference replay on every keyed phase; the full suite passes
+  with it enabled).
+* **AES ILP** (`crypto`): 4-wide round-major CCRND keeps both M1 AES pipes
+  fed — `expand` goes ~4.1 → ~1.75 ns/block, within ~10 % of the
+  2-pipe hardware floor (10 fused rounds / 2 pipes ≈ 1.56 ns). Byte-identical
+  (golden vectors + an old-loop oracle differential). `expand4` batches
+  independent single-block hashes for future kernel use.
+* **Def-4 nonce freshness**: the paper (App. A, Def. 4) requires that no two
+  CCRH queries share a *nonce* — stricter than the (seed, nonce)-pair comment
+  the crate carried. Solo-domain switch hashes now draw from per-phase
+  windows allocated by the pipeline (`solo_nonce_next`), so gate ids reused
+  across phases no longer reuse nonces. Bulk domain: in-System switch-group
+  ids own [0, 2^32), kernels draw above `KERNEL_NONCE_FLOOR = 2^32`, with a
+  hard bound below bit 63.
+* **Smudging** (paper Thm. 5.2) documented as caller responsibility on
+  `build_s_aff_streaming`: `b' = b + μ·p` before deriving residues when the
+  evaluator will CRT-reconstruct over Z_M.
+* Misc: System buffer pooling across phases; `Exec`'s internal modulus check
+  demoted to debug (public `set` keeps its hard assert); `Add(x, x)`
+  aliasing handled in arena ops.
+
+### Where it stands (quiet machine, full clock, single workload S = 1536)
+
+| | stream | garbler | evaluator | instructions | cycles |
+|---|---|---|---|---|---|
+| round 3 end | 0.12 s | ~50 ms | ~60 ms | 1.87 G | 0.38 G |
+| **round 4** | **0.09 s** | **~35 ms** | **~53 ms** | **1.48 G** | **0.29 G** |
+
+Doubled application: ~70 ms garbler + ~106 ms evaluator. Versus the
+hash-only floor (12.5 ms/party single): the garbler is ~2.8× above, the
+evaluator ~4× above. Cumulative since the original implementation: the
+S=1280 stream went 2.33 s → 0.09 s at S=1536 — **~26× at matched clocks**.
+
+### The measured gap to "physical"
+
+Per party, single workload, all numbers measured or derived from counters:
+
+| component | cost | reducible? |
+|---|---|---|
+| CCRH/AES (3.0 M λ-blocks × 1.75 ns) | ~5.3 ms | ~at hardware floor |
+| body-kernel MACs (20.6 M slot×member pairs, NEON ÷4) | ~6 ms | 8-wide NEON ≈ −2 ms |
+| extract lane math + hash-output unpacking | ~8 ms | NEON unpack ≈ −2 ms |
+| eval-side schedule interpretation + journal discovery (`Exec`) | ~13 ms (evaluator only) | the last interpreter standing |
+| build + boundaries + misc | ~4 ms | pooled already |
+
+The protocol's compute is **not** hash-only: the IT-GC body alone does one
+multiply-accumulate per (slot, member) pair — 20.6 M of them per party —
+and the comp-GC's λ = 128-lane ring ops are real work the hash count never
+sees. A hash-only floor estimate therefore undercounts by ~2–3×. What
+remains structurally addressable: hand-rolled NEON for the generic-k unpack
+and an 8-wide MAC kernel (~4 ms/party combined), and replacing `Exec`'s
+worklist with a direct cleartext evaluator for the extract shape (~8 ms,
+evaluator only). Beyond that, single-core gains require protocol changes;
+across parties/workloads the work is embarrassingly parallel.

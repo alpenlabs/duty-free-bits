@@ -268,6 +268,12 @@ impl System {
 
     /// Register a group of NCF switch gates that share one control wire.
     ///
+    /// Group indices key bulk-domain CCRH calls and restart at 0 per System;
+    /// the streaming kernels draw their bulk ids above
+    /// `affine::KERNEL_NONCE_FLOOR` (2^32), so in-System groups own
+    /// `[0, 2^32)`. A System registering ≥ 2^32 groups would violate
+    /// Definition-4 nonce freshness against the kernels.
+    ///
     /// The garbler/evaluator will derive each member's hash from a single wide
     /// CCRH call keyed on the shared control label and the group id, slicing
     /// the output across members. [`System::cost`] charges the group
