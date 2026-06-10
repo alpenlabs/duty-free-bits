@@ -487,6 +487,27 @@ fn test_add_vec() {
     }
 }
 
+// ==================== System extension after propagation ====================
+
+#[test]
+#[should_panic(expected = "extended after a propagation pass")]
+fn test_system_extension_after_run_panics() {
+    // The subscription CSR freezes the gate graph at the first propagation.
+    // Extending the System afterwards must fail loudly (release included) —
+    // silently running on stale subscriptions would skip the new gates.
+    let mut sys = System::new();
+    let x = sys.input(4);
+    let y = sys.input(4);
+    let _ = sys.add(x, y);
+    Exec::new(&sys).run(); // builds the CSR
+
+    let z = sys.input(4);
+    let _ = sys.add(x, z); // stale CSR: must be detected...
+    let mut exec = Exec::new(&sys);
+    exec.set(x, Val::new(1, 4));
+    exec.run(); // ...at the next propagation
+}
+
 // ==================== Exec isolation ====================
 
 #[test]

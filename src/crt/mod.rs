@@ -134,6 +134,16 @@ impl GarnerDecoder {
     /// Precompute Garner constants for `primes` (pairwise coprime, each ≥ 2).
     pub fn new(primes: &[u64]) -> Self {
         let t = primes.len();
+        // Hard bound (not debug-only: decode runs in release): reconstruct's
+        // delayed-reduction accumulator needs Σ_{j<t} c_j·w_j < 2^64 with
+        // c_j < p_max and w_j < p_max, and diff·inv < 2^64 with both < p_max.
+        for &p in primes {
+            assert!(
+                (p as u128) * (p as u128) * (t as u128) < (1u128 << 63),
+                "GarnerDecoder: prime set exceeds the u64 delayed-reduction bound \
+                 (use crt_reconstruct)"
+            );
+        }
         let mut ppi = Vec::with_capacity(t * (t + 1) / 2);
         let mut row = Vec::with_capacity(t);
         let mut inv = Vec::with_capacity(t);
@@ -166,7 +176,8 @@ impl GarnerDecoder {
         }
     }
 
-    /// Reconstruct x from its residues (same order as the constructor's primes).
+    /// Reconstruct x from its residues (same order as the constructor's
+    /// primes; each residue must be reduced, `residues[i] < primes[i]`).
     ///
     /// Same value as [`crt_reconstruct`]; the mixed-radix coefficients are
     /// accumulated raw in u64 — terms are < p_i² ≤ 2^18 over ≤ t ≤ 2^9 primes,
@@ -178,8 +189,8 @@ impl GarnerDecoder {
             return U576::ZERO;
         }
         debug_assert!(
-            self.primes.iter().all(|&p| p * p * (t as u64) < (1 << 63)),
-            "delayed-reduction accumulator would overflow"
+            residues.iter().zip(&self.primes).all(|(&r, &p)| r < p),
+            "residues must be reduced mod their primes"
         );
 
         let mut coeffs: Vec<u64> = Vec::with_capacity(t);

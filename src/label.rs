@@ -633,7 +633,7 @@ mod tests {
         // from_raw_bits ∘ to_packed_words must be the identity for every k:
         // the packed form is the wire format, the lane form is in-memory only.
         let mut r = rng();
-        for k in 1u32..=22 {
+        for k in 1u32..=32 {
             let m = 1u64 << k;
             let l = rand_cf(&mut r, m);
             let packed = l.to_packed_words();

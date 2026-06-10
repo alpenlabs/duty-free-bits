@@ -1,6 +1,6 @@
 use crate::label::LAMBDA;
 use crate::types::*;
-use std::cell::OnceCell;
+use std::sync::OnceLock;
 
 /// The constraint system: holds wires, gates, and propagation queue.
 #[derive(Debug)]
@@ -13,8 +13,8 @@ pub struct System {
     sub_edges: Vec<(u32, u32)>,
     /// Lazily-built CSR over `sub_edges` (one flat allocation instead of a
     /// heap `Vec` per wire — the engines walk subscription lists on every
-    /// wire update).
-    sub_csr: OnceCell<SubscriptionCsr>,
+    /// wire update). `OnceLock` keeps `System: Sync`.
+    sub_csr: OnceLock<SubscriptionCsr>,
     /// Per-wire control-friendliness flag.
     pub(crate) is_cf_flags: Vec<bool>,
     /// Reduces hash count by grouping switches that share the same control wire.
@@ -34,6 +34,10 @@ pub(crate) struct SubscriptionCsr {
 
 impl SubscriptionCsr {
     fn build(num_wires: usize, edges: &[(u32, u32)]) -> Self {
+        assert!(
+            num_wires <= u32::MAX as usize && edges.len() <= u32::MAX as usize,
+            "subscription CSR uses u32 ids/offsets"
+        );
         // Counting sort by wire id; gate order within a wire is preserved
         // (matches the old push order).
         let mut offsets = vec![0u32; num_wires + 1];
@@ -112,7 +116,7 @@ impl System {
             gates: Vec::new(),
             values: Vec::new(),
             sub_edges: Vec::new(),
-            sub_csr: OnceCell::new(),
+            sub_csr: OnceLock::new(),
             is_cf_flags: Vec::new(),
             switch_groups: Vec::new(),
             gate_to_group: Vec::new(),
@@ -123,16 +127,19 @@ impl System {
     /// to CSR on first use. Construction must be finished before the first
     /// call (the propagation engines run on a fully-built system).
     pub(crate) fn subscriptions(&self) -> &SubscriptionCsr {
-        debug_assert!(
-            self.sub_csr.get().is_none() || self.sub_edges.len() == self.csr_edge_count(),
-            "subscriptions() used before construction finished"
+        let csr = self
+            .sub_csr
+            .get_or_init(|| SubscriptionCsr::build(self.values.len(), &self.sub_edges));
+        // The CSR freezes the graph: extending the System after a propagation
+        // pass would silently run on stale subscriptions, so fail loudly
+        // instead (the old per-wire Vec lists were always current).
+        assert_eq!(
+            csr.gids.len(),
+            self.sub_edges.len(),
+            "System was extended after a propagation pass (gates added after \
+             the subscription CSR was built)"
         );
-        self.sub_csr
-            .get_or_init(|| SubscriptionCsr::build(self.values.len(), &self.sub_edges))
-    }
-
-    fn csr_edge_count(&self) -> usize {
-        self.sub_csr.get().map_or(0, |c| c.gids.len())
+        csr
     }
 
     /// Compute the circuit's communication + hash cost.
@@ -208,8 +215,10 @@ impl System {
     fn subscribe(&mut self, w: Wire, gid: GateId) {
         debug_assert!(
             self.sub_csr.get().is_none(),
-            "subscribe after the CSR was built"
+            "System was extended after a propagation pass (gate subscribed \
+             after the subscription CSR was built)"
         );
+        debug_assert!(w.wid <= u32::MAX as usize && gid <= u32::MAX as usize);
         self.sub_edges.push((w.wid as u32, gid as u32));
     }
 
