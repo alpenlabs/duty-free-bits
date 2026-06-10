@@ -657,8 +657,8 @@ fn test_s_aff_scaling() {
         for ps in &pipeline.phase_stats {
             let class = if ps.name.starts_with("chunk[") {
                 "chunk conversion"
-            } else if ps.name.ends_with("/header") {
-                "prime header"
+            } else if ps.name.ends_with("/extract") {
+                "prime extract"
             } else {
                 "other"
             };
@@ -690,6 +690,10 @@ fn test_s_aff_scaling() {
                 name, c.n, c.build, c.garble, c.exec, c.label_eval, c.wires, c.gates
             );
         }
+        eprintln!(
+            "          {:<18} {:>4} {:>8} {:>7.3}s {:>8} {:>7.3}s",
+            "fold kernel", "-", "-", pipeline.fold_garble_secs, "-", pipeline.fold_eval_secs,
+        );
         eprintln!(
             "          {:<18} {:>4} {:>8} {:>7.3}s {:>8} {:>7.3}s",
             "it-gc body kernel",
