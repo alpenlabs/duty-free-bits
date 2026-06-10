@@ -342,35 +342,32 @@ fn accumulate_pads_neon(
     unsafe {
         let p_v = vdupq_n_u32(p_i as u32);
         let mask_v = vdupq_n_u32((1u32 << lg_p) - 1);
-        for j0 in (0..full).step_by(4) {
+        // Per-4-member-group constants: the group's byte offset into a slot
+        // and the per-lane alignment shifts.
+        let group_consts = |j0: usize| {
             let bit_off = j0 * lg_p;
-            let byte_off = bit_off >> 3;
             let shift0 = (bit_off & 7) as i64;
             // vshlq with a negative count right-shifts: lane k's count drops
             // the bits below its pad, [shift0 + k·lg_p ..][..lg_p].
             let shifts = [0i64, 1, 2, 3].map(|k| -(shift0 + k * lg_p as i64));
-            let sh01 = vld1q_s64(shifts.as_ptr());
-            let sh23 = vld1q_s64(shifts.as_ptr().add(2));
-
-            let mut ps = vdupq_n_u32(0);
-            let mut ro = vdupq_n_u32(0);
-            for (i, &g) in gs.iter().enumerate() {
-                if Some(i) == skip {
-                    continue;
-                }
-                let ptr = slab.bytes.as_ptr().add(i * slab.stride + byte_off);
-                let raw = u64::from_le_bytes(core::ptr::read_unaligned(ptr.cast::<[u8; 8]>()));
-                let v = vdupq_n_u64(raw);
-                let acc = vandq_u32(
-                    vcombine_u32(vmovn_u64(vshlq_u64(v, sh01)), vmovn_u64(vshlq_u64(v, sh23))),
-                    mask_v,
-                );
-                // acc < 2^⌈log₂ p⌉ < 2p, so subtracting p exactly where
-                // acc ≥ p matches extract_pad's compare-subtract.
-                let pad = vsubq_u32(acc, vandq_u32(vcgeq_u32(acc, p_v), p_v));
-                ps = vaddq_u32(ps, pad);
-                ro = vmlaq_n_u32(ro, pad, g);
-            }
+            (
+                bit_off >> 3,
+                vld1q_s64(shifts.as_ptr()),
+                vld1q_s64(shifts.as_ptr().add(2)),
+            )
+        };
+        // One group of 4 pads from a slot's raw u64 window.
+        let pads4 = |raw: u64, sh01, sh23| {
+            let v = vdupq_n_u64(raw);
+            let acc = vandq_u32(
+                vcombine_u32(vmovn_u64(vshlq_u64(v, sh01)), vmovn_u64(vshlq_u64(v, sh23))),
+                mask_v,
+            );
+            // acc < 2^⌈log₂ p⌉ < 2p, so subtracting p exactly where
+            // acc ≥ p matches extract_pad's compare-subtract.
+            vsubq_u32(acc, vandq_u32(vcgeq_u32(acc, p_v), p_v))
+        };
+        let widen = |j0: usize, ps, ro, pad_sum_raw: &mut [u64], readout_raw: &mut [u64]| {
             let mut ps_arr = [0u32; 4];
             let mut ro_arr = [0u32; 4];
             vst1q_u32(ps_arr.as_mut_ptr(), ps);
@@ -379,6 +376,52 @@ fn accumulate_pads_neon(
                 pad_sum_raw[j0 + k] += ps_arr[k] as u64;
                 readout_raw[j0 + k] += ro_arr[k] as u64;
             }
+        };
+
+        // 8 members per slot pass: two independent accumulator pairs keep
+        // both halves' dependency chains in flight on the NEON pipes and
+        // halve the per-slot loop overhead (gs load, skip check, pointers).
+        let full8 = b & !7;
+        for j0 in (0..full8).step_by(8) {
+            let (off_a, sh01_a, sh23_a) = group_consts(j0);
+            let (off_b, sh01_b, sh23_b) = group_consts(j0 + 4);
+            let mut ps_a = vdupq_n_u32(0);
+            let mut ro_a = vdupq_n_u32(0);
+            let mut ps_b = vdupq_n_u32(0);
+            let mut ro_b = vdupq_n_u32(0);
+            for (i, &g) in gs.iter().enumerate() {
+                if Some(i) == skip {
+                    continue;
+                }
+                let base = slab.bytes.as_ptr().add(i * slab.stride);
+                let raw_a = u64::from_le_bytes(core::ptr::read_unaligned(base.add(off_a).cast()));
+                let raw_b = u64::from_le_bytes(core::ptr::read_unaligned(base.add(off_b).cast()));
+                let pad_a = pads4(raw_a, sh01_a, sh23_a);
+                let pad_b = pads4(raw_b, sh01_b, sh23_b);
+                ps_a = vaddq_u32(ps_a, pad_a);
+                ro_a = vmlaq_n_u32(ro_a, pad_a, g);
+                ps_b = vaddq_u32(ps_b, pad_b);
+                ro_b = vmlaq_n_u32(ro_b, pad_b, g);
+            }
+            widen(j0, ps_a, ro_a, pad_sum_raw, readout_raw);
+            widen(j0 + 4, ps_b, ro_b, pad_sum_raw, readout_raw);
+        }
+        // Remaining full group of 4, if any.
+        for j0 in (full8..full).step_by(4) {
+            let (off_a, sh01_a, sh23_a) = group_consts(j0);
+            let mut ps = vdupq_n_u32(0);
+            let mut ro = vdupq_n_u32(0);
+            for (i, &g) in gs.iter().enumerate() {
+                if Some(i) == skip {
+                    continue;
+                }
+                let ptr = slab.bytes.as_ptr().add(i * slab.stride + off_a);
+                let raw = u64::from_le_bytes(core::ptr::read_unaligned(ptr.cast::<[u8; 8]>()));
+                let pad = pads4(raw, sh01_a, sh23_a);
+                ps = vaddq_u32(ps, pad);
+                ro = vmlaq_n_u32(ro, pad, g);
+            }
+            widen(j0, ps, ro, pad_sum_raw, readout_raw);
         }
     }
     // Ragged tail (b mod 4 members): scalar kernel, identical pads.

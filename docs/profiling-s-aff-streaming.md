@@ -502,3 +502,60 @@ and an 8-wide MAC kernel (~4 ms/party combined), and replacing `Exec`'s
 worklist with a direct cleartext evaluator for the extract shape (~8 ms,
 evaluator only). Beyond that, single-core gains require protocol changes;
 across parties/workloads the work is embarrassingly parallel.
+
+## 11. Round 5: fused evaluation, NEON unpack, 8-wide MACs
+
+Three final levers, no protocol changes:
+
+* **Fused evaluator** (`fused_eval_arena`): cleartext values and labels now
+  derive together through one worklist pass — a direction fires when its
+  value operands are known, and inductively every value-known wire is
+  label-known too (the same induction that validated the journal). This
+  retires the journal and the entire second dispatch pass; in CF-only shapes
+  every value op's modulus is `2^k` from the layout slot, so value
+  arithmetic loads no `Val`s at all. The journal-replay engine remains as
+  the checked reference for the differential tests.
+* **NEON hash-output unpack** (`unpack_even_k_neon`): for even k — all
+  production lane widths (22, 14, 8, 6) — every 4-lane group of a packed
+  hash output starts byte-aligned, so one static TBL byte-gather + per-lane
+  shift pattern serves all 32 groups. Differential-tested against the
+  scalar window loop for every eligible k; k = 30 (the one even width whose
+  window overflows the 32-bit gather) and odd k stay scalar.
+* **8-wide MAC kernel** (`it_gc`): the body kernel processes two independent
+  4-member accumulator groups per slot pass, keeping both dependency chains
+  in flight on the NEON pipes and halving per-slot loop overhead. Covered by
+  the existing SIMD-vs-scalar differential (bit-identical sums, diffs and
+  outputs across 14 primes × 12 batch sizes).
+
+### Result (N = 256, S = 1536, single workload)
+
+| | stream | instructions | cycles |
+|---|---|---|---|
+| round 4 | 0.09 s | 1.48 G | 0.29 G |
+| **round 5** | **0.075 s** | **1.21 G** | **0.265 G** |
+
+Garbler ≈ 25–30 ms, evaluator ≈ 45 ms; doubled application ≈ 55 ms + 90 ms.
+Cumulative since the original implementation: **~31× wall, 34× instructions,
+26× cycles.**
+
+### Final composition (sampling profile, ~1.1 k samples)
+
+| bucket | share | nature |
+|---|---|---|
+| CCRH/AES (`expand`, 4-wide) | 18 % | hardware floor |
+| body-kernel MACs (8-wide NEON) | 17 % | ~floor |
+| fused evaluator (worklist + ops) | 22 % | the last fixpoint engine |
+| compiled garbler | 12 % | mostly lane math |
+| hash glue + NEON unpack | 9 % | ~floor |
+| lane arithmetic | 8 % | real work |
+| System build + CSR | 8 % | per-phase setup |
+| boundaries, fold, misc | 6 % | |
+
+**~56 % of remaining cycles are irreducible protocol arithmetic** (hashing,
+MACs, λ-lane ring ops, pad unpacking). The only structurally addressable
+remainder is the fused evaluator's *value-discovery* role — replacing the
+fixpoint with straight-line code requires hand-deriving `word_to_hot`'s
+circular value bootstrap per shape, judged not worth the correctness risk
+for the ~10–15 ms it could recover. Everything beyond that requires
+protocol-level changes (or parallelism across the embarrassingly-independent
+primes/workloads).
