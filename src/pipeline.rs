@@ -14,8 +14,8 @@
 //!
 //! Peak memory collapses to the largest single phase plus the carry set. Δ is global.
 
-use crate::comp_gc::eval_with_labels;
 use crate::comp_gc::garble;
+use crate::comp_gc::replay_with_labels;
 use crate::exec::Exec;
 use crate::label::{self, CfLabel, LAMBDA, Label};
 use crate::system::System;
@@ -235,9 +235,11 @@ impl Pipeline {
         let garble_secs = t_garble.elapsed().as_secs_f64();
         self.garble_secs += garble_secs;
 
-        // Evaluate. The evaluator knows x, so it runs a cleartext `Exec` pass to
-        // obtain every switch control, then propagates
-        // labels. The same pass yields the output wires' cleartext values.
+        // Evaluate. The evaluator knows x, so it runs a cleartext `Exec` pass
+        // to obtain every switch control — recording the set order — then
+        // replays that journal at the label level (the journal is a valid
+        // label schedule; see `replay_with_labels`). The same pass yields the
+        // output wires' cleartext values.
         let input_labels: Vec<Label> = inputs
             .iter()
             .map(|&id| self.carry(id).label.clone())
@@ -248,15 +250,16 @@ impl Pipeline {
             let item = self.carry(id);
             exec.set(w, Val::new(item.value, item.modulus));
         }
-        exec.run();
+        exec.run_recorded();
         let exec_secs = t_exec.elapsed().as_secs_f64();
         let t_eval = std::time::Instant::now();
-        let output_labels = eval_with_labels(
+        let output_labels = replay_with_labels(
             &sys,
             &input_wires,
             &input_labels,
             exec.values(),
             &program,
+            exec.journal(),
             &output_wires,
         );
         let output_values: Vec<u64> = output_wires.iter().map(|&w| exec.get(w).v).collect();

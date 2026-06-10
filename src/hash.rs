@@ -52,30 +52,42 @@ pub fn hash_solo(ctrl_mask: &Label, gid: GateId, out_is_cf: bool, out_modulus: u
     let domain = gid as u64; // solo: bit 63 = 0.
     if out_is_cf {
         let k = out_modulus.trailing_zeros() as usize;
-        let total_bits = LAMBDA * k;
-        let words = total_bits.div_ceil(64);
-        let mut buf = vec![0u8; words * 8];
-        expand(seed, domain, &mut buf);
-        let bits: Vec<u64> = (0..words)
-            .map(|w| u64::from_le_bytes(buf[w * 8..(w + 1) * 8].try_into().unwrap()))
-            .collect();
-        Label::Cf(CfLabel::from_raw_bits(bits, out_modulus))
+        if k == 1 {
+            // Z_2: exactly LAMBDA = 128 bits = 16 bytes, one AES block.
+            let mut buf = [0u8; 16];
+            expand(seed, domain, &mut buf);
+            return Label::Cf(CfLabel::from_packed_bytes(&buf, out_modulus));
+        }
+        let words = (LAMBDA * k).div_ceil(64);
+        // k ≤ 32 ⇒ words ≤ ⌈128·32/64⌉ = 64 ⇒ 512 bytes bound the output.
+        debug_assert!(words * 8 <= 512, "CF modulus 2^{k} exceeds the u32 lanes");
+        let mut buf = [0u8; 512];
+        let buf = &mut buf[..words * 8];
+        expand(seed, domain, buf);
+        Label::Cf(CfLabel::from_packed_bytes(buf, out_modulus))
     } else {
         let lg_m = lg_modulus(out_modulus);
-        let mut buf = vec![0u8; lg_m.div_ceil(8)];
-        expand(seed, domain, &mut buf);
-        let mut value = 0u64;
-        for b in 0..lg_m {
-            if (buf[b / 8] >> (b % 8)) & 1 == 1 {
-                value |= 1u64 << b;
-            }
-        }
+        debug_assert!(lg_m <= 64, "NCF modulus {} too large for u64", out_modulus);
+        let mut buf = [0u8; 8];
+        expand(seed, domain, &mut buf[..lg_m.div_ceil(8)]);
+        // Unfilled high bytes are zero, so the LE word load masked to lg_m
+        // bits equals the LSB-first per-bit assembly of the expanded bytes.
+        let word = u64::from_le_bytes(buf);
+        let value = if lg_m >= 64 {
+            word
+        } else {
+            word & ((1u64 << lg_m) - 1)
+        };
+        // value < 2^lg_m ≤ 2·(out_modulus − 1) < 2·out_modulus (lg_m = ⌈log₂ m⌉),
+        // so one compare-subtract equals `value % out_modulus`. For modulus ≤ 1,
+        // lg_m = 0 forces value = 0, matching the old `out_modulus == 0` guard.
+        let rep = if out_modulus != 0 && value >= out_modulus {
+            value - out_modulus
+        } else {
+            value
+        };
         Label::Ncf(NcfLabel {
-            rep: if out_modulus == 0 {
-                0
-            } else {
-                value % out_modulus
-            },
+            rep,
             modulus: out_modulus,
         })
     }
@@ -83,6 +95,18 @@ pub fn hash_solo(ctrl_mask: &Label, gid: GateId, out_is_cf: bool, out_modulus: u
 
 /// CCRH for a switch group: one wide call covering all members.
 pub fn hash_bulk(ctrl_mask: &Label, group_id: usize, total_bits: usize) -> Vec<u8> {
+    let mut out = vec![0u8; total_bits.div_ceil(8)];
+    hash_bulk_into(ctrl_mask, group_id, total_bits, &mut out);
+    out
+}
+
+/// As [`hash_bulk`], but writes the `total_bits.div_ceil(8)` output bytes into
+/// the prefix of `out` (which must be at least that long); bytes past the
+/// prefix are left untouched.
+///
+/// Byte-identical to [`hash_bulk`] — callers may pack many groups into one
+/// slab without per-group allocation.
+pub fn hash_bulk_into(ctrl_mask: &Label, group_id: usize, total_bits: usize, out: &mut [u8]) {
     debug_assert!(
         matches!(ctrl_mask, Label::Cf(c) if c.modulus() == 2),
         "ctrl mask must be CF Z_2"
@@ -95,9 +119,9 @@ pub fn hash_bulk(ctrl_mask: &Label, group_id: usize, total_bits: usize) -> Vec<u
         "group id uses the bulk-domain bit"
     );
     let domain = (group_id as u64) | (1u64 << 63);
-    let mut out = vec![0u8; total_bits.div_ceil(8)];
-    expand(seed, domain, &mut out);
-    out
+    let len = total_bits.div_ceil(8);
+    assert!(out.len() >= len, "hash_bulk_into: out shorter than output");
+    expand(seed, domain, &mut out[..len]);
 }
 
 /// Extract member `idx`'s NCF label from a wide bulk-hash output.
@@ -195,6 +219,18 @@ mod tests {
         let b = hash_bulk(&s, 0, total_bits);
         assert_eq!(a, b);
         assert_eq!(a.len(), total_bits.div_ceil(8));
+    }
+
+    #[test]
+    fn test_bulk_into_matches_bulk_and_preserves_tail() {
+        let s = rand_ctrl();
+        let total_bits: usize = 5 * 9; // exact length 6 bytes, not a multiple of 8.
+        let exact_len = total_bits.div_ceil(8);
+        let expected = hash_bulk(&s, 3, total_bits);
+        let mut out = vec![0xAAu8; exact_len + 8];
+        hash_bulk_into(&s, 3, total_bits, &mut out);
+        assert_eq!(&out[..exact_len], &expected[..]);
+        assert!(out[exact_len..].iter().all(|&b| b == 0xAA));
     }
 
     #[test]

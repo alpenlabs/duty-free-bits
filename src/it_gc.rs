@@ -88,13 +88,13 @@ pub fn body_batch_garble(
     );
     let mut pad_sum_raw = vec![0u64; b]; // Σ_i pad_i (unreduced)
     let mut readout_raw = vec![0u64; b]; // Σ_i g_i·pad_i (unreduced)
-    for i in 0..p {
-        let g = truth_table[i] % p_i;
-        let wide = &slot_hash[i];
-        for j in 0..b {
-            let pad = extract_pad(wide, j, lg_p, p_i);
-            pad_sum_raw[j] += pad;
-            readout_raw[j] += g * pad;
+    for (i, &t) in truth_table.iter().enumerate() {
+        let g = t % p_i;
+        let base = i * slot_hash.stride;
+        for (j, (ps, ro)) in pad_sum_raw.iter_mut().zip(&mut readout_raw).enumerate() {
+            let pad = extract_pad(&slot_hash.bytes, base, j, lg_p, p_i);
+            *ps += pad;
+            *ro += g * pad;
         }
     }
 
@@ -160,16 +160,16 @@ pub fn body_batch_eval(
     // Delayed reduction, mirroring `body_batch_garble` (see the bound there).
     let mut pad_sum_raw = vec![0u64; b]; // Σ_{i≠hot} pad_i  (every pad we can recompute)
     let mut readout_raw = vec![0u64; b]; // Σ_{i≠hot} g(i)·pad_i
-    for i in 0..p {
+    for (i, &t) in truth_table.iter().enumerate() {
         if i == hot {
             continue;
         }
-        let g = truth_table[i] % p_i;
-        let wide = &slot_hash[i];
-        for j in 0..b {
-            let pad = extract_pad(wide, j, lg_p, p_i);
-            pad_sum_raw[j] += pad;
-            readout_raw[j] += g * pad;
+        let g = t % p_i;
+        let base = i * slot_hash.stride;
+        for (j, (ps, ro)) in pad_sum_raw.iter_mut().zip(&mut readout_raw).enumerate() {
+            let pad = extract_pad(&slot_hash.bytes, base, j, lg_p, p_i);
+            *ps += pad;
+            *ro += g * pad;
         }
     }
 
@@ -183,36 +183,54 @@ pub fn body_batch_eval(
         .collect()
 }
 
-/// The pad material `H(h_p[i])` for each one-hot slot, bulk-packed: each output
+/// Slot-major slab of the per-slot bulk hashes: slot `i`'s `b·lg|p_i|` pad
+/// bits occupy `bytes[i·stride .. i·stride + exact_len]`, where `stride` is
+/// `exact_len` rounded up to a u64 boundary. 8 trailing zero bytes guarantee
+/// that any u64 load starting inside a slot's exact region stays in bounds.
+struct HashSlab {
+    bytes: Vec<u8>,
+    stride: usize,
+}
+
+/// The pad material `H(h_p[i])` for each one-hot slot, bulk-packed: each slot
 /// holds `b·lg|p_i|` pseudorandom bits, one `lg|p_i|`-bit pad per batch member.
 /// Garbler and evaluator call this identically (on masks / labels); at every
 /// non-hot slot the two agree, which is what lets `pad_i` line up.
-fn switch_hashes(ohe: &[Label], group_id_base: usize, b: usize, p_i: u64) -> Vec<Vec<u8>> {
+fn switch_hashes(ohe: &[Label], group_id_base: usize, b: usize, p_i: u64) -> HashSlab {
     let lg_p = hash::lg_modulus(p_i);
-    ohe.iter()
-        .enumerate()
-        .map(|(i, l)| hash::hash_bulk(l, group_id_base + i, b * lg_p))
-        .collect()
+    let total_bits = b * lg_p;
+    let exact_len = total_bits.div_ceil(8);
+    let stride = exact_len.div_ceil(8) * 8;
+    // One allocation for the whole batch; intra-slot padding and the 8-byte
+    // tail stay zero (and are masked off in `extract_pad` regardless).
+    let mut bytes = vec![0u8; ohe.len() * stride + 8];
+    for (i, l) in ohe.iter().enumerate() {
+        let base = i * stride;
+        hash::hash_bulk_into(
+            l,
+            group_id_base + i,
+            total_bits,
+            &mut bytes[base..base + exact_len],
+        );
+    }
+    HashSlab { bytes, stride }
 }
 
 /// Member `j`'s pad `pad_i` (an NCF Z_p residue) sliced from slot `i`'s bulk
-/// hash: bits `[j·lg_p .. (j+1)·lg_p)` of `wide`, reduced into Z_p.
+/// hash: bits `[j·lg_p .. (j+1)·lg_p)` past `base = i·stride`, reduced into Z_p.
 ///
 /// Computes the same value as [`hash::extract_ncf`] (LSB-first bit slice, then
-/// `% p`), but via a single word load instead of a per-bit loop, and a
-/// compare-subtract instead of a division (`acc < 2^⌈lg p⌉ < 2p`).
+/// `% p`), but via a single unconditional u64 load instead of a per-bit loop —
+/// the slab's 8-byte tail keeps the load in bounds, and the `lg_p`-bit mask
+/// keeps padding bytes out of the value — and a compare-subtract instead of a
+/// division (`acc < 2^⌈lg p⌉ < 2p`).
 #[inline(always)]
-fn extract_pad(wide: &[u8], member_idx: usize, lg_p: usize, p: u64) -> u64 {
-    debug_assert!(lg_p <= 25, "extract_pad word load covers ≤ 25-bit slices");
+fn extract_pad(slab: &[u8], base: usize, member_idx: usize, lg_p: usize, p: u64) -> u64 {
+    debug_assert!(lg_p <= 57, "extract_pad u64 load covers ≤ 57-bit slices");
     let bit_off = member_idx * lg_p;
-    let byte = bit_off / 8;
-    let shift = bit_off % 8;
-    // Gather up to 4 bytes (lg_p + shift ≤ 32 bits); the tail copy keeps the
-    // last members of the buffer in bounds.
-    let mut raw = [0u8; 4];
-    let take = (wide.len() - byte).min(4);
-    raw[..take].copy_from_slice(&wide[byte..byte + take]);
-    let acc = (u32::from_le_bytes(raw) >> shift) as u64 & ((1u64 << lg_p) - 1);
+    let byte = base + (bit_off >> 3);
+    let raw = u64::from_le_bytes(slab[byte..byte + 8].try_into().unwrap());
+    let acc = (raw >> (bit_off & 7)) & ((1u64 << lg_p) - 1);
     // acc < 2^⌈log₂ p⌉ < 2p, so one conditional subtract equals `acc % p`.
     if acc >= p { acc - p } else { acc }
 }

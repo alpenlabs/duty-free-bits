@@ -20,6 +20,7 @@
 //! declared output masks.
 
 use super::program::Program;
+use crate::exec::Worklist;
 use crate::hash;
 use crate::label::{self, Label, NcfLabel};
 use crate::system::System;
@@ -69,8 +70,12 @@ pub fn garble(
     assert_eq!(input_wires.len(), input_masks.len());
 
     let mut masks: Vec<Option<Label>> = vec![None; system.num_wires()];
+    let mut wl = Worklist::new(system.num_wires(), system.num_gates());
 
     // Seed 1: constants. Mask = -c·Δ_R (CF) or -c (NCF).
+    // Δ_R depends only on the modulus; cache it per k (constants are numerous —
+    // every fold bit allocates zeros — and rebuilding Δ_R walks all λ coords).
+    let mut delta_r_cache: [Option<Label>; 33] = [const { None }; 33];
     for (wid, slot) in masks.iter_mut().enumerate() {
         let v = system.values[wid];
         if !v.defined {
@@ -79,14 +84,17 @@ pub fn garble(
         let modulus = v.modulus;
         let neg_c = if v.v == 0 { 0 } else { modulus - v.v };
         *slot = Some(if system.is_cf_flags[wid] {
-            let d = label::delta_r(delta, modulus);
-            label::scalar_mul(neg_c, &Label::Cf(d))
+            let k = modulus.trailing_zeros() as usize;
+            let d =
+                delta_r_cache[k].get_or_insert_with(|| Label::Cf(label::delta_r(delta, modulus)));
+            label::scalar_mul(neg_c, d)
         } else {
             Label::Ncf(NcfLabel {
                 rep: neg_c,
                 modulus,
             })
         });
+        wl.mark_known(wid);
     }
 
     // Seed 2: declared inputs (CF, caller-supplied).
@@ -104,18 +112,38 @@ pub fn garble(
             w.wid
         );
         masks[w.wid] = Some(m.clone());
+        wl.mark_known(w.wid);
     }
 
-    // Worklist: seed with every gate, then let `try_set` cascades take over.
-    // We seed all gates (not just subscribers of seeded wires) because
-    // `Mul(0, _)` doesn't depend on its input — its output mask is `0`
-    // unconditionally — so it needs a firing chance even if nothing ever
-    // updates its input. That's what lets the phantom `bs[i]` wires in
-    // `word_to_hot_with_bits` get their first mask.
+    // Joins never fire during propagation — the diff is emitted in the final
+    // pass — so they are done before the worklist starts.
+    for (gid, g) in system.gates.iter().enumerate() {
+        if matches!(g, Gate::Join { .. }) {
+            wl.mark_done(gid);
+        }
+    }
+
+    // Worklist seed: subscribers of every seeded wire, plus all `Mul(0, _)`
+    // gates — the one gate shape that fires with no masked input (its output
+    // mask is `0` unconditionally; that's what lets the phantom `bs[i]` wires
+    // in `word_to_hot_with_bits` get their first mask). Every other gate needs
+    // at least one known wire, so it is reachable through `try_set` cascades.
     let mut bulk_cache: BulkCache = vec![None; system.num_switch_groups()];
-    let mut queue: Vec<GateId> = (0..system.num_gates()).collect();
-    while let Some(gid) = queue.pop() {
-        propagate_gate(system, gid, &mut masks, &mut queue, &mut bulk_cache);
+    let subs = system.subscriptions();
+    for wid in 0..system.num_wires() {
+        if wl.wire_known(wid) {
+            wl.enqueue_all(subs.of(wid));
+        }
+    }
+    for (gid, g) in system.gates.iter().enumerate() {
+        if matches!(g, Gate::Mul { scalar: 0, .. }) {
+            wl.enqueue(gid);
+        }
+    }
+    while let Some(gid) = wl.pop_live() {
+        if propagate_gate(system, gid, &mut masks, &mut wl, &mut bulk_cache) {
+            wl.mark_done(gid);
+        }
     }
 
     // Second pass: emit join diffs (the only switch-system communication) and
@@ -146,125 +174,140 @@ pub fn garble(
     program
 }
 
+/// Fire gate `gid` once; returns true when the gate can never derive a new
+/// wire. Invariant: `wl.wire_known(w)` ⇔ `masks[w].is_some()` — definedness is
+/// read from the bitset; `masks` is loaded only for operands.
 fn propagate_gate(
     system: &System,
     gid: GateId,
     masks: &mut [Option<Label>],
-    queue: &mut Vec<GateId>,
+    wl: &mut Worklist,
     bulk_cache: &mut BulkCache,
-) {
+) -> bool {
     match system.gates[gid] {
         Gate::Add { in0, in1, out } => {
             // out = in0 + in1  ⇔  in0 = out - in1  ⇔  in1 = out - in0
             // Compute a direction only if its target is still unset: label ops
             // allocate and (for k>1) walk all λ coordinates, so speculative
             // recomputation on every wakeup dominated garble time.
-            if masks[out.wid].is_none()
-                && let (Some(a), Some(b)) = (&masks[in0.wid], &masks[in1.wid])
-            {
-                let v = label::add(a, b);
-                try_set(masks, out, v, queue, system);
+            if !wl.wire_known(out.wid) && wl.wire_known(in0.wid) && wl.wire_known(in1.wid) {
+                let v = label::add(
+                    masks[in0.wid].as_ref().unwrap(),
+                    masks[in1.wid].as_ref().unwrap(),
+                );
+                try_set(masks, out, v, gid, wl, system);
             }
-            if masks[in0.wid].is_none()
-                && let (Some(o), Some(b)) = (&masks[out.wid], &masks[in1.wid])
-            {
-                let v = label::sub(o, b);
-                try_set(masks, in0, v, queue, system);
+            if !wl.wire_known(in0.wid) && wl.wire_known(out.wid) && wl.wire_known(in1.wid) {
+                let v = label::sub(
+                    masks[out.wid].as_ref().unwrap(),
+                    masks[in1.wid].as_ref().unwrap(),
+                );
+                try_set(masks, in0, v, gid, wl, system);
             }
-            if masks[in1.wid].is_none()
-                && let (Some(a), Some(o)) = (&masks[in0.wid], &masks[out.wid])
-            {
-                let v = label::sub(o, a);
-                try_set(masks, in1, v, queue, system);
+            if !wl.wire_known(in1.wid) && wl.wire_known(in0.wid) && wl.wire_known(out.wid) {
+                let v = label::sub(
+                    masks[out.wid].as_ref().unwrap(),
+                    masks[in0.wid].as_ref().unwrap(),
+                );
+                try_set(masks, in1, v, gid, wl, system);
             }
+            wl.wire_known(in0.wid) && wl.wire_known(in1.wid) && wl.wire_known(out.wid)
         }
         Gate::Sub { in0, in1, out } => {
             // out = in0 - in1  ⇔  in0 = out + in1  ⇔  in1 = in0 - out
-            if masks[out.wid].is_none()
-                && let (Some(a), Some(b)) = (&masks[in0.wid], &masks[in1.wid])
-            {
-                let v = label::sub(a, b);
-                try_set(masks, out, v, queue, system);
+            if !wl.wire_known(out.wid) && wl.wire_known(in0.wid) && wl.wire_known(in1.wid) {
+                let v = label::sub(
+                    masks[in0.wid].as_ref().unwrap(),
+                    masks[in1.wid].as_ref().unwrap(),
+                );
+                try_set(masks, out, v, gid, wl, system);
             }
-            if masks[in0.wid].is_none()
-                && let (Some(o), Some(b)) = (&masks[out.wid], &masks[in1.wid])
-            {
-                let v = label::add(o, b);
-                try_set(masks, in0, v, queue, system);
+            if !wl.wire_known(in0.wid) && wl.wire_known(out.wid) && wl.wire_known(in1.wid) {
+                let v = label::add(
+                    masks[out.wid].as_ref().unwrap(),
+                    masks[in1.wid].as_ref().unwrap(),
+                );
+                try_set(masks, in0, v, gid, wl, system);
             }
-            if masks[in1.wid].is_none()
-                && let (Some(a), Some(o)) = (&masks[in0.wid], &masks[out.wid])
-            {
-                let v = label::sub(a, o);
-                try_set(masks, in1, v, queue, system);
+            if !wl.wire_known(in1.wid) && wl.wire_known(in0.wid) && wl.wire_known(out.wid) {
+                let v = label::sub(
+                    masks[in0.wid].as_ref().unwrap(),
+                    masks[out.wid].as_ref().unwrap(),
+                );
+                try_set(masks, in1, v, gid, wl, system);
             }
+            wl.wire_known(in0.wid) && wl.wire_known(in1.wid) && wl.wire_known(out.wid)
         }
         Gate::Mul { in0, scalar, out } => {
             // X_out = s · X_in. When s = 0 this is 0 regardless of X_in, so the
             // gate is fireable without its input being masked.
-            if masks[out.wid].is_some() {
-                return;
+            if !wl.wire_known(out.wid) {
+                if scalar == 0 {
+                    try_set(
+                        masks,
+                        out,
+                        Label::zero(system.is_cf(out), system.modulus(out)),
+                        gid,
+                        wl,
+                        system,
+                    );
+                } else if wl.wire_known(in0.wid) {
+                    let v = label::scalar_mul(scalar, masks[in0.wid].as_ref().unwrap());
+                    try_set(masks, out, v, gid, wl, system);
+                }
             }
-            if scalar == 0 {
-                try_set(
-                    masks,
-                    out,
-                    Label::zero(system.is_cf(out), system.modulus(out)),
-                    queue,
-                    system,
-                );
-            } else if let Some(a) = &masks[in0.wid] {
-                let v = label::scalar_mul(scalar, a);
-                try_set(masks, out, v, queue, system);
-            }
+            wl.wire_known(out.wid)
         }
         Gate::Mod2k { in0, k, out } => {
-            if masks[out.wid].is_none()
-                && let Some(a) = &masks[in0.wid]
-            {
-                let v = label::mod2k(a, k);
-                try_set(masks, out, v, queue, system);
+            if !wl.wire_known(out.wid) && wl.wire_known(in0.wid) {
+                let v = label::mod2k(masks[in0.wid].as_ref().unwrap(), k);
+                try_set(masks, out, v, gid, wl, system);
             }
+            wl.wire_known(out.wid)
         }
         Gate::Div2k { in0, k, out } => {
-            if masks[out.wid].is_none()
-                && let Some(a) = &masks[in0.wid]
-            {
-                let v = label::div2k(a, k);
-                try_set(masks, out, v, queue, system);
+            if !wl.wire_known(out.wid) && wl.wire_known(in0.wid) {
+                let v = label::div2k(masks[in0.wid].as_ref().unwrap(), k);
+                try_set(masks, out, v, gid, wl, system);
             }
+            wl.wire_known(out.wid)
         }
         Gate::Switch { data, ctrl, out } => {
             // out = H(ctrl, gid) + data  ⇔  data = out - H(ctrl, gid).
             // For grouped switches, H is sliced from a single wide bulk call.
             // Skip the hash entirely once both sides are determined.
-            let need_out = masks[out.wid].is_none() && masks[data.wid].is_some();
-            let need_data = masks[data.wid].is_none() && masks[out.wid].is_some();
-            if !(need_out || need_data) {
-                return;
-            }
-            if let Some(c) = masks[ctrl.wid].clone() {
-                let h = switch_hash(system, gid, &c, bulk_cache);
-                if need_out && let Some(d) = &masks[data.wid] {
-                    let v = label::add(&h, d);
-                    try_set(masks, out, v, queue, system);
+            let need_out = !wl.wire_known(out.wid) && wl.wire_known(data.wid);
+            let need_data = !wl.wire_known(data.wid) && wl.wire_known(out.wid);
+            if (need_out || need_data) && wl.wire_known(ctrl.wid) {
+                let h = switch_hash(system, gid, masks[ctrl.wid].as_ref().unwrap(), bulk_cache);
+                if need_out {
+                    let v = label::add(&h, masks[data.wid].as_ref().unwrap());
+                    try_set(masks, out, v, gid, wl, system);
                 }
-                if need_data && let Some(o) = &masks[out.wid] {
-                    let v = label::sub(o, &h);
-                    try_set(masks, data, v, queue, system);
+                if need_data {
+                    let v = label::sub(masks[out.wid].as_ref().unwrap(), &h);
+                    try_set(masks, data, v, gid, wl, system);
                 }
             }
+            // Garbler never branches on the control value: done once both
+            // sides are determined.
+            wl.wire_known(data.wid) && wl.wire_known(out.wid)
         }
         Gate::Join { .. } => {
             // No mask propagation; the join diff is emitted in the final pass.
+            // Marked done at init, so this arm is never reached from the queue.
+            true
         }
         Gate::SameWire { a, b } => {
-            if let Some(ma) = masks[a.wid].clone() {
-                try_set(masks, b, ma, queue, system);
+            if !wl.wire_known(b.wid) && wl.wire_known(a.wid) {
+                let v = masks[a.wid].clone().unwrap();
+                try_set(masks, b, v, gid, wl, system);
             }
-            if let Some(mb) = masks[b.wid].clone() {
-                try_set(masks, a, mb, queue, system);
+            if !wl.wire_known(a.wid) && wl.wire_known(b.wid) {
+                let v = masks[b.wid].clone().unwrap();
+                try_set(masks, a, v, gid, wl, system);
             }
+            wl.wire_known(a.wid) && wl.wire_known(b.wid)
         }
     }
 }
@@ -273,10 +316,11 @@ fn try_set(
     masks: &mut [Option<Label>],
     w: Wire,
     new_mask: Label,
-    queue: &mut Vec<GateId>,
+    src: GateId,
+    wl: &mut Worklist,
     system: &System,
 ) {
-    if masks[w.wid].is_none() {
+    if !wl.wire_known(w.wid) {
         assert_eq!(
             new_mask.modulus(),
             system.modulus(w),
@@ -284,6 +328,7 @@ fn try_set(
             w.wid
         );
         masks[w.wid] = Some(new_mask);
-        queue.extend_from_slice(&system.subscriptions[w.wid]);
+        wl.mark_known(w.wid);
+        wl.wake_subscribers(system.subscriptions().of(w.wid), src);
     }
 }

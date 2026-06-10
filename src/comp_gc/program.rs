@@ -11,10 +11,14 @@ use crate::label::Label;
 use crate::types::GateId;
 
 /// Garbled program.
+///
+/// Join diffs are stored sparsely (gates are overwhelmingly non-joins, so a
+/// dense `Vec<Option<Label>>` zeroed ~1.4 MB per streaming phase); the garbler
+/// emits them in ascending gate order, so lookup is a binary search.
 #[derive(Clone, Debug, Default)]
 pub struct Program {
-    /// Join diff `X_in0 − X_in1` per gate id; `None` for non-join gates.
-    join_diffs: Vec<Option<Label>>,
+    /// `(gate id, X_in0 − X_in1)` per Join gate, sorted by gate id.
+    join_diffs: Vec<(GateId, Label)>,
     /// One mask per declared output wire, in the caller's order.
     output_masks: Vec<Label>,
     /// Accumulated bit count.
@@ -23,23 +27,24 @@ pub struct Program {
 
 impl Program {
     /// New program sized for `num_gates`.
-    pub fn with_num_gates(num_gates: usize) -> Self {
+    pub fn with_num_gates(_num_gates: usize) -> Self {
         Self {
-            join_diffs: vec![None; num_gates],
+            join_diffs: Vec::new(),
             output_masks: Vec::new(),
             bits: 0,
         }
     }
 
-    /// Record a join's mask difference.
+    /// Record a join's mask difference. Calls must arrive in ascending gate
+    /// order (the garbler's final emission pass iterates gates in order).
     pub fn set_join_diff(&mut self, gid: GateId, diff: Label) {
         assert!(
-            self.join_diffs[gid].is_none(),
+            self.join_diffs.last().is_none_or(|&(last, _)| last < gid),
             "join diff already set for gate {}",
             gid
         );
         self.bits += label_bits(&diff);
-        self.join_diffs[gid] = Some(diff);
+        self.join_diffs.push((gid, diff));
     }
 
     /// Append an output mask.
@@ -50,7 +55,10 @@ impl Program {
 
     /// The join diff for a join gate (`None` if the gate emitted nothing).
     pub fn join_diff(&self, gid: GateId) -> Option<&Label> {
-        self.join_diffs[gid].as_ref()
+        self.join_diffs
+            .binary_search_by_key(&gid, |&(g, _)| g)
+            .ok()
+            .map(|idx| &self.join_diffs[idx].1)
     }
 
     /// Output masks in declaration order.
