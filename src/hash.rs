@@ -4,7 +4,6 @@
 
 use crate::crypto::{Block, expand};
 use crate::label::{self, CfLabel, LAMBDA, Label, NcfLabel};
-use crate::types::GateId;
 
 /// `⌈log₂ modulus⌉` (number of bits needed to represent values < modulus).
 ///
@@ -38,18 +37,19 @@ fn label_to_block(l: &Label) -> Block {
 }
 
 /// CCRH for a single switch gate.
-pub fn hash_solo(ctrl_mask: &Label, gid: GateId, out_is_cf: bool, out_modulus: u64) -> Label {
+///
+/// `nonce` must be globally fresh for the garbling (paper App. A, Def. 4: no
+/// two queries share a nonce) — callers offset per-phase gate ids by a
+/// monotonically allocated base.
+pub fn hash_solo(ctrl_mask: &Label, nonce: u64, out_is_cf: bool, out_modulus: u64) -> Label {
     debug_assert!(
         matches!(ctrl_mask, Label::Cf(c) if c.modulus() == 2),
         "ctrl mask must be CF Z_2"
     );
     let seed = label_to_block(ctrl_mask);
     // Bit 63 is the solo/bulk domain flag, so the nonce must leave it clear.
-    debug_assert!(
-        (gid as u64) < (1u64 << 63),
-        "switch gid uses the bulk-domain bit"
-    );
-    let domain = gid as u64; // solo: bit 63 = 0.
+    debug_assert!(nonce < (1u64 << 63), "solo nonce uses the bulk-domain bit");
+    let domain = nonce; // solo: bit 63 = 0.
     if out_is_cf {
         let k = out_modulus.trailing_zeros() as usize;
         if k == 1 {

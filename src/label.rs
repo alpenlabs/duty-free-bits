@@ -130,6 +130,31 @@ impl CfLabel {
         }
     }
 
+    /// The u32 lane array of a k > 1 label (in-memory form; panics on Z_2).
+    pub(crate) fn lanes(&self) -> &[u32] {
+        match &self.repr {
+            Repr::Lanes(l) => l,
+            Repr::Bits(_) => panic!("lanes: Z_2 labels are stored bit-packed"),
+        }
+    }
+
+    /// Build a k > 1 label directly from its lane array.
+    pub(crate) fn from_lanes(lanes: Vec<u32>, modulus: u64) -> CfLabel {
+        assert!(
+            modulus.is_power_of_two() && modulus > 2 && modulus <= (1u64 << 32),
+            "from_lanes: modulus {modulus} out of the lanes range"
+        );
+        assert_eq!(lanes.len(), LAMBDA);
+        debug_assert!({
+            let mask = coord_mask(modulus.trailing_zeros()) as u32;
+            lanes.iter().all(|&l| l & !mask == 0)
+        });
+        CfLabel {
+            repr: Repr::Lanes(lanes),
+            modulus,
+        }
+    }
+
     /// Raw bit-packed words of a Z_2 label (the wire format). Z_2 only — wider
     /// labels store lanes; serialize those with
     /// [`to_packed_words`](CfLabel::to_packed_words).

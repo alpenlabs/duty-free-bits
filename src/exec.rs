@@ -193,10 +193,12 @@ impl<'a> Exec<'a> {
     fn try_set(&mut self, w: Wire, v: Val, src: GateId, wl: &mut Worklist) {
         if !wl.wire_known(w.wid) {
             debug_assert!(!v.is_none());
-            assert_eq!(
+            // Internal invariant (gates construct same-modulus values);
+            // the public `set` keeps its hard assert.
+            debug_assert_eq!(
                 self.values[w.wid].modulus, v.modulus,
-                "modulus mismatch on wire {}: expected {}, got {}",
-                w.wid, self.values[w.wid].modulus, v.modulus
+                "modulus mismatch on wire {}",
+                w.wid
             );
             self.values[w.wid] = v;
             if self.record {

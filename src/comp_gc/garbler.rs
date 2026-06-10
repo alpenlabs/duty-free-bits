@@ -46,6 +46,7 @@ fn switch_hash(
     gid: GateId,
     ctrl_mask: &Label,
     bulk_cache: &mut BulkCache,
+    nonce_base: u64,
 ) -> Label {
     if let Some((group_idx, member_idx)) = system.gate_group(gid) {
         let group = system.switch_group(group_idx);
@@ -63,7 +64,12 @@ fn switch_hash(
         let Gate::Switch { out, .. } = system.gates[gid] else {
             unreachable!("switch_hash on non-switch gate {gid}");
         };
-        hash::hash_solo(ctrl_mask, gid, system.is_cf(out), system.modulus(out))
+        hash::hash_solo(
+            ctrl_mask,
+            nonce_base + gid as u64,
+            system.is_cf(out),
+            system.modulus(out),
+        )
     }
 }
 
@@ -161,8 +167,17 @@ pub fn garble(
     input_masks: &[Label],
     output_wires: &[Wire],
     delta: u128,
+    nonce_base: u64,
 ) -> Program {
-    garble_impl(system, input_wires, input_masks, output_wires, delta, None)
+    garble_impl(
+        system,
+        input_wires,
+        input_masks,
+        output_wires,
+        delta,
+        None,
+        nonce_base,
+    )
 }
 
 /// [`garble`], additionally recording the mask-derivation tape.
@@ -182,6 +197,7 @@ pub fn garble_recorded(
     input_masks: &[Label],
     output_wires: &[Wire],
     delta: u128,
+    nonce_base: u64,
 ) -> (Program, Vec<JournalEntry>) {
     assert!(
         system.num_wires() <= u32::MAX as usize && system.num_gates() <= u32::MAX as usize,
@@ -195,6 +211,7 @@ pub fn garble_recorded(
         output_wires,
         delta,
         Some(&mut tape),
+        nonce_base,
     );
     (program, tape)
 }
@@ -208,6 +225,7 @@ fn garble_impl(
     output_wires: &[Wire],
     delta: u128,
     mut tape: Option<&mut Vec<JournalEntry>>,
+    nonce_base: u64,
 ) -> Program {
     let mut masks = seed_masks(system, input_wires, input_masks, delta);
     let mut wl = Worklist::new(system.num_wires(), system.num_gates());
@@ -246,6 +264,7 @@ fn garble_impl(
             &mut wl,
             &mut bulk_cache,
             tape.as_deref_mut(),
+            nonce_base,
         ) {
             wl.mark_done(gid);
         }
@@ -281,6 +300,7 @@ pub fn garble_replay(
     output_wires: &[Wire],
     delta: u128,
     tape: &[JournalEntry],
+    nonce_base: u64,
 ) -> Program {
     let mut masks = seed_masks(system, input_wires, input_masks, delta);
 
@@ -360,7 +380,7 @@ pub fn garble_replay(
                 if wid != out.wid && wid != data.wid {
                     bad_wid()
                 }
-                let h = switch_hash(system, gid, mask(ctrl), &mut bulk_cache);
+                let h = switch_hash(system, gid, mask(ctrl), &mut bulk_cache, nonce_base);
                 if wid == out.wid {
                     label::add(&h, mask(data))
                 } else {
@@ -404,6 +424,7 @@ pub fn garble_replay(
 /// Fire gate `gid` once; returns true when the gate can never derive a new
 /// wire. Invariant: `wl.wire_known(w)` ⇔ `masks[w].is_some()` — definedness is
 /// read from the bitset; `masks` is loaded only for operands.
+#[allow(clippy::too_many_arguments)]
 fn propagate_gate(
     system: &System,
     gid: GateId,
@@ -411,6 +432,7 @@ fn propagate_gate(
     wl: &mut Worklist,
     bulk_cache: &mut BulkCache,
     mut tape: Option<&mut Vec<JournalEntry>>,
+    nonce_base: u64,
 ) -> bool {
     match system.gates[gid] {
         Gate::Add { in0, in1, out } => {
@@ -508,7 +530,13 @@ fn propagate_gate(
             let need_out = !wl.wire_known(out.wid) && wl.wire_known(data.wid);
             let need_data = !wl.wire_known(data.wid) && wl.wire_known(out.wid);
             if (need_out || need_data) && wl.wire_known(ctrl.wid) {
-                let h = switch_hash(system, gid, masks[ctrl.wid].as_ref().unwrap(), bulk_cache);
+                let h = switch_hash(
+                    system,
+                    gid,
+                    masks[ctrl.wid].as_ref().unwrap(),
+                    bulk_cache,
+                    nonce_base,
+                );
                 if need_out {
                     let v = label::add(&h, masks[data.wid].as_ref().unwrap());
                     try_set(masks, out, v, gid, wl, system, tape.as_deref_mut());
@@ -647,13 +675,14 @@ mod tests {
                     .collect();
                 let delta: u128 = rng.random();
 
-                let expected = garble(&sys, &bit_wires, &input_masks, &h_p, delta);
-                let (recorded, tape) = garble_recorded(&sys, &bit_wires, &input_masks, &h_p, delta);
+                let expected = garble(&sys, &bit_wires, &input_masks, &h_p, delta, 0);
+                let (recorded, tape) =
+                    garble_recorded(&sys, &bit_wires, &input_masks, &h_p, delta, 0);
                 assert_programs_equal(&sys, &expected, &recorded, &format!("p={p} r={round}"));
                 assert!(!tape.is_empty(), "header derivation must tape entries");
 
                 // Self-replay: the tape reproduces the Program on its own system.
-                let replayed = garble_replay(&sys, &bit_wires, &input_masks, &h_p, delta, &tape);
+                let replayed = garble_replay(&sys, &bit_wires, &input_masks, &h_p, delta, &tape, 0);
                 assert_programs_equal(
                     &sys,
                     &expected,
@@ -680,7 +709,7 @@ mod tests {
             .iter()
             .map(|_| sample_cf_mask(&mut rng, 1u64 << ell))
             .collect();
-        let (_prog_a, tape) = garble_recorded(&sys_a, &in_a, &masks_a, &out_a, rng.random());
+        let (_prog_a, tape) = garble_recorded(&sys_a, &in_a, &masks_a, &out_a, rng.random(), 0);
 
         for round in 0..3 {
             let masks_b: Vec<Label> = in_b
@@ -688,8 +717,8 @@ mod tests {
                 .map(|_| sample_cf_mask(&mut rng, 1u64 << ell))
                 .collect();
             let delta_b: u128 = rng.random();
-            let expected = garble(&sys_b, &in_b, &masks_b, &out_b, delta_b);
-            let replayed = garble_replay(&sys_b, &in_b, &masks_b, &out_b, delta_b, &tape);
+            let expected = garble(&sys_b, &in_b, &masks_b, &out_b, delta_b, 0);
+            let replayed = garble_replay(&sys_b, &in_b, &masks_b, &out_b, delta_b, &tape, 0);
             assert_programs_equal(&sys_b, &expected, &replayed, &format!("cross r={round}"));
         }
     }
@@ -711,8 +740,9 @@ mod tests {
         let wb = sys_b.alloc_wire(16); // never masked
         let _yb = sys_b.mul(3, wb); // gate 0: same kind, different dependency
         let mask = sample_cf_mask(&mut rng, 16);
-        let (_prog, tape) = garble_recorded(&sys_a, &[xa], std::slice::from_ref(&mask), &[za], 1);
-        garble_replay(&sys_b, &[xb], &[mask], &[], 7, &tape);
+        let (_prog, tape) =
+            garble_recorded(&sys_a, &[xa], std::slice::from_ref(&mask), &[za], 1, 0);
+        garble_replay(&sys_b, &[xb], &[mask], &[], 7, &tape, 0);
     }
 
     #[test]
@@ -731,7 +761,7 @@ mod tests {
         let yb = sys_b.input(16);
         sys_b.join(xb, yb); // gate 0: different gate kind at the taped gid
         let masks: Vec<Label> = (0..2).map(|_| sample_cf_mask(&mut rng, 16)).collect();
-        let (_prog, tape) = garble_recorded(&sys_a, &[xa, ya], &masks, &[ta], 1);
-        garble_replay(&sys_b, &[xb, yb], &masks, &[], 7, &tape);
+        let (_prog, tape) = garble_recorded(&sys_a, &[xa, ya], &masks, &[ta], 1, 0);
+        garble_replay(&sys_b, &[xb, yb], &masks, &[], 7, &tape, 0);
     }
 }
