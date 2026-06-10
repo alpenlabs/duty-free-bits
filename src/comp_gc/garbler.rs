@@ -299,14 +299,25 @@ pub fn garble_replay(
                 )
             })
         };
+        // Every arm verifies the taped wid is actually a wire of gate gid —
+        // a tape from a structurally different system must fail loudly, never
+        // write to an unrelated wire.
+        let bad_wid = || -> ! {
+            panic!(
+                "garble_replay: tape pairs gate {gid} with wire {wid}, which the \
+                 gate does not touch — tape/system structure mismatch"
+            )
+        };
         let v = match system.gates[gid] {
             Gate::Add { in0, in1, out } => {
                 if wid == out.wid {
                     label::add(mask(in0), mask(in1)) // out = in0 + in1
                 } else if wid == in0.wid {
                     label::sub(mask(out), mask(in1)) // in0 = out - in1
-                } else {
+                } else if wid == in1.wid {
                     label::sub(mask(out), mask(in0)) // in1 = out - in0
+                } else {
+                    bad_wid()
                 }
             }
             Gate::Sub { in0, in1, out } => {
@@ -314,12 +325,16 @@ pub fn garble_replay(
                     label::sub(mask(in0), mask(in1)) // out = in0 - in1
                 } else if wid == in0.wid {
                     label::add(mask(out), mask(in1)) // in0 = out + in1
-                } else {
+                } else if wid == in1.wid {
                     label::sub(mask(in0), mask(out)) // in1 = in0 - out
+                } else {
+                    bad_wid()
                 }
             }
             Gate::Mul { in0, scalar, out } => {
-                debug_assert_eq!(wid, out.wid);
+                if wid != out.wid {
+                    bad_wid()
+                }
                 if scalar == 0 {
                     Label::zero(system.is_cf(out), system.modulus(out))
                 } else {
@@ -327,17 +342,24 @@ pub fn garble_replay(
                 }
             }
             Gate::Mod2k { in0, k, out } => {
-                debug_assert_eq!(wid, out.wid);
+                if wid != out.wid {
+                    bad_wid()
+                }
                 label::mod2k(mask(in0), k)
             }
             Gate::Div2k { in0, k, out } => {
-                debug_assert_eq!(wid, out.wid);
+                if wid != out.wid {
+                    bad_wid()
+                }
                 label::div2k(mask(in0), k)
             }
             Gate::Switch { data, ctrl, out } => {
                 // out = H(ctrl, gid) + data  ⇔  data = out - H(ctrl, gid).
                 // Unlike the evaluator's replay there is no control-value
                 // check: the garbler propagates switch masks unconditionally.
+                if wid != out.wid && wid != data.wid {
+                    bad_wid()
+                }
                 let h = switch_hash(system, gid, mask(ctrl), &mut bulk_cache);
                 if wid == out.wid {
                     label::add(&h, mask(data))
@@ -355,8 +377,10 @@ pub fn garble_replay(
             Gate::SameWire { a, b } => {
                 if wid == b.wid {
                     mask(a).clone()
-                } else {
+                } else if wid == a.wid {
                     mask(b).clone()
+                } else {
+                    bad_wid()
                 }
             }
         };

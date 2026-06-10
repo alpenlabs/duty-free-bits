@@ -183,14 +183,25 @@ pub fn replay_with_labels(
                 .as_ref()
                 .unwrap_or_else(|| panic!("replay: operand wire {} unlabeled", w.wid))
         };
+        // Every arm verifies the journaled wid is actually a wire of gate gid —
+        // a journal from a different Exec/System must fail loudly, never write
+        // to an unrelated wire.
+        let bad_wid = || -> ! {
+            panic!(
+                "replay: journal pairs gate {gid} with wire {wid}, which the \
+                 gate does not touch — journal/system mismatch"
+            )
+        };
         let v = match system.gates[gid] {
             Gate::Add { in0, in1, out } => {
                 if wid == out.wid {
                     label::add(lbl(in0), lbl(in1)) // out = in0 + in1
                 } else if wid == in0.wid {
                     label::sub(lbl(out), lbl(in1)) // in0 = out - in1
-                } else {
+                } else if wid == in1.wid {
                     label::sub(lbl(out), lbl(in0)) // in1 = out - in0
+                } else {
+                    bad_wid()
                 }
             }
             Gate::Sub { in0, in1, out } => {
@@ -198,12 +209,16 @@ pub fn replay_with_labels(
                     label::sub(lbl(in0), lbl(in1)) // out = in0 - in1
                 } else if wid == in0.wid {
                     label::add(lbl(out), lbl(in1)) // in0 = out + in1
-                } else {
+                } else if wid == in1.wid {
                     label::sub(lbl(in0), lbl(out)) // in1 = in0 - out
+                } else {
+                    bad_wid()
                 }
             }
             Gate::Mul { in0, scalar, out } => {
-                debug_assert_eq!(wid, out.wid);
+                if wid != out.wid {
+                    bad_wid()
+                }
                 if scalar == 0 {
                     Label::zero(system.is_cf(out), system.modulus(out))
                 } else {
@@ -211,17 +226,24 @@ pub fn replay_with_labels(
                 }
             }
             Gate::Mod2k { in0, k, out } => {
-                debug_assert_eq!(wid, out.wid);
+                if wid != out.wid {
+                    bad_wid()
+                }
                 label::mod2k(lbl(in0), k)
             }
             Gate::Div2k { in0, k, out } => {
-                debug_assert_eq!(wid, out.wid);
+                if wid != out.wid {
+                    bad_wid()
+                }
                 label::div2k(lbl(in0), k)
             }
             Gate::Switch { data, ctrl, out } => {
                 // Exec fires a switch only when its control value is 0; a
                 // journal from a different Exec/input would silently produce
                 // garbage labels here, so check unconditionally.
+                if wid != out.wid && wid != data.wid {
+                    bad_wid()
+                }
                 assert_eq!(values[ctrl.wid].v, 0, "replay: switch {gid} open");
                 let h = switch_hash(system, gid, lbl(ctrl), &mut bulk_cache);
                 if wid == out.wid {
@@ -237,15 +259,19 @@ pub fn replay_with_labels(
                     .unwrap_or_else(|| panic!("missing join diff for gate {}", gid));
                 if wid == bw.wid {
                     label::sub(lbl(aw), diff)
-                } else {
+                } else if wid == aw.wid {
                     label::add(lbl(bw), diff)
+                } else {
+                    bad_wid()
                 }
             }
             Gate::SameWire { a: aw, b: bw } => {
                 if wid == bw.wid {
                     lbl(aw).clone()
-                } else {
+                } else if wid == aw.wid {
                     lbl(bw).clone()
+                } else {
+                    bad_wid()
                 }
             }
         };

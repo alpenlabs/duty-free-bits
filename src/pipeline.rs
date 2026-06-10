@@ -285,7 +285,9 @@ impl Pipeline {
             None => garble(&sys, &input_wires, &input_masks, &output_wires, self.delta),
             Some(key) => match self.garble_tapes.get(key) {
                 Some((num_gates, num_wires, tape)) => {
-                    debug_assert_eq!(
+                    // Hard assert: a shape-key collision (e.g. a Pipeline
+                    // reused across parameter sets) must not reach replay.
+                    assert_eq!(
                         (*num_gates, *num_wires),
                         (sys.num_gates(), sys.num_wires()),
                         "phase shape diverged for key {key:?}"

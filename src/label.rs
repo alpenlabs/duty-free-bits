@@ -547,6 +547,12 @@ pub fn mod2k(x: &Label, k_out: u32) -> Label {
 ///
 /// Output modulus = input_modulus / 2^k.
 pub fn div2k(x: &Label, k: u32) -> Label {
+    // k = 0 is the identity (zero low 0 bits, divide by 1); the general CF arm
+    // below assumes a Lanes input, which a Z_2 wire (width-1 sub-chunks at
+    // ell ≡ 1 mod 8) is not.
+    if k == 0 {
+        return x.clone();
+    }
     match x {
         Label::Cf(a) => {
             assert!(a.modulus > (1u64 << k));
