@@ -215,15 +215,32 @@ impl LabelArena {
     }
 
     /// dst = a ± b over lanes mod 2^k. `sub` selects subtraction.
+    ///
+    /// `dst` can never alias an operand (it is undefined, operands are
+    /// defined), but `a == b` is legal (`add(x, x)`).
     #[inline]
     fn addsub_lanes(&mut self, dst: Slot, a: Slot, b: Slot, sub: bool) {
         let k = dst.k();
         debug_assert!(a.k() == k && b.k() == k);
         let mask = lane_mask(k);
+        if a.index() == b.index() {
+            let [d, av] = self
+                .lanes
+                .get_disjoint_mut([dst.index(), a.index()])
+                .expect("arena dst must differ from operands");
+            if sub {
+                d.fill(0); // a - a = 0
+            } else {
+                for i in 0..LAMBDA {
+                    d[i] = av[i].wrapping_add(av[i]) & mask; // a + a
+                }
+            }
+            return;
+        }
         let [d, av, bv] = self
             .lanes
             .get_disjoint_mut([dst.index(), a.index(), b.index()])
-            .expect("arena slots must be distinct");
+            .expect("arena dst must differ from operands");
         if sub {
             for i in 0..LAMBDA {
                 d[i] = av[i].wrapping_sub(bv[i]) & mask;
@@ -820,10 +837,24 @@ pub(crate) fn garble_compiled(
             }
             OP_ADD_L | OP_SUB_L => {
                 let mask = lane_mask(ins.k as u32);
+                if a == b {
+                    let [dv, av] = arena
+                        .lanes
+                        .get_disjoint_mut([d, a])
+                        .expect("compiled dst must differ from operands");
+                    if ins.op == OP_SUB_L {
+                        dv.fill(0);
+                    } else {
+                        for i in 0..LAMBDA {
+                            dv[i] = av[i].wrapping_add(av[i]) & mask;
+                        }
+                    }
+                    continue;
+                }
                 let [dv, av, bv] = arena
                     .lanes
                     .get_disjoint_mut([d, a, b])
-                    .expect("compiled slots are distinct");
+                    .expect("compiled dst must differ from operands");
                 if ins.op == OP_SUB_L {
                     for i in 0..LAMBDA {
                         dv[i] = av[i].wrapping_sub(bv[i]) & mask;

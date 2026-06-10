@@ -162,6 +162,14 @@ pub fn build_s_aff_streaming(
         .map(|&p| (num_batches as u64 + fold_bits as u64) * p)
         .collect();
     let prime_nonce_bases = nonce::windows(KERNEL_NONCE_FLOOR, &prime_window_sizes);
+    // The bulk CCRH domain reserves bit 63; every kernel id must stay below it
+    // (hash_z2/hash_bulk only debug-check this).
+    if let (Some(&base), Some(&size)) = (prime_nonce_bases.last(), prime_window_sizes.last()) {
+        assert!(
+            base + size < (1u64 << 63),
+            "kernel CCRH nonce space exhausted"
+        );
+    }
 
     for (i, &p_i) in params.primes.iter().enumerate() {
         // hot_i = x mod p_i, derived once from x_bits and reused per body batch.
