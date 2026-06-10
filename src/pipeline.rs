@@ -58,6 +58,14 @@ pub struct PhaseStats {
     pub switch_groups: usize,
     /// Bits emitted into the program by this phase.
     pub program_bits: usize,
+    /// Wall time building the phase's gates (the caller's closure).
+    pub build_secs: f64,
+    /// Wall time in garble (mask propagation + program emit).
+    pub garble_secs: f64,
+    /// Wall time in the cleartext `Exec` pass.
+    pub exec_secs: f64,
+    /// Wall time in label propagation (excludes the `Exec` pass).
+    pub label_eval_secs: f64,
 }
 
 use crate::it_gc::BatchCost;
@@ -102,6 +110,10 @@ pub struct Pipeline {
     pub garble_secs: f64,
     /// Wall time in eval (label propagation + decode), summed across phases.
     pub eval_secs: f64,
+    /// Portion of `garble_secs` spent in the System-bypass IT-GC kernel.
+    pub kernel_garble_secs: f64,
+    /// Portion of `eval_secs` spent in the System-bypass IT-GC kernel.
+    pub kernel_eval_secs: f64,
 }
 
 impl Pipeline {
@@ -129,6 +141,8 @@ impl Pipeline {
             hash_count_ncf: 0,
             garble_secs: 0.0,
             eval_secs: 0.0,
+            kernel_garble_secs: 0.0,
+            kernel_eval_secs: 0.0,
         }
     }
 
@@ -207,7 +221,9 @@ impl Pipeline {
             })
             .collect();
 
+        let t_build = std::time::Instant::now();
         let output_wires = build(&mut sys, &input_wires);
+        let build_secs = t_build.elapsed().as_secs_f64();
 
         // Garble.
         let input_masks: Vec<Label> = inputs
@@ -216,7 +232,8 @@ impl Pipeline {
             .collect();
         let t_garble = std::time::Instant::now();
         let program = garble(&sys, &input_wires, &input_masks, &output_wires, self.delta);
-        self.garble_secs += t_garble.elapsed().as_secs_f64();
+        let garble_secs = t_garble.elapsed().as_secs_f64();
+        self.garble_secs += garble_secs;
 
         // Evaluate. The evaluator knows x, so it runs a cleartext `Exec` pass to
         // obtain every switch control, then propagates
@@ -225,13 +242,15 @@ impl Pipeline {
             .iter()
             .map(|&id| self.carry(id).label.clone())
             .collect();
-        let t_eval = std::time::Instant::now();
+        let t_exec = std::time::Instant::now();
         let mut exec = Exec::new(&sys);
         for (&w, &id) in input_wires.iter().zip(inputs) {
             let item = self.carry(id);
             exec.set(w, Val::new(item.value, item.modulus));
         }
         exec.run();
+        let exec_secs = t_exec.elapsed().as_secs_f64();
+        let t_eval = std::time::Instant::now();
         let output_labels = eval_with_labels(
             &sys,
             &input_wires,
@@ -241,7 +260,8 @@ impl Pipeline {
             &output_wires,
         );
         let output_values: Vec<u64> = output_wires.iter().map(|&w| exec.get(w).v).collect();
-        self.eval_secs += t_eval.elapsed().as_secs_f64();
+        let label_eval_secs = t_eval.elapsed().as_secs_f64();
+        self.eval_secs += exec_secs + label_eval_secs;
 
         // Output masks live in the program in declaration order.
         let output_masks: Vec<Label> = program.output_masks().to_vec();
@@ -255,6 +275,10 @@ impl Pipeline {
             gates: sys.num_gates(),
             switch_groups: sys.num_switch_groups(),
             program_bits: program.total_bits(),
+            build_secs,
+            garble_secs,
+            exec_secs,
+            label_eval_secs,
         };
         self.total_wires += stats.wires;
         self.total_gates += stats.gates;
@@ -299,6 +323,8 @@ impl Pipeline {
     pub fn record_kernel_batch(&mut self, garble_secs: f64, eval_secs: f64, cost: BatchCost) {
         self.garble_secs += garble_secs;
         self.eval_secs += eval_secs;
+        self.kernel_garble_secs += garble_secs;
+        self.kernel_eval_secs += eval_secs;
         self.total_program_bits += cost.program_bits;
         self.join_complexity_ncf += cost.join_complexity_ncf;
         self.hash_count_ncf += cost.hash_count_ncf;

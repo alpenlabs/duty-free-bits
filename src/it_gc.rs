@@ -77,17 +77,32 @@ pub fn body_batch_garble(
 
     // pad_i = H(h_p[i]) for each one-hot slot, bulk-packed across the b members.
     let slot_hash = switch_hashes(h_p_masks, group_id_base, b, p_i);
+    let lg_p = hash::lg_modulus(p_i);
+
+    // Accumulate Σ pad_i and Σ g_i·pad_i per member with delayed reduction:
+    // pad < p and g < p with p ≤ 2^9 at concrete params, so even p·p·p < 2^27
+    // stays far from u64 overflow — one `% p` per member replaces one per slot.
+    debug_assert!(
+        (p_i as u128) * (p_i as u128) * (p_i as u128) < (1u128 << 63),
+        "delayed-reduction accumulators would overflow for p = {p_i}"
+    );
+    let mut pad_sum_raw = vec![0u64; b]; // Σ_i pad_i (unreduced)
+    let mut readout_raw = vec![0u64; b]; // Σ_i g_i·pad_i (unreduced)
+    for i in 0..p {
+        let g = truth_table[i] % p_i;
+        let wide = &slot_hash[i];
+        for j in 0..b {
+            let pad = extract_pad(wide, j, lg_p, p_i);
+            pad_sum_raw[j] += pad;
+            readout_raw[j] += g * pad;
+        }
+    }
 
     let mut join_diffs = Vec::with_capacity(b);
     let mut result_masks = Vec::with_capacity(b);
     for j in 0..b {
-        let mut pad_sum = 0u64; // Σ_i pad_i
-        let mut readout = neg_mod(b_batch[j], p_i); // seed −b so decoding restores +b
-        for i in 0..p {
-            let pad = member_pad(&slot_hash[i], j, p_i);
-            pad_sum = mod_add(pad_sum, pad, p_i);
-            readout = mod_add(readout, mod_mul(truth_table[i] % p_i, pad, p_i), p_i);
-        }
+        let pad_sum = pad_sum_raw[j] % p_i;
+        let readout = mod_add(readout_raw[j] % p_i, neg_mod(b_batch[j], p_i), p_i);
         // The one residue sent per map: diff = Σ pad_i + a (mod_sub by −a adds a).
         join_diffs.push(mod_sub(pad_sum, neg_mod(a_batch[j], p_i), p_i));
         result_masks.push(readout);
@@ -139,24 +154,31 @@ pub fn body_batch_eval(
     // Same pads the garbler formed. At a non-hot slot the one-hot bit is 0, so
     // label == mask and the evaluator recomputes pad_i exactly; only pad_hot differs.
     let slot_hash = switch_hashes(h_p_labels, group_id_base, b, p_i);
+    let lg_p = hash::lg_modulus(p_i);
     let g_hot = truth_table[hot] % p_i;
+
+    // Delayed reduction, mirroring `body_batch_garble` (see the bound there).
+    let mut pad_sum_raw = vec![0u64; b]; // Σ_{i≠hot} pad_i  (every pad we can recompute)
+    let mut readout_raw = vec![0u64; b]; // Σ_{i≠hot} g(i)·pad_i
+    for i in 0..p {
+        if i == hot {
+            continue;
+        }
+        let g = truth_table[i] % p_i;
+        let wide = &slot_hash[i];
+        for j in 0..b {
+            let pad = extract_pad(wide, j, lg_p, p_i);
+            pad_sum_raw[j] += pad;
+            readout_raw[j] += g * pad;
+        }
+    }
 
     (0..b)
         .map(|j| {
-            let mut pad_sum = 0u64; // Σ_{i≠hot} pad_i  (every pad we can recompute)
-            let mut readout = 0u64; // Σ_{i≠hot} g(i)·pad_i
-            for i in 0..p {
-                if i == hot {
-                    continue;
-                }
-                let pad = member_pad(&slot_hash[i], j, p_i);
-                pad_sum = mod_add(pad_sum, pad, p_i);
-                readout = mod_add(readout, mod_mul(truth_table[i] % p_i, pad, p_i), p_i);
-            }
             // Open the one hidden pad; the diff leaves `a` sitting on it:
             //   pad_hot + a = diff − Σ_{i≠hot} pad_i.
-            let pad_hot = mod_sub(join_diffs[j], pad_sum, p_i);
-            mod_add(readout, mod_mul(g_hot, pad_hot, p_i), p_i)
+            let pad_hot = mod_sub(join_diffs[j], pad_sum_raw[j] % p_i, p_i);
+            mod_add(readout_raw[j] % p_i, mod_mul(g_hot, pad_hot, p_i), p_i)
         })
         .collect()
 }
@@ -173,13 +195,26 @@ fn switch_hashes(ohe: &[Label], group_id_base: usize, b: usize, p_i: u64) -> Vec
         .collect()
 }
 
-/// Member `j`'s pad `pad_i` (an NCF Z_p residue) sliced from slot `i`'s bulk hash.
+/// Member `j`'s pad `pad_i` (an NCF Z_p residue) sliced from slot `i`'s bulk
+/// hash: bits `[j·lg_p .. (j+1)·lg_p)` of `wide`, reduced into Z_p.
+///
+/// Computes the same value as [`hash::extract_ncf`] (LSB-first bit slice, then
+/// `% p`), but via a single word load instead of a per-bit loop, and a
+/// compare-subtract instead of a division (`acc < 2^⌈lg p⌉ < 2p`).
 #[inline(always)]
-fn member_pad(slot_hash: &[u8], member_idx: usize, p: u64) -> u64 {
-    match hash::extract_ncf(slot_hash, member_idx, p) {
-        Label::Ncf(n) => n.rep,
-        _ => unreachable!(),
-    }
+fn extract_pad(wide: &[u8], member_idx: usize, lg_p: usize, p: u64) -> u64 {
+    debug_assert!(lg_p <= 25, "extract_pad word load covers ≤ 25-bit slices");
+    let bit_off = member_idx * lg_p;
+    let byte = bit_off / 8;
+    let shift = bit_off % 8;
+    // Gather up to 4 bytes (lg_p + shift ≤ 32 bits); the tail copy keeps the
+    // last members of the buffer in bounds.
+    let mut raw = [0u8; 4];
+    let take = (wide.len() - byte).min(4);
+    raw[..take].copy_from_slice(&wide[byte..byte + take]);
+    let acc = (u32::from_le_bytes(raw) >> shift) as u64 & ((1u64 << lg_p) - 1);
+    // acc < 2^⌈log₂ p⌉ < 2p, so one conditional subtract equals `acc % p`.
+    if acc >= p { acc - p } else { acc }
 }
 
 // NCF Z_p label algebra. A label is its residue, so the gate operations are

@@ -120,7 +120,10 @@ pub fn val_add(x: Val, y: Val) -> Val {
     if x.is_none() || y.is_none() {
         return Val::none(x.modulus);
     }
-    Val::new((x.v + y.v) % x.modulus, x.modulus)
+    // Both operands are reduced, so one compare-subtract replaces the division.
+    let s = x.v + y.v;
+    let v = if s >= x.modulus { s - x.modulus } else { s };
+    Val::new(v, x.modulus)
 }
 
 /// Subtract two values in the same ring.
@@ -129,7 +132,12 @@ pub fn val_sub(x: Val, y: Val) -> Val {
     if x.is_none() || y.is_none() {
         return Val::none(x.modulus);
     }
-    Val::new((x.modulus + x.v - y.v) % x.modulus, x.modulus)
+    let v = if x.v >= y.v {
+        x.v - y.v
+    } else {
+        x.v + x.modulus - y.v
+    };
+    Val::new(v, x.modulus)
 }
 
 /// Scalar multiplication: s * x in x's ring.
@@ -137,8 +145,14 @@ pub fn val_mul(s: u64, x: Val) -> Val {
     if x.is_none() {
         return Val::none(x.modulus);
     }
-    let p = ((s as u128) * (x.v as u128)) % (x.modulus as u128);
-    Val::new(p as u64, x.modulus)
+    // Stay in u64 when the product can't overflow (always at concrete params:
+    // moduli ≤ 2^22 and scalars reduced or small); fall back to u128 otherwise.
+    let s_mod = if s < x.modulus { s } else { s % x.modulus };
+    let v = match s_mod.checked_mul(x.v) {
+        Some(p) => p % x.modulus,
+        None => (((s_mod as u128) * (x.v as u128)) % (x.modulus as u128)) as u64,
+    };
+    Val::new(v, x.modulus)
 }
 
 /// Reduce x modulo 2^k.

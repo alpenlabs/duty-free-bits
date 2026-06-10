@@ -156,41 +156,55 @@ fn propagate_gate(
     match system.gates[gid] {
         Gate::Add { in0, in1, out } => {
             // out = in0 + in1  ⇔  in0 = out - in1  ⇔  in1 = out - in0
-            let (m0, m1, mo) = (
-                masks[in0.wid].clone(),
-                masks[in1.wid].clone(),
-                masks[out.wid].clone(),
-            );
-            if let (Some(a), Some(b)) = (&m0, &m1) {
-                try_set(masks, out, label::add(a, b), queue, system);
+            // Compute a direction only if its target is still unset: label ops
+            // allocate and (for k>1) walk all λ coordinates, so speculative
+            // recomputation on every wakeup dominated garble time.
+            if masks[out.wid].is_none()
+                && let (Some(a), Some(b)) = (&masks[in0.wid], &masks[in1.wid])
+            {
+                let v = label::add(a, b);
+                try_set(masks, out, v, queue, system);
             }
-            if let (Some(o), Some(b)) = (&mo, &m1) {
-                try_set(masks, in0, label::sub(o, b), queue, system);
+            if masks[in0.wid].is_none()
+                && let (Some(o), Some(b)) = (&masks[out.wid], &masks[in1.wid])
+            {
+                let v = label::sub(o, b);
+                try_set(masks, in0, v, queue, system);
             }
-            if let (Some(a), Some(o)) = (&m0, &mo) {
-                try_set(masks, in1, label::sub(o, a), queue, system);
+            if masks[in1.wid].is_none()
+                && let (Some(a), Some(o)) = (&masks[in0.wid], &masks[out.wid])
+            {
+                let v = label::sub(o, a);
+                try_set(masks, in1, v, queue, system);
             }
         }
         Gate::Sub { in0, in1, out } => {
             // out = in0 - in1  ⇔  in0 = out + in1  ⇔  in1 = in0 - out
-            let (m0, m1, mo) = (
-                masks[in0.wid].clone(),
-                masks[in1.wid].clone(),
-                masks[out.wid].clone(),
-            );
-            if let (Some(a), Some(b)) = (&m0, &m1) {
-                try_set(masks, out, label::sub(a, b), queue, system);
+            if masks[out.wid].is_none()
+                && let (Some(a), Some(b)) = (&masks[in0.wid], &masks[in1.wid])
+            {
+                let v = label::sub(a, b);
+                try_set(masks, out, v, queue, system);
             }
-            if let (Some(o), Some(b)) = (&mo, &m1) {
-                try_set(masks, in0, label::add(o, b), queue, system);
+            if masks[in0.wid].is_none()
+                && let (Some(o), Some(b)) = (&masks[out.wid], &masks[in1.wid])
+            {
+                let v = label::add(o, b);
+                try_set(masks, in0, v, queue, system);
             }
-            if let (Some(a), Some(o)) = (&m0, &mo) {
-                try_set(masks, in1, label::sub(a, o), queue, system);
+            if masks[in1.wid].is_none()
+                && let (Some(a), Some(o)) = (&masks[in0.wid], &masks[out.wid])
+            {
+                let v = label::sub(a, o);
+                try_set(masks, in1, v, queue, system);
             }
         }
         Gate::Mul { in0, scalar, out } => {
             // X_out = s · X_in. When s = 0 this is 0 regardless of X_in, so the
             // gate is fireable without its input being masked.
+            if masks[out.wid].is_some() {
+                return;
+            }
             if scalar == 0 {
                 try_set(
                     masks,
@@ -199,30 +213,45 @@ fn propagate_gate(
                     queue,
                     system,
                 );
-            } else if let Some(a) = masks[in0.wid].clone() {
-                try_set(masks, out, label::scalar_mul(scalar, &a), queue, system);
+            } else if let Some(a) = &masks[in0.wid] {
+                let v = label::scalar_mul(scalar, a);
+                try_set(masks, out, v, queue, system);
             }
         }
         Gate::Mod2k { in0, k, out } => {
-            if let Some(a) = masks[in0.wid].clone() {
-                try_set(masks, out, label::mod2k(&a, k), queue, system);
+            if masks[out.wid].is_none()
+                && let Some(a) = &masks[in0.wid]
+            {
+                let v = label::mod2k(a, k);
+                try_set(masks, out, v, queue, system);
             }
         }
         Gate::Div2k { in0, k, out } => {
-            if let Some(a) = masks[in0.wid].clone() {
-                try_set(masks, out, label::div2k(&a, k), queue, system);
+            if masks[out.wid].is_none()
+                && let Some(a) = &masks[in0.wid]
+            {
+                let v = label::div2k(a, k);
+                try_set(masks, out, v, queue, system);
             }
         }
         Gate::Switch { data, ctrl, out } => {
             // out = H(ctrl, gid) + data  ⇔  data = out - H(ctrl, gid).
             // For grouped switches, H is sliced from a single wide bulk call.
+            // Skip the hash entirely once both sides are determined.
+            let need_out = masks[out.wid].is_none() && masks[data.wid].is_some();
+            let need_data = masks[data.wid].is_none() && masks[out.wid].is_some();
+            if !(need_out || need_data) {
+                return;
+            }
             if let Some(c) = masks[ctrl.wid].clone() {
                 let h = switch_hash(system, gid, &c, bulk_cache);
-                if let Some(d) = masks[data.wid].clone() {
-                    try_set(masks, out, label::add(&h, &d), queue, system);
+                if need_out && let Some(d) = &masks[data.wid] {
+                    let v = label::add(&h, d);
+                    try_set(masks, out, v, queue, system);
                 }
-                if let Some(o) = masks[out.wid].clone() {
-                    try_set(masks, data, label::sub(&o, &h), queue, system);
+                if need_data && let Some(o) = &masks[out.wid] {
+                    let v = label::sub(o, &h);
+                    try_set(masks, data, v, queue, system);
                 }
             }
         }
