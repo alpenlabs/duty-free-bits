@@ -24,34 +24,24 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 pub mod crypto;
 
-/// The S_aff affine-map driver (composes comp_gc + it_gc via the pipeline).
 pub mod affine;
 
-/// Computational Yao garbling (Phase 1).
 pub mod comp_gc;
 
-/// CRT parameters, reconstruction, and big-integer math.
 pub mod crt;
 
-/// Concrete cleartext execution of a system.
 pub mod exec;
 
-/// CCRH core + nonce rules.
 pub mod hash;
 
-/// Information-theoretic GC (Phase 3).
 pub mod it_gc;
 
-/// CF and NCF garbled-circuit labels.
 pub mod label;
 
-/// Streaming garble+eval orchestration.
 pub mod pipeline;
 
-/// The constraint system: wires, gates, derived operations.
 pub mod system;
 
-/// Core types: values, wires, gates, ring arithmetic.
 pub mod types;
 
 #[cfg(test)]

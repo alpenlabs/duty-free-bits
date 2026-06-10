@@ -1,5 +1,6 @@
 //! Kernel-path mod-p OHE folding: the straight-line garble/eval of
-//! [`fold_to_mod_ohe`] (see [`super::convert`]), bypassing the `System`.
+//! [`fold_to_mod_ohe`](super::convert::fold_to_mod_ohe) (see
+//! [`super::convert`]), bypassing the `System`.
 //!
 //! The fold circuit is regular — per folded bit `b`, per slot `r`:
 //!

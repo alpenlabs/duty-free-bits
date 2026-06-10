@@ -15,11 +15,26 @@
 //!   never touches `Label` at all; conversions happen only at phase
 //!   boundaries (carry items, join diffs, output masks).
 //!
+//! Two production engines run here:
+//!
+//! * **[`compile_garble`] / [`garble_compiled`]** — the garbler's recorded
+//!   firing schedule compiles once per phase *shape* into a typed
+//!   instruction stream (with full structural validation at compile time);
+//!   same-shape phases then garble with no `System` access except dynamic
+//!   `Mul` scalar loads.
+//! * **[`fused_eval_arena`]** — the evaluator derives cleartext values and
+//!   labels together through one worklist pass (a direction fires when its
+//!   value operands are known; inductively every value-known wire is also
+//!   label-known).
+//!
+//! The `Label`-path worklist engines in [`super::garbler`] /
+//! [`super::evaluator`] remain the checked references (and the fallback for
+//! shapes the arena does not support); differential tests pin both
+//! production engines against them bit-for-bit.
+//!
 //! Arenas persist across phases: a slot is written by its phase's seeds or
-//! schedule before any read (the same induction that validates the schedule),
-//! so no clearing is needed. A `defined` bitset hard-asserts that invariant —
-//! a foreign tape/journal must fail loudly, never read stale state (matching
-//! the `garble_replay` / `replay_with_labels` misuse contracts).
+//! schedule before any read (the same induction that validates the
+//! schedule), so no clearing is needed.
 //!
 //! Security note: the garbler-side and evaluator-side runs use separate
 //! arenas (the parties never share state); hashing goes through the same
@@ -30,7 +45,7 @@ use crate::crypto::expand;
 use crate::exec::{JournalEntry, Worklist};
 use crate::label::{CfLabel, LAMBDA, Label};
 use crate::system::System;
-use crate::types::{Gate, Val, Wire};
+use crate::types::{Gate, Wire};
 
 /// Packed arena location of a wire: bits 31..30 kind (0 = Z₂, 1 = lanes),
 /// bits 29..24 the lane width k, bits 23..0 the slot index.
@@ -114,13 +129,13 @@ impl WireLayout {
     }
 }
 
-/// Dense mask/label storage for one party. Persistent across phases.
+/// Dense mask/label storage for one party. Persistent across phases: a slot
+/// is written by its phase's seeds or schedule before any read (the same
+/// induction that validates the schedule), so no clearing is needed.
 #[derive(Debug, Default)]
 pub(crate) struct LabelArena {
     z2: Vec<[u64; 2]>,
     lanes: Vec<[u32; LAMBDA]>,
-    /// One bit per wire of the current phase: written this phase.
-    defined: Vec<u64>,
     /// CCRH output scratch (zeroed once; `expand` overwrites the used prefix).
     scratch: Vec<u8>,
 }
@@ -138,48 +153,6 @@ impl LabelArena {
             self.scratch.resize(512, 0);
         }
     }
-
-    /// Size for `layout`, resetting the per-phase definedness.
-    fn begin_phase(&mut self, layout: &WireLayout) {
-        if self.z2.len() < layout.z2_count {
-            self.z2.resize(layout.z2_count, [0; 2]);
-        }
-        if self.lanes.len() < layout.lanes_count {
-            self.lanes.resize(layout.lanes_count, [0; LAMBDA]);
-        }
-        let words = layout.slots.len().div_ceil(64);
-        self.defined.clear();
-        self.defined.resize(words, 0);
-        if self.scratch.len() < 512 {
-            self.scratch.resize(512, 0);
-        }
-    }
-
-    #[inline]
-    fn mark(&mut self, w: Wire) {
-        self.defined[w.wid >> 6] |= 1 << (w.wid & 63);
-    }
-    #[inline]
-    fn is_defined(&self, w: Wire) -> bool {
-        (self.defined[w.wid >> 6] >> (w.wid & 63)) & 1 != 0
-    }
-    /// Hard misuse checks, mirroring the `Label`-path replayers: operands must
-    /// be written this phase, the destination must not be.
-    fn check_write(&self, dst: Wire, srcs: &[Wire]) {
-        assert!(
-            !self.is_defined(dst),
-            "arena: wire {} already written — tape/journal mismatch",
-            dst.wid
-        );
-        for s in srcs {
-            assert!(
-                self.is_defined(*s),
-                "arena: operand wire {} unwritten — tape/journal mismatch",
-                s.wid
-            );
-        }
-    }
-
     // -- Boundary conversions --
 
     fn store_label(&mut self, slot: Slot, l: &Label) {
@@ -206,7 +179,8 @@ impl LabelArena {
         }
     }
 
-    // -- Ops (slots must be pre-checked distinct via check_write) --
+    // -- Ops. A destination never aliases an operand (it is undefined,
+    // operands are defined); only `a == b` aliasing is possible. --
 
     #[inline]
     fn xor_z2(&mut self, dst: Slot, a: Slot, b: Slot) {
@@ -1022,99 +996,6 @@ pub(crate) fn garble_compiled(
     program
 }
 
-/// Seed the garbler's constant masks (`-c·Δ_R`) and declared inputs.
-/// Production garbling runs [`garble_compiled`]; this interpreted path is the
-/// checked reference the differential tests compare against.
-#[allow(dead_code)]
-fn seed_garble(
-    system: &System,
-    layout: &WireLayout,
-    arena: &mut LabelArena,
-    input_wires: &[Wire],
-    input_masks: &[Label],
-    delta: u128,
-) {
-    assert_eq!(input_wires.len(), input_masks.len());
-    let dw = [delta as u64, (delta >> 64) as u64];
-    for wid in 0..system.num_wires() {
-        let v = system.values[wid];
-        if !v.defined {
-            continue;
-        }
-        let w = Wire { wid };
-        let slot = layout.slot(w);
-        let neg_c = if v.v == 0 { 0 } else { v.modulus - v.v };
-        if slot.is_z2() {
-            // -c mod 2 = c: mask is c·Δ₂ (Δ's bits as the packed Z₂ label).
-            arena.z2[slot.index()] = if neg_c == 0 { [0; 2] } else { dw };
-        } else {
-            let nc = neg_c as u32;
-            let d = &mut arena.lanes[slot.index()];
-            for (i, lane) in d.iter_mut().enumerate() {
-                *lane = if (delta >> i) & 1 == 1 { nc } else { 0 };
-            }
-        }
-        arena.mark(w);
-    }
-    for (&w, m) in input_wires.iter().zip(input_masks) {
-        arena.store_label(layout.slot(w), m);
-        arena.mark(w);
-    }
-}
-
-/// Garble by replaying a recorded tape against the arena. Equivalent to
-/// [`super::garbler::garble_replay`] (same schedule-validity contract, same
-/// loud-failure misuse net), with masks in flat storage. `nonce_base` offsets
-/// every solo switch hash: callers allocate `system.num_gates()` fresh ids
-/// per phase so no two phases share a CCRH nonce (paper App. A, Def. 4).
-#[allow(dead_code, clippy::too_many_arguments)]
-pub(crate) fn garble_tape_arena(
-    system: &System,
-    layout: &WireLayout,
-    arena: &mut LabelArena,
-    tape: &[JournalEntry],
-    input_wires: &[Wire],
-    input_masks: &[Label],
-    output_wires: &[Wire],
-    delta: u128,
-    nonce_base: u64,
-) -> Program {
-    arena.begin_phase(layout);
-    seed_garble(system, layout, arena, input_wires, input_masks, delta);
-
-    for &JournalEntry { gid, wid } in tape {
-        step(
-            system,
-            layout,
-            arena,
-            gid as usize,
-            wid as usize,
-            Party::Garbler { nonce_base },
-        );
-    }
-
-    // Emission: join diffs in gate order, then declared output masks.
-    let mut program = Program::with_num_gates(system.num_gates());
-    for (gid, &g) in system.gates.iter().enumerate() {
-        if let Gate::Join { a, b } = g {
-            assert!(
-                arena.is_defined(a) && arena.is_defined(b),
-                "join gate {gid}: side mask unresolved"
-            );
-            program.set_join_diff(gid, arena.diff_label(layout.slot(a), layout.slot(b)));
-        }
-    }
-    for &w in output_wires {
-        assert!(
-            arena.is_defined(w),
-            "output wire {}: mask unresolved",
-            w.wid
-        );
-        program.push_output_mask(arena.load_label(layout.slot(w)));
-    }
-    program
-}
-
 /// Evaluate a garbled system in a single fused pass: cleartext values and
 /// labels derive together through one worklist.
 ///
@@ -1144,7 +1025,7 @@ pub(crate) fn fused_eval_arena(
 ) -> (Vec<Label>, Vec<u64>) {
     assert_eq!(input_wires.len(), input_labels.len());
     assert_eq!(input_wires.len(), input_values.len());
-    arena.begin_phase(layout);
+    arena.ensure(layout.z2_count, layout.lanes_count);
     vals.clear();
     vals.resize(system.num_wires(), 0);
 
@@ -1155,14 +1036,12 @@ pub(crate) fn fused_eval_arena(
         if v.defined {
             let w = Wire { wid };
             arena.zero(layout.slot(w));
-            arena.mark(w);
             vals[wid] = v.v;
             wl.mark_known(wid);
         }
     }
     for ((&w, l), &v) in input_wires.iter().zip(input_labels).zip(input_values) {
         arena.store_label(layout.slot(w), l);
-        arena.mark(w);
         vals[w.wid] = v;
         wl.mark_known(w.wid);
     }
@@ -1185,7 +1064,7 @@ pub(crate) fn fused_eval_arena(
     let labels = output_wires
         .iter()
         .map(|&w| {
-            assert!(arena.is_defined(w), "no label on output wire {}", w.wid);
+            assert!(wl.wire_known(w.wid), "no label on output wire {}", w.wid);
             arena.load_label(layout.slot(w))
         })
         .collect();
@@ -1225,7 +1104,6 @@ fn fused_fire(
             debug_assert!(!wl.wire_known(w.wid));
             vals[w.wid] = $v;
             $label;
-            arena.mark(w);
             wl.mark_known(w.wid);
             wl.wake_subscribers(system.subscriptions().of(w.wid), gid);
         }};
@@ -1388,232 +1266,16 @@ fn fused_fire(
     }
 }
 
-/// Evaluate by replaying the cleartext-execution journal against the arena
-/// (production evaluation runs [`fused_eval_arena`]; this is the checked
-/// reference the differential tests compare against).
-#[allow(dead_code)]
-#[doc(hidden)]
-/// Original doc:
-/// Equivalent to [`super::evaluator::replay_with_labels`] (same journal
-/// contract and misuse net), with labels in flat storage.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn eval_journal_arena(
-    system: &System,
-    layout: &WireLayout,
-    arena: &mut LabelArena,
-    journal: &[JournalEntry],
-    input_wires: &[Wire],
-    input_labels: &[Label],
-    values: &[Val],
-    program: &Program,
-    output_wires: &[Wire],
-    nonce_base: u64,
-) -> Vec<Label> {
-    arena.begin_phase(layout);
-    // Constants: the evaluator's label is 0.
-    for wid in 0..system.num_wires() {
-        if system.values[wid].defined {
-            let w = Wire { wid };
-            arena.zero(layout.slot(w));
-            arena.mark(w);
-        }
-    }
-    for (&w, l) in input_wires.iter().zip(input_labels) {
-        arena.store_label(layout.slot(w), l);
-        arena.mark(w);
-    }
-
-    for &JournalEntry { gid, wid } in journal {
-        step(
-            system,
-            layout,
-            arena,
-            gid as usize,
-            wid as usize,
-            Party::Evaluator {
-                nonce_base,
-                values,
-                program,
-            },
-        );
-    }
-
-    output_wires
-        .iter()
-        .map(|&w| {
-            assert!(arena.is_defined(w), "no label on output wire {}", w.wid);
-            arena.load_label(layout.slot(w))
-        })
-        .collect()
-}
-
-/// Which side's semantics a `step` executes. The two differ only at switches
-/// (the evaluator checks the cleartext control and the garbler never reads
-/// values) and joins (mask-side: never in a tape; label-side: via the diff).
-enum Party<'a> {
-    /// Test-only (production garbling is compiled); see `garble_tape_arena`.
-    #[allow(dead_code)]
-    Garbler { nonce_base: u64 },
-    Evaluator {
-        nonce_base: u64,
-        values: &'a [Val],
-        program: &'a Program,
-    },
-}
-
-/// Execute one schedule entry: gate `gid` derives wire `wid`.
-fn step(
-    system: &System,
-    layout: &WireLayout,
-    arena: &mut LabelArena,
-    gid: usize,
-    wid: usize,
-    party: Party<'_>,
-) {
-    let w = Wire { wid };
-    let dst = layout.slot(w);
-    let bad_wid = || -> ! {
-        panic!(
-            "arena: schedule pairs gate {gid} with wire {wid}, which the gate \
-             does not touch — tape/journal mismatch"
-        )
-    };
-    match system.gates[gid] {
-        Gate::Add { in0, in1, out } | Gate::Sub { in0, in1, out } => {
-            let is_sub = matches!(system.gates[gid], Gate::Sub { .. });
-            // Derivation direction relative to out = in0 ± in1.
-            let (a, b, sub) = if wid == out.wid {
-                (in0, in1, is_sub)
-            } else if wid == in0.wid {
-                (out, in1, !is_sub)
-            } else if wid == in1.wid {
-                if is_sub {
-                    (in0, out, true) // in1 = in0 - out
-                } else {
-                    (out, in0, true) // in1 = out - in0
-                }
-            } else {
-                bad_wid()
-            };
-            arena.check_write(w, &[a, b]);
-            if dst.is_z2() {
-                arena.xor_z2(dst, layout.slot(a), layout.slot(b));
-            } else {
-                arena.addsub_lanes(dst, layout.slot(a), layout.slot(b), sub);
-            }
-        }
-        Gate::Mul { in0, scalar, out } => {
-            if wid != out.wid {
-                bad_wid()
-            }
-            if scalar == 0 {
-                arena.check_write(w, &[]);
-                arena.zero(dst);
-            } else {
-                arena.check_write(w, &[in0]);
-                let src = layout.slot(in0);
-                if dst.is_z2() {
-                    // s odd → copy, s even → zero (s·x mod 2).
-                    if scalar & 1 == 1 {
-                        arena.copy(dst, src);
-                    } else {
-                        arena.zero(dst);
-                    }
-                } else {
-                    arena.mul_lanes(dst, src, scalar);
-                }
-            }
-        }
-        Gate::Mod2k { in0, out, .. } => {
-            if wid != out.wid {
-                bad_wid()
-            }
-            arena.check_write(w, &[in0]);
-            let src = layout.slot(in0);
-            if src.is_z2() {
-                arena.copy(dst, src); // k_in = k_out = 1
-            } else {
-                arena.shift_mask(dst, src, 0);
-            }
-        }
-        Gate::Div2k { in0, k, out } => {
-            if wid != out.wid {
-                bad_wid()
-            }
-            arena.check_write(w, &[in0]);
-            let src = layout.slot(in0);
-            if k == 0 {
-                arena.copy(dst, src);
-            } else {
-                arena.shift_mask(dst, src, k);
-            }
-        }
-        Gate::Switch { data, ctrl, out } => {
-            if wid != out.wid && wid != data.wid {
-                bad_wid()
-            }
-            let domain = match &party {
-                Party::Garbler { nonce_base } => nonce_base + gid as u64,
-                Party::Evaluator {
-                    nonce_base, values, ..
-                } => {
-                    // Exec fires a switch only when its control value is 0.
-                    assert_eq!(values[ctrl.wid].v, 0, "replay: switch {gid} open");
-                    nonce_base + gid as u64
-                }
-            };
-            let (a, sub) = if wid == out.wid {
-                (data, false) // out = data + H
-            } else {
-                (out, true) // data = out - H
-            };
-            arena.check_write(w, &[ctrl, a]);
-            arena.hash_addsub(dst, layout.slot(a), layout.slot(ctrl), domain, sub);
-        }
-        Gate::Join { a, b } => match &party {
-            Party::Garbler { .. } => {
-                panic!("arena: tape entry for Join gate {gid} — joins never propagate masks")
-            }
-            Party::Evaluator { program, .. } => {
-                // diff = X_a − X_b ⇒ label_b = label_a − diff, label_a = label_b + diff.
-                let diff = program
-                    .join_diff(gid)
-                    .unwrap_or_else(|| panic!("missing join diff for gate {gid}"));
-                let (src, sub) = if wid == b.wid {
-                    (a, true)
-                } else if wid == a.wid {
-                    (b, false)
-                } else {
-                    bad_wid()
-                };
-                arena.check_write(w, &[src]);
-                arena.diff_addsub(dst, layout.slot(src), diff, sub);
-            }
-        },
-        Gate::SameWire { a, b } => {
-            let src = if wid == b.wid {
-                a
-            } else if wid == a.wid {
-                b
-            } else {
-                bad_wid()
-            };
-            arena.check_write(w, &[src]);
-            arena.copy(dst, layout.slot(src));
-        }
-    }
-    arena.mark(w);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::comp_gc::convert::{compute_sub_widths, fold_to_mod_ohe, sub_chunk_extract};
+    use crate::comp_gc::eval_with_labels;
     use crate::comp_gc::garbler::{garble, garble_recorded};
-    use crate::comp_gc::{eval_with_labels, replay_with_labels};
     use crate::exec::Exec;
     use crate::label::{self};
     use crate::pipeline::sample_cf_mask;
+    use crate::types::Val;
     use rand::Rng;
 
     /// The NEON even-k unpacker must agree with the scalar window loop on
@@ -1637,10 +1299,11 @@ mod tests {
         }
     }
 
-    /// Arena garble + eval must agree bit-for-bit with the `Label`-path
-    /// reference on the real header circuitry (circular word_to_hot, Mul(0)
-    /// seeding, switches, joins, Z₂ and lanes wires), across primes, inputs
-    /// and deltas.
+    /// The production execution paths — compiled garbling and fused
+    /// value+label evaluation — must agree bit-for-bit with the `Label`-path
+    /// worklist references on the real header circuitry (circular
+    /// word_to_hot, Mul(0) seeding, switches, joins, Z₂ and lanes wires),
+    /// across primes, inputs and deltas.
     #[test]
     fn test_arena_matches_label_path() {
         let mut rng = rand::rng();
@@ -1669,35 +1332,19 @@ mod tests {
                     garble(&sys, &bit_wires, &input_masks, &h_p, delta, nonce_base);
                 assert_eq!(program_ref.output_masks(), program_direct.output_masks());
 
+                // Production garbler: compiled program (output masks AND
+                // join diffs must match the Label-path reference).
                 let layout = WireLayout::build(&sys).expect("CF-only system");
                 let mut arena = LabelArena::default();
-                let program_arena = garble_tape_arena(
-                    &sys,
-                    &layout,
-                    &mut arena,
-                    &tape,
-                    &bit_wires,
-                    &input_masks,
-                    &h_p,
-                    delta,
-                    nonce_base,
-                );
-                assert_eq!(
-                    program_ref.output_masks(),
-                    program_arena.output_masks(),
-                    "garbler arena/label divergence: p={p}, input={input}"
-                );
-                assert_eq!(program_ref.total_bits(), program_arena.total_bits());
-
-                // Compiled program must agree too (including join diffs).
                 let compiled = compile_garble(&sys, &layout, &tape, &bit_wires, &h_p);
                 let program_compiled =
                     garble_compiled(&sys, &compiled, &mut arena, &input_masks, delta, nonce_base);
                 assert_eq!(
                     program_ref.output_masks(),
                     program_compiled.output_masks(),
-                    "compiled garble output divergence: p={p}"
+                    "compiled garble output divergence: p={p}, input={input}"
                 );
+                assert_eq!(program_ref.total_bits(), program_compiled.total_bits());
                 for gid in 0..sys.num_gates() {
                     assert_eq!(
                         program_ref.join_diff(gid),
@@ -1706,29 +1353,22 @@ mod tests {
                     );
                 }
 
-                // Eval side: journal replay, arena vs Label path.
+                // Production evaluator: the fused value+label pass must match
+                // the worklist reference on labels and the cleartext `Exec`
+                // pass on values.
                 let d2 = Label::Cf(label::delta_r(delta, 2));
                 let input_labels: Vec<Label> = input_masks
                     .iter()
                     .enumerate()
                     .map(|(j, m)| label::add(m, &label::scalar_mul((input >> j) & 1, &d2)))
                     .collect();
+                let input_values: Vec<u64> = (0..ell as usize).map(|j| (input >> j) & 1).collect();
                 let mut exec = Exec::new(&sys);
                 for (j, &w) in bit_wires.iter().enumerate() {
                     exec.set(w, Val::new((input >> j) & 1, 2));
                 }
-                exec.run_recorded();
+                exec.run();
 
-                let via_label = replay_with_labels(
-                    &sys,
-                    &bit_wires,
-                    &input_labels,
-                    exec.values(),
-                    &program_ref,
-                    exec.journal(),
-                    &h_p,
-                    nonce_base,
-                );
                 let via_worklist = eval_with_labels(
                     &sys,
                     &bit_wires,
@@ -1738,22 +1378,27 @@ mod tests {
                     &h_p,
                     nonce_base,
                 );
-                assert_eq!(via_label, via_worklist);
-                let via_arena = eval_journal_arena(
+                let mut vals = Vec::new();
+                let (via_fused, fused_values) = fused_eval_arena(
                     &sys,
                     &layout,
                     &mut arena,
-                    exec.journal(),
+                    &mut vals,
                     &bit_wires,
                     &input_labels,
-                    exec.values(),
+                    &input_values,
                     &program_ref,
                     &h_p,
                     nonce_base,
                 );
                 assert_eq!(
-                    via_label, via_arena,
-                    "eval arena/label divergence: p={p}, input={input}"
+                    via_worklist, via_fused,
+                    "fused eval label divergence: p={p}, input={input}"
+                );
+                let exec_values: Vec<u64> = h_p.iter().map(|&w| exec.get(w).v).collect();
+                assert_eq!(
+                    exec_values, fused_values,
+                    "fused eval value divergence: p={p}, input={input}"
                 );
             }
         }

@@ -53,7 +53,8 @@ fn switch_hash(
 /// Evaluate a garbled system at the label level.
 ///
 /// Takes the evaluator's labels for inputs (already including value·Δ_R) plus the
-/// cleartext `values` of every wire (from running [`Exec`] on the evaluator's
+/// cleartext `values` of every wire (from running [`Exec`](crate::exec::Exec)
+/// on the evaluator's
 /// known input `x`), and returns the labels of the requested output wires. The
 /// cleartext values supply switch controls.
 pub fn eval_with_labels(

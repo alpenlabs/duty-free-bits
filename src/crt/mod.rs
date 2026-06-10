@@ -232,7 +232,8 @@ pub fn crt_reconstruct(residues: &[u64], primes: &[u64]) -> U576 {
 
     // Garner's algorithm: find coefficients c_i such that
     //   x = c_0 + c_1·p_0 + c_2·p_0·p_1 + ...
-    // All coefficients are < p_i <= 409, so u128 arithmetic suffices here. TODO: use u16 instead of u128.
+    // u128 arithmetic keeps this correct for any u64 primes; the repeated-use
+    // path with precomputed constants is GarnerDecoder.
     let mut coeffs: Vec<u128> = vec![0; t];
     coeffs[0] = residues[0] as u128;
 
