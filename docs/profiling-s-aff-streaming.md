@@ -327,3 +327,100 @@ Updated roadmap, in descending value:
    chunk-word carries; scoped threads over primes would cut wall time ~4–6×
    on M1 without touching single-core cost (orthogonal to all of the above;
    changes the measurement semantics, so kept out of these numbers).
+
+## 9. Round 3: ~0.22 s → 0.11 s, and the distance to the theoretical floor
+
+Round 3 removed the `System` interpreter from everything regular and
+vectorized the body kernel. Interleaved four-way benchmark (identical machine
+state, full clock — the run reproduced the session's original wall numbers):
+
+| commit | [stream] wall | instructions | cycles |
+|---|---|---|---|
+| pre-round-1 (`10a1a7e`) | 2.10–2.33 s | 41.39 G | 6.69–6.89 G |
+| round-1 (`55557a3`) | 0.49–0.57 s | 7.36 G | 1.78 G |
+| round-2 (`9b14b9a`) | 0.22–0.25 s | 3.71 G | 0.71 G |
+| round-3 (HEAD) | **0.11–0.12 s** | **1.78 G** | **0.36 G** |
+
+**Cumulative: 19× wall, 18.7× cycles, 23× instructions.** The original
+"1 s garble + 1 s eval" is now ≈50 ms garble + ≈60 ms eval.
+
+### What landed
+
+* **Fold kernel** (`comp_gc/fold.rs`): the mod-p OHE fold — the regular,
+  Z₂-only ~60 % of every header circuit — garbles/evaluates as straight-line
+  code on bare `[u64; 2]` label words, like the body kernel. Per (bit, slot):
+  one CCRH block + three XORs; the evaluator recovers the single hot pad
+  backward through the join (`L_h'[hot] = L_bit ⊕ diff ⊕ ⊕_{r≠hot} pads`).
+  Fold ids draw from per-prime bulk-domain nonce windows above
+  `KERNEL_NONCE_FLOOR = 2^32` (the `[0, 2^32)` range stays reserved for
+  in-System switch-group ids). Cost-ledger parity with the System path is
+  asserted by a dedicated test (CF joins and CF hashes identical; the
+  `total_program_bits` telemetry changed meaning — extract output masks
+  replace h_p masks — and is not a parity quantity). Fold kernel wall time:
+  ~1 ms per side for all 80 primes.
+* **Garble-schedule replay** (`garbler.rs` + `pipeline.run_phase_keyed`): the
+  garbler's firing schedule depends only on circuit structure, so the 79
+  odd-prime extract phases (gate-identical; only Mul scalar values differ)
+  and the 32 chunk phases replay one recorded tape with no worklist. The
+  validity contract (identical structure incl. the Mul zero/nonzero pattern)
+  is documented and enforced by per-arm wire-membership panics; p = 2 (whose
+  zero coefficients skip gates) garbles unkeyed.
+* **NEON body kernel** (`it_gc.rs`): 4 members per `uint32x4` group,
+  member-major with register accumulators — one unaligned u64 load per
+  (slot, group), per-lane `vshlq` alignment, vectorized compare-subtract,
+  `vmlaq_n_u32`. Gated on `p³ < 2^32` (u32-lane overflow bound, admits
+  p ≤ 1625) with the scalar path as portable fallback and differential
+  oracle. Body kernel: ~0.6 ns per (slot, member) pair.
+
+### Review findings (fixed)
+
+A second adversarial panel (4 reviewers + verifiers, with reproductions)
+confirmed two majors, both fixed: (1) `garble_replay`/`replay_with_labels`
+arms did not verify the taped wire belongs to the gate — a foreign tape could
+silently fabricate a mask (reproduced); every arm now fails loudly, and the
+pipeline's shape check is a hard assert. (2) A **pre-existing** crash (present
+since before round 1): any parameter set with ell ≡ 1 (mod 8) — e.g. the
+production prime set at n = 32 — panicked in `label::div2k` on the width-1
+sub-chunk; `div2k(_, 0)` is now the identity, with an end-to-end regression
+test. Hardenings: hard asserts on `x_bits` validity, the `r_i < 2^ell` bound,
+and the kernel delayed-reduction bound; edge-regime sweep tests
+(p > 2^first_width, fold_bits = 0, short last chunk, single-prime sets).
+
+### Distance to the theoretical floor
+
+Counting *significant* instructions for this protocol at these parameters
+(both parties, full run):
+
+| component | count | ≈instructions |
+|---|---|---|
+| CCRH/AES (5.55 M λ-blocks, 2 parties) | 5.55 M × ~22 | ~120 M |
+| body kernel MACs (34.4 M pairs, NEON ÷4) | 8.6 M × ~10 | ~90 M |
+| extract lane ops (1.1 M × λ=128 u32 lanes) | 1.1 M × ~40 | ~45 M |
+| fold/Z₂ XORs, exec values, tapes, build, decode | | ~120 M |
+| **floor** | | **~0.4 G** |
+
+Measured: 1.78 G — **~4× above the irreducible floor** (0.36 G cycles ≈
+110 ms ≈ 3× above the ~40 ms cycle floor, since AES and NEON sustain
+higher IPC than the rest). The remaining slack is concentrated in the extract
+phases' per-op abstraction (enum dispatch + `Option` wrapping + one heap
+`Vec<u32>` per lane-op result ≈ 3× the bare lane math), the `Exec` value
+worklist, and `System` construction. Closing it requires the full
+compiled-VM design: flat per-wire label arenas (no enum, no `Option`, no
+per-op allocation) executed by the recorded tapes — a representation rewrite
+of `label.rs`/`garbler.rs`/`evaluator.rs` with modest absolute payoff
+(~70 ms → ~45 ms) and high churn. Orthogonally, the 80 primes are
+independent given the chunk-word carries: scoped threads would cut wall time
+another ~4–6× on this machine without changing per-core cost.
+
+### Updated takeaways
+
+* The protocol now runs within ~3–4× of its instruction-counted floor; the
+  cryptography (AES) is ~7 % of remaining cycles, the two hand-written
+  kernels ~30 %, and the residual `System` machinery the rest.
+* Every regular sub-circuit (fold, body) pays ~zero interpretation cost; the
+  only circuits still interpreted are the genuinely irregular ones
+  (`word_to_hot`'s circular construction), and those replay recorded
+  schedules across structurally-identical phases.
+* All protocol-visible quantities — communication bits, CF/NCF hash counts,
+  decoded outputs — are pinned identical to the original System-only
+  implementation by ledger-parity and known-answer tests.
