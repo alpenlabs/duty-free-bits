@@ -1036,3 +1036,91 @@ fn test_streaming_sweep() {
         }
     }
 }
+
+#[test]
+fn test_streaming_edge_regimes() {
+    // Parameter regimes outside the main sweep, each end-to-end against the
+    // known answer:
+    // * primes above 2^first_width (fold h-init leaves zero-mask slots);
+    // * a single sub-chunk (fold_bits = 0: empty fold kernel);
+    // * ell ≡ 1 (mod 8): a trailing width-1 sub-chunk (regression — used to
+    //   panic in label::div2k via div2k(_, 0));
+    // * chunk_size ∤ n: a short, padded last chunk with its own shape key;
+    // * p = 2 alone (extract garbles unkeyed) and one odd prime alone (tape
+    //   recorded, never replayed).
+    let mut rng = rng();
+    let cases: &[(&[u64], u32)] = &[
+        (&[251, 257, 263], 16),  // p > 2^8 = 2^first_width
+        (&[3, 5, 7], 4),         // single sub-chunk, fold_bits = 0
+        (&[3, 5, 7, 11, 13], 8), // ell = 9 → sub_widths [8, 1]
+        (&[3, 5, 7, 11, 13], 9), // cs = 4, chunks [4, 4, 1]: short last chunk
+        (&[2], 4),               // p = 2 only: no tape ever recorded
+        (&[13], 6),              // one odd prime: tape recorded, never replayed
+    ];
+    for &(primes, n) in cases {
+        let params = CrtParams::from_primes(primes, n);
+        let m: u128 = primes.iter().map(|&p| p as u128).product();
+        for _ in 0..3 {
+            let s_dim = 3usize;
+            let a_vals: Vec<u64> = (0..s_dim)
+                .map(|_| rng.random_range(0..m.min(u64::MAX as u128) as u64))
+                .collect();
+            let b_vals: Vec<u64> = (0..s_dim)
+                .map(|_| rng.random_range(0..m.min(u64::MAX as u128) as u64))
+                .collect();
+            let x: u64 = rng.random_range(0..(1u64 << n));
+            assert_s_aff_streaming_correct(&params, &a_vals, &b_vals, x, &mut rng);
+        }
+    }
+}
+
+#[test]
+fn test_fold_kernel_cost_matches_system_fold() {
+    // The fold kernel's cost ledger must charge exactly what the System path
+    // charged for the same circuit: per prime, `fold_to_mod_ohe` adds
+    // `fold_bits` CF Z₂ joins and `fold_bits·p` CF Z₂-payload switches. Build
+    // the old full header System and the new extract-only System and assert
+    // the difference equals FoldCost, for several (ell, p).
+    use crate::comp_gc::convert::{compute_sub_widths, fold_to_mod_ohe, sub_chunk_extract};
+    use crate::comp_gc::fold::fold_batch_garble;
+    use crate::pipeline::sample_cf_mask;
+
+    let mut rng = rng();
+    for (ell, primes) in [(11u32, vec![2u64, 5, 29]), (22, vec![2u64, 257, 409])] {
+        let sub_widths = compute_sub_widths(ell, 8);
+        let first_width = sub_widths[0];
+        let fold_bits: usize = sub_widths[1..].iter().map(|&w| w as usize).sum();
+        for &p in &primes {
+            let build = |with_fold: bool| {
+                let mut sys = System::new();
+                let r = sys.input_bits(ell);
+                let ex = sub_chunk_extract(&mut sys, r, &sub_widths);
+                if with_fold {
+                    fold_to_mod_ohe(&mut sys, &ex, p);
+                }
+                sys.cost()
+            };
+            let old = build(true);
+            let new = build(false);
+            let fbh_masks: Vec<_> = (0..1usize << first_width)
+                .map(|_| sample_cf_mask(&mut rng, 2))
+                .collect();
+            let bit_masks: Vec<_> = (0..fold_bits)
+                .map(|_| sample_cf_mask(&mut rng, 2))
+                .collect();
+            let g = fold_batch_garble(p, &fbh_masks, &bit_masks, first_width, 0);
+            assert_eq!(
+                old.join_complexity_cf,
+                new.join_complexity_cf + g.cost.join_complexity_cf,
+                "CF join parity broke for ell={ell}, p={p}"
+            );
+            assert_eq!(
+                old.hash_count_cf,
+                new.hash_count_cf + g.cost.hash_count_cf,
+                "CF hash parity broke for ell={ell}, p={p}"
+            );
+            assert_eq!(old.join_complexity_ncf, new.join_complexity_ncf);
+            assert_eq!(old.hash_count_ncf, new.hash_count_ncf);
+        }
+    }
+}

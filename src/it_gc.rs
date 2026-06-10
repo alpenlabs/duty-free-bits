@@ -251,7 +251,7 @@ fn accumulate_pads(
     pad_sum_raw: &mut [u64],
     readout_raw: &mut [u64],
 ) {
-    debug_assert!(
+    assert!(
         (p_i as u128) * (p_i as u128) * (p_i as u128) < (1u128 << 63),
         "delayed-reduction accumulators would overflow for p = {p_i}"
     );

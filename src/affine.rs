@@ -33,6 +33,14 @@ const MAX_SUB_CHUNK_WIDTH: u32 = 8;
 /// per-phase peak wires low.
 const RESIDUE_BATCH_SIZE: usize = 128;
 
+/// First bulk-domain CCRH id available to the kernels (body + fold).
+///
+/// `[0, 2^32)` is reserved for in-System NCF switch-group indices
+/// ([`crate::system::System::register_ncf_switch_group`]), which share the
+/// bulk domain — keeping the spaces disjoint preserves Definition-4 nonce
+/// freshness even if a future phase registers switch groups.
+const KERNEL_NONCE_FLOOR: u64 = 1 << 32;
+
 /// Garble + evaluate the affine maps as a sequence of independent phases via a
 /// [`Pipeline`]:
 ///
@@ -71,7 +79,7 @@ pub fn build_s_aff_streaming(
     assert_eq!(n, params.n as usize);
     assert_eq!(x_bits.len(), n);
     for &b in x_bits {
-        debug_assert!(b < 2);
+        assert!(b < 2, "x_bits entries must be 0 or 1");
     }
     assert_eq!(a_residues.len(), params.num_primes);
     assert_eq!(b_residues.len(), params.num_primes);
@@ -144,7 +152,7 @@ pub fn build_s_aff_streaming(
         .iter()
         .map(|&p| (num_batches as u64 + fold_bits as u64) * p)
         .collect();
-    let prime_nonce_bases = nonce::windows(0, &prime_window_sizes);
+    let prime_nonce_bases = nonce::windows(KERNEL_NONCE_FLOOR, &prime_window_sizes);
 
     for (i, &p_i) in params.primes.iter().enumerate() {
         // hot_i = x mod p_i, derived once from x_bits and reused per body batch.
@@ -168,7 +176,10 @@ pub fn build_s_aff_streaming(
             .enumerate()
             .map(|(c, &w)| pow2_mod((c * chunk_size) as u32, p_i) * w)
             .sum();
-        debug_assert!(r_i_value < work_mod);
+        assert!(
+            r_i_value < work_mod,
+            "r_i overflows 2^ell — CrtParams.ell undersized for these primes/n"
+        );
         debug_assert_eq!(r_i_value % p_i, hot_i as u64);
 
         // -- Extract phase: r_i + sub_chunk_extract. Carries out the first
