@@ -95,7 +95,7 @@ impl Cost {
     }
 }
 
-/// A group of NCF switches that share one control wire. TODO: maybe the better abstraction is arbitrary payload in (Z_p1 x ... x Z_pn)
+/// A group of NCF switches that share one control wire.
 ///
 /// The garbler/evaluator derives all members' hashes from a single wide CCRH
 /// call keyed on the shared control label and the group id, slicing the
@@ -227,7 +227,7 @@ impl System {
     /// Allocate a fresh wire in Z_modulus (initially undefined).
     ///
     /// Defaults: CF iff `modulus` is a power of two. Use [`alloc_wire_kind`](Self::alloc_wire_kind) to
-    /// override — e.g. to allocate a NCF Z_{2^k} wire. TODO: maybe this should be the default?
+    /// override — e.g. to allocate a NCF Z_{2^k} wire.
     pub fn alloc_wire(&mut self, modulus: u64) -> Wire {
         self.alloc_wire_kind(modulus, modulus.is_power_of_two())
     }

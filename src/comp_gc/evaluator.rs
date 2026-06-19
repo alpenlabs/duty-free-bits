@@ -105,8 +105,8 @@ pub fn replay_with_labels(
     for &JournalEntry { gid, wid } in journal {
         let gid = gid as usize;
         let wid = wid as usize;
-        // Operands are borrowed (the derived label is written only after the
-        // arm computes it); cloning here heap-copied every lane operand.
+        // Borrow each operand label — the derived label is written only after
+        // the arm computes it, so operands need no clone.
         let lbl = |w: Wire| -> &Label {
             labels[w.wid]
                 .as_ref()
