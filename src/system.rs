@@ -47,7 +47,7 @@ impl SubscriptionCsr {
             "subscription CSR uses u32 ids/offsets"
         );
         // Counting sort by wire id; gate order within a wire is preserved
-        // (matches the old push order).
+        // (insertion order is preserved).
         let mut offsets = vec![0u32; num_wires + 1];
         for &(wid, _) in edges {
             offsets[wid as usize + 1] += 1;
@@ -152,8 +152,7 @@ impl System {
             .sub_csr
             .get_or_init(|| SubscriptionCsr::build(self.values.len(), &self.sub_edges));
         // The CSR freezes the graph: extending the System after a propagation
-        // pass would silently run on stale subscriptions, so fail loudly
-        // instead (the old per-wire Vec lists were always current).
+        // pass would silently run on stale subscriptions, so fail loudly.
         assert_eq!(
             csr.gids.len(),
             self.sub_edges.len(),

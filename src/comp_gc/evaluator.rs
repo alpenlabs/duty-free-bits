@@ -1,13 +1,15 @@
-//! Evaluator: decode labels using a worklist, mirroring `Exec`'s structure.
+//! Evaluator: derive output labels by replaying a cleartext-execution journal.
 //!
-//! Each wire's evaluator label ultimately takes the form `X + x·Δ_R` (CF) or
-//! `X + x` (NCF), where `X` is the garbler's mask. Labels are derived in *any*
-//! order the graph permits — forward through affine gates, backward too, and
-//! through switches only when `ctrl = 0`. The control is taken from the
-//! cleartext wire `values`.
+//! Each wire's evaluator label takes the form `X + x·Δ_R` (CF) or `X + x`
+//! (NCF), where `X` is the garbler's mask. The evaluator knows the cleartext
+//! `x`, so it first runs [`Exec`](crate::exec::Exec) to learn every wire's
+//! value (and every switch control), then [`replay_with_labels`] walks that
+//! journal, deriving each label through the same gate direction the value
+//! pass took — forward through affine gates, backward too, and through a
+//! switch only when its control is 0.
 
 use super::program::Program;
-use crate::exec::{JournalEntry, Worklist};
+use crate::exec::JournalEntry;
 use crate::hash;
 use crate::label::{self, Label};
 use crate::system::System;
@@ -50,89 +52,6 @@ fn switch_hash(
     }
 }
 
-/// Evaluate a garbled system at the label level.
-///
-/// Takes the evaluator's labels for inputs (already including value·Δ_R) plus the
-/// cleartext `values` of every wire (from running [`Exec`](crate::exec::Exec)
-/// on the evaluator's
-/// known input `x`), and returns the labels of the requested output wires. The
-/// cleartext values supply switch controls.
-pub fn eval_with_labels(
-    system: &System,
-    input_wires: &[Wire],
-    input_labels: &[Label],
-    values: &[Val],
-    program: &Program,
-    output_wires: &[Wire],
-    nonce_base: u64,
-) -> Vec<Label> {
-    assert_eq!(input_wires.len(), input_labels.len());
-    assert_eq!(
-        values.len(),
-        system.num_wires(),
-        "values must cover all wires"
-    );
-
-    let mut labels: Vec<Option<Label>> = vec![None; system.num_wires()];
-    let mut wl = Worklist::new(system.num_wires(), system.num_gates());
-
-    // Constants: evaluator's label is 0 in the appropriate ring.
-    for (wid, slot) in labels.iter_mut().enumerate() {
-        let v = system.values[wid];
-        if !v.defined {
-            continue;
-        }
-        *slot = Some(Label::zero(system.is_cf_flags[wid], v.modulus));
-        wl.mark_known(wid);
-    }
-
-    // Inputs: caller-provided labels.
-    for (&w, lbl) in input_wires.iter().zip(input_labels.iter()) {
-        assert_eq!(
-            lbl.modulus(),
-            system.modulus(w),
-            "input label modulus mismatch"
-        );
-        labels[w.wid] = Some(lbl.clone());
-        wl.mark_known(w.wid);
-    }
-
-    // Seed worklist: every gate subscribed to a currently-labeled wire.
-    let subs = system.subscriptions();
-    for wid in 0..system.num_wires() {
-        if wl.wire_known(wid) {
-            wl.enqueue_all(subs.of(wid));
-        }
-    }
-
-    // Propagate.
-    let mut bulk_cache: BulkCache = vec![None; system.num_switch_groups()];
-    while let Some(gid) = wl.pop_live() {
-        if fire_gate(
-            system,
-            gid,
-            &mut labels,
-            values,
-            program,
-            &mut wl,
-            &mut bulk_cache,
-            nonce_base,
-        ) {
-            wl.mark_done(gid);
-        }
-    }
-
-    // Pull out labels for the requested outputs.
-    output_wires
-        .iter()
-        .map(|&w| {
-            labels[w.wid]
-                .clone()
-                .unwrap_or_else(|| panic!("no label on output wire {}", w.wid))
-        })
-        .collect()
-}
-
 /// Evaluate a garbled system by replaying a cleartext-execution journal.
 ///
 /// `journal` is the set-order record of an [`Exec::run_recorded`] pass
@@ -140,10 +59,9 @@ pub fn eval_with_labels(
 /// propagation derives wires through exactly the same gate directions as value
 /// propagation — joins via the program diff, switches only when the cleartext
 /// control is 0 — so by induction every operand a step reads is label-known
-/// when the step executes, and the result equals [`eval_with_labels`]'s
-/// fixpoint on every value-derivable wire (which includes every output and
-/// every operand). This replaces the worklist with a linear tape: no queue, no
-/// wakeups, no definedness checks.
+/// when the step executes, and each label is the unique value consistent with
+/// the garbled program. The journal is a linear tape: no queue, no wakeups, no
+/// definedness checks.
 ///
 /// [`Exec::run_recorded`]: crate::exec::Exec::run_recorded
 #[allow(clippy::too_many_arguments)]
@@ -303,191 +221,4 @@ pub fn replay_with_labels(
                 .unwrap_or_else(|| panic!("no label on output wire {}", w.wid))
         })
         .collect()
-}
-
-/// Fire gate `gid` once; returns true when the gate can never derive a new
-/// wire. Invariant: `wl.wire_known(w)` ⇔ `labels[w].is_some()` — definedness is
-/// read from the bitset; `labels` is loaded only for operands.
-#[allow(clippy::too_many_arguments)]
-fn fire_gate(
-    system: &System,
-    gid: GateId,
-    labels: &mut [Option<Label>],
-    values: &[Val],
-    program: &Program,
-    wl: &mut Worklist,
-    bulk_cache: &mut BulkCache,
-    nonce_base: u64,
-) -> bool {
-    match system.gates[gid] {
-        Gate::Add { in0, in1, out } => {
-            // Compute a direction only if its target is still unset: label ops
-            // allocate and (for k>1) walk all λ coordinates, so speculative
-            // recomputation on every wakeup dominated eval time.
-            if !wl.wire_known(out.wid) && wl.wire_known(in0.wid) && wl.wire_known(in1.wid) {
-                let v = label::add(
-                    labels[in0.wid].as_ref().unwrap(),
-                    labels[in1.wid].as_ref().unwrap(),
-                ); // out = in0 + in1
-                try_set(labels, out, v, gid, wl, system);
-            }
-            if !wl.wire_known(in0.wid) && wl.wire_known(out.wid) && wl.wire_known(in1.wid) {
-                let v = label::sub(
-                    labels[out.wid].as_ref().unwrap(),
-                    labels[in1.wid].as_ref().unwrap(),
-                ); // in0 = out - in1
-                try_set(labels, in0, v, gid, wl, system);
-            }
-            if !wl.wire_known(in1.wid) && wl.wire_known(out.wid) && wl.wire_known(in0.wid) {
-                let v = label::sub(
-                    labels[out.wid].as_ref().unwrap(),
-                    labels[in0.wid].as_ref().unwrap(),
-                ); // in1 = out - in0
-                try_set(labels, in1, v, gid, wl, system);
-            }
-            wl.wire_known(in0.wid) && wl.wire_known(in1.wid) && wl.wire_known(out.wid)
-        }
-        Gate::Sub { in0, in1, out } => {
-            if !wl.wire_known(out.wid) && wl.wire_known(in0.wid) && wl.wire_known(in1.wid) {
-                let v = label::sub(
-                    labels[in0.wid].as_ref().unwrap(),
-                    labels[in1.wid].as_ref().unwrap(),
-                ); // out = in0 - in1
-                try_set(labels, out, v, gid, wl, system);
-            }
-            if !wl.wire_known(in0.wid) && wl.wire_known(out.wid) && wl.wire_known(in1.wid) {
-                let v = label::add(
-                    labels[out.wid].as_ref().unwrap(),
-                    labels[in1.wid].as_ref().unwrap(),
-                ); // in0 = out + in1
-                try_set(labels, in0, v, gid, wl, system);
-            }
-            if !wl.wire_known(in1.wid) && wl.wire_known(in0.wid) && wl.wire_known(out.wid) {
-                let v = label::sub(
-                    labels[in0.wid].as_ref().unwrap(),
-                    labels[out.wid].as_ref().unwrap(),
-                ); // in1 = in0 - out
-                try_set(labels, in1, v, gid, wl, system);
-            }
-            wl.wire_known(in0.wid) && wl.wire_known(in1.wid) && wl.wire_known(out.wid)
-        }
-        Gate::Mul { in0, scalar, out } => {
-            // label_out = s · label_in; when s = 0 the output label is 0 regardless.
-            if !wl.wire_known(out.wid) {
-                if scalar == 0 {
-                    try_set(
-                        labels,
-                        out,
-                        Label::zero(system.is_cf(out), system.modulus(out)),
-                        gid,
-                        wl,
-                        system,
-                    );
-                } else if wl.wire_known(in0.wid) {
-                    let v = label::scalar_mul(scalar, labels[in0.wid].as_ref().unwrap());
-                    try_set(labels, out, v, gid, wl, system);
-                }
-            }
-            wl.wire_known(out.wid)
-        }
-        Gate::Mod2k { in0, k, out } => {
-            // Forward only; low-bit dropping is not invertible.
-            if !wl.wire_known(out.wid) && wl.wire_known(in0.wid) {
-                let v = label::mod2k(labels[in0.wid].as_ref().unwrap(), k);
-                try_set(labels, out, v, gid, wl, system);
-            }
-            wl.wire_known(out.wid)
-        }
-        Gate::Div2k { in0, k, out } => {
-            if !wl.wire_known(out.wid) && wl.wire_known(in0.wid) {
-                let v = label::div2k(labels[in0.wid].as_ref().unwrap(), k);
-                try_set(labels, out, v, gid, wl, system);
-            }
-            wl.wire_known(out.wid)
-        }
-        Gate::Switch { data, ctrl, out } => {
-            // The control value is known in cleartext (the evaluator knows `x`):
-            // the switch fires iff ctrl = 0. Nothing is revealed by the garbler.
-            let cv = values[ctrl.wid];
-            debug_assert!(!cv.is_none(), "switch {gid}: ctrl value undefined");
-            if cv.v != 0 {
-                // `values` is fixed for the whole run: a defined non-zero
-                // control means the switch is open forever.
-                return !cv.is_none();
-            }
-            // Skip the hash entirely once both sides are determined.
-            let need_out = !wl.wire_known(out.wid) && wl.wire_known(data.wid);
-            let need_data = !wl.wire_known(data.wid) && wl.wire_known(out.wid);
-            // ctrl = 0: we still need the ctrl *label* to form H. Wait for it.
-            if (need_out || need_data) && wl.wire_known(ctrl.wid) {
-                // For grouped switches, H is sliced from a single wide bulk call.
-                let h = switch_hash(
-                    system,
-                    gid,
-                    labels[ctrl.wid].as_ref().unwrap(),
-                    bulk_cache,
-                    nonce_base,
-                );
-                if need_out {
-                    let v = label::add(labels[data.wid].as_ref().unwrap(), &h); // out = data + H
-                    try_set(labels, out, v, gid, wl, system);
-                }
-                if need_data {
-                    let v = label::sub(labels[out.wid].as_ref().unwrap(), &h); // data = out - H
-                    try_set(labels, data, v, gid, wl, system);
-                }
-            }
-            wl.wire_known(data.wid) && wl.wire_known(out.wid)
-        }
-        Gate::Join { a: aw, b: bw } => {
-            // diff = X_a - X_b, so label_b = label_a - diff and label_a = label_b + diff.
-            let ka = wl.wire_known(aw.wid);
-            let kb = wl.wire_known(bw.wid);
-            if ka != kb {
-                let diff = program
-                    .join_diff(gid)
-                    .unwrap_or_else(|| panic!("missing join diff for gate {}", gid));
-                if ka {
-                    let v = label::sub(labels[aw.wid].as_ref().unwrap(), diff);
-                    try_set(labels, bw, v, gid, wl, system);
-                } else {
-                    let v = label::add(labels[bw.wid].as_ref().unwrap(), diff);
-                    try_set(labels, aw, v, gid, wl, system);
-                }
-            }
-            wl.wire_known(aw.wid) && wl.wire_known(bw.wid)
-        }
-        Gate::SameWire { a: aw, b: bw } => {
-            if !wl.wire_known(bw.wid) && wl.wire_known(aw.wid) {
-                let v = labels[aw.wid].clone().unwrap();
-                try_set(labels, bw, v, gid, wl, system);
-            }
-            if !wl.wire_known(aw.wid) && wl.wire_known(bw.wid) {
-                let v = labels[bw.wid].clone().unwrap();
-                try_set(labels, aw, v, gid, wl, system);
-            }
-            wl.wire_known(aw.wid) && wl.wire_known(bw.wid)
-        }
-    }
-}
-
-fn try_set(
-    labels: &mut [Option<Label>],
-    w: Wire,
-    new_label: Label,
-    src: GateId,
-    wl: &mut Worklist,
-    system: &System,
-) {
-    if !wl.wire_known(w.wid) {
-        assert_eq!(
-            new_label.modulus(),
-            system.modulus(w),
-            "modulus mismatch setting wire {}",
-            w.wid
-        );
-        labels[w.wid] = Some(new_label);
-        wl.mark_known(w.wid);
-        wl.wake_subscribers(system.subscriptions().of(w.wid), src);
-    }
 }

@@ -80,7 +80,7 @@ pub fn hash_solo(ctrl_mask: &Label, nonce: u64, out_is_cf: bool, out_modulus: u6
         };
         // value < 2^lg_m ≤ 2·(out_modulus − 1) < 2·out_modulus (lg_m = ⌈log₂ m⌉),
         // so one compare-subtract equals `value % out_modulus`. For modulus ≤ 1,
-        // lg_m = 0 forces value = 0, matching the old `out_modulus == 0` guard.
+        // lg_m = 0 forces value = 0, consistent with the `out_modulus == 0` guard.
         let rep = if out_modulus != 0 && value >= out_modulus {
             value - out_modulus
         } else {
