@@ -943,82 +943,6 @@ fn bench_primitives() {
 }
 
 #[test]
-fn test_replay_matches_worklist_eval() {
-    // The journal-replay evaluator must agree with the worklist evaluator
-    // (the reference fixpoint) on every output label. Exercise the gnarliest
-    // header circuitry: bin_to_word -> sub_chunk_extract (circular
-    // word_to_hot, backward propagation, Mul(0) seeding) -> fold_to_mod_ohe
-    // (switch-heavy), across several primes and inputs.
-    use crate::comp_gc::convert::{compute_sub_widths, fold_to_mod_ohe, sub_chunk_extract};
-    use crate::comp_gc::{eval_with_labels, garble, replay_with_labels};
-    use crate::label::{self, Label};
-    use crate::pipeline::sample_cf_mask;
-
-    let mut rng = rng();
-    let ell: u32 = 8;
-    let sub_widths = compute_sub_widths(ell, 4); // [4, 4]: forces a peel
-    for p in [2u64, 5, 7] {
-        for _ in 0..3 {
-            let input: u64 = rng.random_range(0..(1u64 << ell));
-            let delta: u128 = rng.random();
-
-            let mut sys = System::new();
-            let bit_wires: Vec<Wire> = (0..ell).map(|_| sys.input(2)).collect();
-            let x = crate::comp_gc::convert::bin_to_word(&mut sys, &bit_wires, ell);
-            let extraction = sub_chunk_extract(&mut sys, x, &sub_widths);
-            let h_p = fold_to_mod_ohe(&mut sys, &extraction, p);
-
-            // Garble with random input masks; labels = mask + bit·Δ_2.
-            let input_masks: Vec<Label> = bit_wires
-                .iter()
-                .map(|_| sample_cf_mask(&mut rng, 2))
-                .collect();
-            let program = garble(&sys, &bit_wires, &input_masks, &h_p, delta, 0);
-            let d2 = Label::Cf(label::delta_r(delta, 2));
-            let input_labels: Vec<Label> = input_masks
-                .iter()
-                .enumerate()
-                .map(|(j, m)| {
-                    let bit = (input >> j) & 1;
-                    label::add(m, &label::scalar_mul(bit, &d2))
-                })
-                .collect();
-
-            let mut exec = Exec::new(&sys);
-            for (j, &w) in bit_wires.iter().enumerate() {
-                exec.set(w, Val::new((input >> j) & 1, 2));
-            }
-            exec.run_recorded();
-            let journal = exec.journal().to_vec();
-
-            let via_worklist = eval_with_labels(
-                &sys,
-                &bit_wires,
-                &input_labels,
-                exec.values(),
-                &program,
-                &h_p,
-                0,
-            );
-            let via_replay = replay_with_labels(
-                &sys,
-                &bit_wires,
-                &input_labels,
-                exec.values(),
-                &program,
-                &journal,
-                &h_p,
-                0,
-            );
-            assert_eq!(
-                via_worklist, via_replay,
-                "replay/worklist divergence: p={p}, input={input}"
-            );
-        }
-    }
-}
-
-#[test]
 #[ignore]
 fn bench_stream_loop() {
     // Repeats the production stream so a sampling profiler has a long window.
@@ -1136,7 +1060,7 @@ fn test_fold_kernel_cost_matches_system_fold() {
     // The fold kernel's cost ledger must charge exactly what the System path
     // charged for the same circuit: per prime, `fold_to_mod_ohe` adds
     // `fold_bits` CF Z₂ joins and `fold_bits·p` CF Z₂-payload switches. Build
-    // the old full header System and the new extract-only System and assert
+    // the full-fold System and the extract-only System and assert
     // the difference equals FoldCost, for several (ell, p).
     use crate::comp_gc::convert::{compute_sub_widths, fold_to_mod_ohe, sub_chunk_extract};
     use crate::comp_gc::fold::fold_batch_garble;

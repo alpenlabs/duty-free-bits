@@ -22,19 +22,16 @@
 //! (the per-prime extract phases and the chunk phases do). For those:
 //!
 //! * **Garbling** records its worklist schedule on the shape's first phase
-//!   ([`garble_recorded`]), compiles it into a typed instruction stream on the
-//!   second (`compile_garble`), and runs the compiled program from then on
-//!   (`garble_compiled`) — no `System` access except `Mul` scalar loads.
-//!   Setting `DFB_DIFF=1` re-derives every compiled phase through
-//!   [`garble_replay`] and asserts bit-equality.
+//!   ([`garble_recorded`]), compiles it into a typed instruction stream, and
+//!   runs the compiled program from then on (`compile_garble` /
+//!   `garble_compiled` in the `comp_gc::arena` module) — no `System` access
+//!   except `Mul` scalar loads.
 //! * **Evaluation** runs `fused_eval_arena`: one worklist pass deriving
 //!   cleartext values and labels together against flat label arenas.
 //!
-//! Unkeyed phases (and shapes the arena cannot host, e.g. with NCF wires) use
-//! the `Label`-path engines: worklist [`garble`], and a cleartext [`Exec`]
-//! pass whose recorded journal drives [`replay_with_labels`]. Those engines
-//! double as the checked references the differential tests pin the fast paths
-//! against.
+//! Unkeyed phases — and the rare keyed shape the arena cannot host (NCF
+//! wires) — garble with the worklist [`garble`] and evaluate with a cleartext
+//! [`Exec`] pass whose recorded journal drives [`replay_with_labels`].
 //!
 //! Every phase reserves a fresh window of solo-domain CCRH nonces, so no two
 //! switch hashes anywhere in the pipeline share a nonce (paper App. A,
@@ -44,7 +41,7 @@ use crate::comp_gc::Program;
 use crate::comp_gc::arena::{
     CompiledGarble, LabelArena, WireLayout, compile_garble, fused_eval_arena, garble_compiled,
 };
-use crate::comp_gc::garbler::{garble, garble_recorded, garble_replay};
+use crate::comp_gc::garbler::{garble, garble_recorded};
 use crate::comp_gc::replay_with_labels;
 use crate::exec::{Exec, JournalEntry};
 use crate::label::{self, CfLabel, LAMBDA, Label};
@@ -288,12 +285,13 @@ impl Pipeline {
     /// [`run_phase`](Pipeline::run_phase) with garble-schedule caching.
     ///
     /// All phases sharing a `shape_key` must build structurally-identical
-    /// Systems — same gate kinds, wire ids and subscriptions, same `Mul`
-    /// scalar zero/nonzero pattern (the [`garble_replay`] validity contract;
-    /// scalar values, masks and inputs may differ). The first phase records
-    /// the garbler's firing schedule; the rest replay it linearly with no
-    /// worklist. A replay against a structurally-different System fails
-    /// loudly (debug builds also check the gate/wire counts).
+    /// Systems — same gate kinds, wire ids and subscriptions, and the same
+    /// `Mul` scalar zero/nonzero pattern (scalar values, masks and inputs may
+    /// differ). The first phase records the garbler's firing schedule and
+    /// compiles it; every phase of the shape then runs the compiled program
+    /// (no worklist). A shape-key collision is caught by a gate/wire-count
+    /// assert, and the compiled program's structural validation fails loudly
+    /// on any mismatch.
     pub fn run_phase_keyed<F>(
         &mut self,
         phase_name: impl Into<String>,
@@ -462,9 +460,8 @@ impl Pipeline {
     }
 
     /// Garble one phase: the compiled fast path for cached shapes (recording
-    /// and compiling on a shape's first uses), the `Label`-path worklist
-    /// otherwise. `DFB_DIFF=1` re-derives every compiled phase through
-    /// [`garble_replay`] and asserts bit-equality.
+    /// and compiling on a shape's first use), the worklist [`garble`]
+    /// otherwise.
     fn garble_phase(
         &mut self,
         sys: &System,
@@ -494,52 +491,31 @@ impl Pipeline {
                     );
                     match &cache.layout {
                         Some(layout) => {
-                            // First replay compiles (full structural
-                            // validation); later phases run the compiled
-                            // program with no System access.
+                            // The first phase of a shape compiles its tape
+                            // (with full structural validation); every phase of
+                            // the shape then runs the compiled program with no
+                            // System access.
                             let compiled = cache.compiled.get_or_insert_with(|| {
                                 compile_garble(sys, layout, &cache.tape, input_wires, output_wires)
                             });
-                            let prog = garble_compiled(
+                            garble_compiled(
                                 sys,
                                 compiled,
                                 &mut self.garble_arena,
                                 input_masks,
                                 self.delta,
                                 nonce_base,
-                            );
-                            if std::env::var("DFB_DIFF").is_ok() {
-                                let reference = garble_replay(
-                                    sys,
-                                    input_wires,
-                                    input_masks,
-                                    output_wires,
-                                    self.delta,
-                                    &cache.tape,
-                                    nonce_base,
-                                );
-                                assert_eq!(
-                                    reference.output_masks(),
-                                    prog.output_masks(),
-                                    "compiled output masks diverge"
-                                );
-                                for gid in 0..sys.num_gates() {
-                                    assert_eq!(
-                                        reference.join_diff(gid),
-                                        prog.join_diff(gid),
-                                        "compiled join diff diverges at gid {gid}"
-                                    );
-                                }
-                            }
-                            prog
+                            )
                         }
-                        None => garble_replay(
+                        // A keyed shape the arena can't host (none arises in
+                        // the streaming pipeline, whose keyed phases are all
+                        // CF): garble it directly.
+                        None => garble(
                             sys,
                             input_wires,
                             input_masks,
                             output_wires,
                             self.delta,
-                            &cache.tape,
                             nonce_base,
                         ),
                     }

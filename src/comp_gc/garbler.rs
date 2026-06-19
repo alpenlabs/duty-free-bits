@@ -19,14 +19,14 @@
 //! switch-system communication — switches reveal nothing) and appends the
 //! declared output masks.
 //!
-//! Three entry points share one engine (`seed_masks` → propagation →
+//! Two entry points share one engine (`seed_masks` → propagation →
 //! `emit_program`):
 //! * [`garble`] — worklist propagation to fixpoint.
 //! * [`garble_recorded`] — same, additionally recording the firing schedule.
-//! * [`garble_replay`] — walks a recorded schedule linearly (no worklist).
-//!   The schedule depends only on the system's *structure* — never on mask
-//!   values — so the gate-for-gate identical prime-header phases record once
-//!   and replay for the rest.
+//!   The schedule depends only on the system's *structure* (never on mask
+//!   values), so the gate-for-gate identical prime phases record it once and
+//!   subsequent phases of the same shape compile and run it without a
+//!   worklist (see the `arena` module).
 
 use super::program::Program;
 use crate::exec::{JournalEntry, Worklist};
@@ -189,8 +189,8 @@ pub fn garble(
 ///
 /// The firing schedule depends only on the system's *structure* — gate kinds,
 /// wire ids/subscriptions, and the Mul scalar zero/nonzero pattern — never on
-/// mask values, so the tape can drive [`garble_replay`] on any structurally
-/// identical system.
+/// mask values, so the `arena` module compiles the tape once per shape and runs
+/// it for every structurally identical phase.
 pub fn garble_recorded(
     system: &System,
     input_wires: &[Wire],
@@ -268,154 +268,6 @@ fn garble_impl(
         ) {
             wl.mark_done(gid);
         }
-    }
-
-    emit_program(system, &masks, output_wires)
-}
-
-/// Garble by replaying a [`garble_recorded`] tape linearly.
-///
-/// Seeds constants and inputs exactly like [`garble`], then performs one mask
-/// derivation per tape entry — no worklist, no wakeups, no definedness checks
-/// — and returns the identical [`Program`] that [`garble`] would.
-///
-/// # Validity contract
-///
-/// The tape must come from `garble_recorded` on a `System` with **identical
-/// structure**: same gate kinds, wire ids and subscriptions, and the same Mul
-/// scalar zero/nonzero pattern (a `Mul(0)` fires with no input; a
-/// `Mul(nonzero)` needs its input — a different dependency). Scalar *values*
-/// may differ otherwise; input masks and `delta` may differ freely. The firing
-/// schedule depends only on that structure, so the replay derives exactly the
-/// masks the worklist would.
-///
-/// A tape replayed against a structurally different system fails loudly,
-/// never silently: operand loads panic on unmasked wires, every write
-/// hard-asserts the target is not already masked, and a Join entry panics
-/// (joins never propagate masks, so they cannot appear in a garbler tape).
-pub fn garble_replay(
-    system: &System,
-    input_wires: &[Wire],
-    input_masks: &[Label],
-    output_wires: &[Wire],
-    delta: u128,
-    tape: &[JournalEntry],
-    nonce_base: u64,
-) -> Program {
-    let mut masks = seed_masks(system, input_wires, input_masks, delta);
-
-    let mut bulk_cache: BulkCache = vec![None; system.num_switch_groups()];
-    for &JournalEntry { gid, wid } in tape {
-        let gid = gid as usize;
-        let wid = wid as usize;
-        // Operands are borrowed (the derived mask is written only after the
-        // arm computes it). A missing operand means the tape does not match
-        // this system's structure — fail loudly.
-        let mask = |w: Wire| -> &Label {
-            masks[w.wid].as_ref().unwrap_or_else(|| {
-                panic!(
-                    "garble_replay: operand wire {} unmasked — tape/system structure mismatch",
-                    w.wid
-                )
-            })
-        };
-        // Every arm verifies the taped wid is actually a wire of gate gid —
-        // a tape from a structurally different system must fail loudly, never
-        // write to an unrelated wire.
-        let bad_wid = || -> ! {
-            panic!(
-                "garble_replay: tape pairs gate {gid} with wire {wid}, which the \
-                 gate does not touch — tape/system structure mismatch"
-            )
-        };
-        let v = match system.gates[gid] {
-            Gate::Add { in0, in1, out } => {
-                if wid == out.wid {
-                    label::add(mask(in0), mask(in1)) // out = in0 + in1
-                } else if wid == in0.wid {
-                    label::sub(mask(out), mask(in1)) // in0 = out - in1
-                } else if wid == in1.wid {
-                    label::sub(mask(out), mask(in0)) // in1 = out - in0
-                } else {
-                    bad_wid()
-                }
-            }
-            Gate::Sub { in0, in1, out } => {
-                if wid == out.wid {
-                    label::sub(mask(in0), mask(in1)) // out = in0 - in1
-                } else if wid == in0.wid {
-                    label::add(mask(out), mask(in1)) // in0 = out + in1
-                } else if wid == in1.wid {
-                    label::sub(mask(in0), mask(out)) // in1 = in0 - out
-                } else {
-                    bad_wid()
-                }
-            }
-            Gate::Mul { in0, scalar, out } => {
-                if wid != out.wid {
-                    bad_wid()
-                }
-                if scalar == 0 {
-                    Label::zero(system.is_cf(out), system.modulus(out))
-                } else {
-                    label::scalar_mul(scalar, mask(in0))
-                }
-            }
-            Gate::Mod2k { in0, k, out } => {
-                if wid != out.wid {
-                    bad_wid()
-                }
-                label::mod2k(mask(in0), k)
-            }
-            Gate::Div2k { in0, k, out } => {
-                if wid != out.wid {
-                    bad_wid()
-                }
-                label::div2k(mask(in0), k)
-            }
-            Gate::Switch { data, ctrl, out } => {
-                // out = H(ctrl, gid) + data  ⇔  data = out - H(ctrl, gid).
-                // Unlike the evaluator's replay there is no control-value
-                // check: the garbler propagates switch masks unconditionally.
-                if wid != out.wid && wid != data.wid {
-                    bad_wid()
-                }
-                let h = switch_hash(system, gid, mask(ctrl), &mut bulk_cache, nonce_base);
-                if wid == out.wid {
-                    label::add(&h, mask(data))
-                } else {
-                    label::sub(mask(out), &h)
-                }
-            }
-            Gate::Join { .. } => {
-                panic!(
-                    "garble_replay: tape entry for Join gate {gid} — joins never propagate \
-                     masks, so this tape was not recorded by garble_recorded on a \
-                     structurally identical system"
-                )
-            }
-            Gate::SameWire { a, b } => {
-                if wid == b.wid {
-                    mask(a).clone()
-                } else if wid == a.wid {
-                    mask(b).clone()
-                } else {
-                    bad_wid()
-                }
-            }
-        };
-        assert_eq!(
-            v.modulus(),
-            system.modulus(Wire { wid }),
-            "modulus mismatch setting wire {wid}"
-        );
-        // Hard assert (not debug): a duplicate write means the tape does not
-        // match this system's structure.
-        assert!(
-            masks[wid].is_none(),
-            "garble_replay: wire {wid} already masked — tape/system structure mismatch"
-        );
-        masks[wid] = Some(v);
     }
 
     emit_program(system, &masks, output_wires)
@@ -571,7 +423,8 @@ fn propagate_gate(
 
 /// Set `w`'s mask if still unset, wake its subscribers, and (when recording)
 /// append the derivation to `tape` — only writes that actually happen are
-/// taped, so the tape is exactly the firing schedule [`garble_replay`] needs.
+/// taped, so the tape is exactly the firing schedule the compiled garbler
+/// (the `arena` module) needs.
 fn try_set(
     masks: &mut [Option<Label>],
     w: Wire,
@@ -640,26 +493,6 @@ mod tests {
         (sys, bit_wires, h_p)
     }
 
-    /// The pipeline's `r_i` accumulation pattern: `r = Σ coeff_c · w_c` over CF
-    /// chunk-word inputs, then extract + fold. Two calls differing only in
-    /// (nonzero) `coeffs` build structurally identical systems — only the Mul
-    /// scalar VALUES vary.
-    fn build_accum_header(coeffs: &[u64], ell: u32, p: u64) -> (System, Vec<Wire>, Vec<Wire>) {
-        assert!(coeffs.iter().all(|&c| c != 0), "coeffs must stay nonzero");
-        let sub_widths = compute_sub_widths(ell, 4);
-        let work_mod = 1u64 << ell;
-        let mut sys = System::new();
-        let chunk_wires: Vec<Wire> = coeffs.iter().map(|_| sys.input(work_mod)).collect();
-        let mut r = sys.constant(0, work_mod);
-        for (&coeff, &w) in coeffs.iter().zip(&chunk_wires) {
-            let term = sys.mul(coeff, w);
-            r = sys.add(r, term);
-        }
-        let extraction = sub_chunk_extract(&mut sys, r, &sub_widths);
-        let h_p = fold_to_mod_ohe(&mut sys, &extraction, p);
-        (sys, chunk_wires, h_p)
-    }
-
     #[test]
     fn test_garble_recorded_matches_garble() {
         // garble_recorded must emit the identical Program (and replaying its
@@ -680,88 +513,8 @@ mod tests {
                     garble_recorded(&sys, &bit_wires, &input_masks, &h_p, delta, 0);
                 assert_programs_equal(&sys, &expected, &recorded, &format!("p={p} r={round}"));
                 assert!(!tape.is_empty(), "header derivation must tape entries");
-
-                // Self-replay: the tape reproduces the Program on its own system.
-                let replayed = garble_replay(&sys, &bit_wires, &input_masks, &h_p, delta, &tape, 0);
-                assert_programs_equal(
-                    &sys,
-                    &expected,
-                    &replayed,
-                    &format!("self-replay p={p} r={round}"),
-                );
             }
         }
     }
 
-    #[test]
-    fn test_cross_replay_different_mul_scalars() {
-        // Record on A, replay on B: same construction, different (all-nonzero)
-        // Mul scalars, B's own masks and delta. The replayed Program must
-        // equal garble(B) exactly — the schedule depends only on structure.
-        let mut rng = rng();
-        let (ell, p) = (8u32, 5u64);
-        let (sys_a, in_a, out_a) = build_accum_header(&[3, 9], ell, p);
-        let (sys_b, in_b, out_b) = build_accum_header(&[5, 11], ell, p);
-        assert_eq!(sys_a.num_gates(), sys_b.num_gates());
-        assert_eq!(sys_a.num_wires(), sys_b.num_wires());
-
-        let masks_a: Vec<Label> = in_a
-            .iter()
-            .map(|_| sample_cf_mask(&mut rng, 1u64 << ell))
-            .collect();
-        let (_prog_a, tape) = garble_recorded(&sys_a, &in_a, &masks_a, &out_a, rng.random(), 0);
-
-        for round in 0..3 {
-            let masks_b: Vec<Label> = in_b
-                .iter()
-                .map(|_| sample_cf_mask(&mut rng, 1u64 << ell))
-                .collect();
-            let delta_b: u128 = rng.random();
-            let expected = garble(&sys_b, &in_b, &masks_b, &out_b, delta_b, 0);
-            let replayed = garble_replay(&sys_b, &in_b, &masks_b, &out_b, delta_b, &tape, 0);
-            assert_programs_equal(&sys_b, &expected, &replayed, &format!("cross r={round}"));
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "unmasked")]
-    fn test_replay_mismatched_mul_pattern_panics() {
-        // A's Mul(0) fires with no masked input; B's Mul(3) at the same gid
-        // needs one — the zero/nonzero clause of the validity contract. The
-        // replay must hit the loud operand panic, never write silently.
-        let mut rng = rng();
-        let mut sys_a = System::new();
-        let xa = sys_a.input(16);
-        let wa = sys_a.alloc_wire(16); // never masked
-        let ya = sys_a.mul(0, wa); // gate 0: fires with no input
-        let za = sys_a.add(xa, ya); // gate 1
-        let mut sys_b = System::new();
-        let xb = sys_b.input(16);
-        let wb = sys_b.alloc_wire(16); // never masked
-        let _yb = sys_b.mul(3, wb); // gate 0: same kind, different dependency
-        let mask = sample_cf_mask(&mut rng, 16);
-        let (_prog, tape) =
-            garble_recorded(&sys_a, &[xa], std::slice::from_ref(&mask), &[za], 1, 0);
-        garble_replay(&sys_b, &[xb], &[mask], &[], 7, &tape, 0);
-    }
-
-    #[test]
-    #[should_panic(expected = "joins never propagate masks")]
-    fn test_replay_tape_onto_join_gid_panics() {
-        // Record on a 2-gate adder; replay on a system whose gate 0 is a Join.
-        // Joins cannot appear in a garbler tape, so the replay must panic.
-        let mut rng = rng();
-        let mut sys_a = System::new();
-        let xa = sys_a.input(16);
-        let ya = sys_a.input(16);
-        let sa = sys_a.add(xa, ya); // gate 0
-        let ta = sys_a.add(sa, ya); // gate 1
-        let mut sys_b = System::new();
-        let xb = sys_b.input(16);
-        let yb = sys_b.input(16);
-        sys_b.join(xb, yb); // gate 0: different gate kind at the taped gid
-        let masks: Vec<Label> = (0..2).map(|_| sample_cf_mask(&mut rng, 16)).collect();
-        let (_prog, tape) = garble_recorded(&sys_a, &[xa, ya], &masks, &[ta], 1, 0);
-        garble_replay(&sys_b, &[xb, yb], &masks, &[], 7, &tape, 0);
-    }
 }

@@ -1,41 +1,38 @@
-//! The fast garble + eval engines, over flat label storage.
+//! Garble + eval engines for keyed all-CF phases, over flat label storage.
 //!
-//! These are the *production* execution paths; the worklist engines in
-//! [`super::garbler`] / [`super::evaluator`] stay as the readable references
-//! (and the fallback for shapes this module can't host). Differential tests
-//! pin both engines here against those references bit-for-bit. The speedup
-//! comes from two changes — how labels are *stored*, and how the gate
-//! schedule is *run*.
+//! The streaming pipeline's chunk and per-prime extract phases run here; the
+//! worklist [`garble`](super::garbler::garble) and the journal
+//! [`replay_with_labels`](super::evaluator::replay_with_labels) handle the
+//! remaining (unkeyed or NCF) phases and record each shape's tape. This
+//! module is fast because of two choices — how labels are *stored* and how
+//! the gate schedule is *run*.
 //!
-//! # Storage: a handle-indexed arena instead of boxed labels
+//! # Storage: a handle-indexed arena
 //!
-//! The reference engines hold per-wire masks/labels as `Vec<Option<Label>>` —
-//! an enum behind an `Option`, with a heap allocation per k > 1 result — so
-//! every gate pays enum dispatch + `Option` bookkeeping + an allocator
-//! round-trip around ~30 ns of real lane arithmetic. A [`LabelArena`] instead
-//! stores them densely, addressed by *handle*: a per-shape [`WireLayout`]
-//! assigns each wire a [`Slot`] (a packed integer handle), and the arena is
-//! two flat vectors — `[u64; 2]` per Z₂ wire (the packed wire format) and
-//! `[u32; LAMBDA]` per k>1 wire (one coordinate per lane). This is the
-//! id-arena pattern: no `Label`, no `Option`, no per-op allocation. A
-//! `Label` is materialized only at phase boundaries (carry items, join diffs,
-//! output masks). The arena persists across phases unchanged — a slot is
-//! always written (by the phase's seeds or schedule) before it is read.
+//! A [`LabelArena`] holds per-wire masks/labels densely, addressed by
+//! *handle*: a per-shape [`WireLayout`] assigns each wire a [`Slot`] (a packed
+//! integer handle), and the arena is two flat vectors — `[u64; 2]` per Z₂ wire
+//! (the packed wire format) and `[u32; LAMBDA]` per k>1 wire (one coordinate
+//! per lane). This is the id-arena pattern: no per-wire `Box`/`Option`, no
+//! per-op allocation, no enum dispatch in the inner loops. A `Label` is
+//! materialized only at phase boundaries (carry items, join diffs, output
+//! masks). The arena persists across phases unchanged — a slot is always
+//! written (by the phase's seeds or schedule) before it is read.
 //!
 //! # Schedule: compiled garbling, fused evaluation
 //!
-//! * **[`compile_garble`] / [`garble_compiled`]** — the garbler's recorded
-//!   firing schedule compiles once per phase *shape* into a typed instruction
-//!   stream (fully validated at compile time); same-shape phases then garble
+//! * **[`compile_garble`] / [`garble_compiled`]** — the garbler's firing
+//!   schedule compiles once per phase *shape* into a typed instruction stream
+//!   (fully validated at compile time); every phase of the shape then garbles
 //!   with no `System` access except dynamic `Mul` scalar loads.
 //! * **[`fused_eval_arena`]** — the evaluator derives cleartext values and
 //!   labels together in one worklist pass (a direction fires when its value
 //!   operands are known; inductively every value-known wire is also
-//!   label-known), replacing the reference's separate value- and label-passes.
+//!   label-known).
 //!
 //! Security note: the garbler and evaluator use separate arenas (the parties
-//! never share state); hashing goes through the same CCRH calls as the
-//! `Label` path, with the same solo-domain nonces.
+//! never share state); hashing goes through the same CCRH calls everywhere,
+//! with the same solo-domain nonces.
 
 use super::program::Program;
 use crate::crypto::expand;
@@ -1247,8 +1244,8 @@ fn fused_fire(
 mod tests {
     use super::*;
     use crate::comp_gc::convert::{compute_sub_widths, fold_to_mod_ohe, sub_chunk_extract};
-    use crate::comp_gc::eval_with_labels;
     use crate::comp_gc::garbler::{garble, garble_recorded};
+    use crate::comp_gc::replay_with_labels;
     use crate::exec::Exec;
     use crate::label::{self};
     use crate::pipeline::sample_cf_mask;
@@ -1278,9 +1275,9 @@ mod tests {
 
     /// The production execution paths — compiled garbling and fused
     /// value+label evaluation — must agree bit-for-bit with the `Label`-path
-    /// worklist references on the real header circuitry (circular
-    /// word_to_hot, Mul(0) seeding, switches, joins, Z₂ and lanes wires),
-    /// across primes, inputs and deltas.
+    /// engines (worklist [`garble`], journal [`replay_with_labels`]) on the
+    /// real header circuitry (circular word_to_hot, Mul(0) seeding, switches,
+    /// joins, Z₂ and lanes wires), across primes, inputs and deltas.
     #[test]
     fn test_arena_matches_label_path() {
         let mut rng = rand::rng();
@@ -1331,8 +1328,8 @@ mod tests {
                 }
 
                 // Production evaluator: the fused value+label pass must match
-                // the worklist reference on labels and the cleartext `Exec`
-                // pass on values.
+                // the journal-replay evaluator on labels and the cleartext
+                // `Exec` pass on values.
                 let d2 = Label::Cf(label::delta_r(delta, 2));
                 let input_labels: Vec<Label> = input_masks
                     .iter()
@@ -1344,14 +1341,15 @@ mod tests {
                 for (j, &w) in bit_wires.iter().enumerate() {
                     exec.set(w, Val::new((input >> j) & 1, 2));
                 }
-                exec.run();
+                exec.run_recorded();
 
-                let via_worklist = eval_with_labels(
+                let via_replay = replay_with_labels(
                     &sys,
                     &bit_wires,
                     &input_labels,
                     exec.values(),
                     &program_ref,
+                    exec.journal(),
                     &h_p,
                     nonce_base,
                 );
@@ -1369,7 +1367,7 @@ mod tests {
                     nonce_base,
                 );
                 assert_eq!(
-                    via_worklist, via_fused,
+                    via_replay, via_fused,
                     "fused eval label divergence: p={p}, input={input}"
                 );
                 let exec_values: Vec<u64> = h_p.iter().map(|&w| exec.get(w).v).collect();
