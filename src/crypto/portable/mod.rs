@@ -1,5 +1,3 @@
-// TODO: Replace with x86_64 AES-NI backend, this is written by Claude so that CI doesn't fail, although it passes tests.
-
 //! Portable software AES-128 + CCRND backend.
 //!
 //! Used on non-aarch64 targets (aarch64 uses the AES-NI backend). Produces
