@@ -232,7 +232,7 @@ impl LabelArena {
     fn mul_lanes(&mut self, dst: Slot, a: Slot, s: u64) {
         let k = dst.k();
         let mask = lane_mask(k);
-        let s32 = (s & mask as u64 as u64) as u32;
+        let s32 = (s & mask as u64) as u32;
         let [d, av] = self
             .lanes
             .get_disjoint_mut([dst.index(), a.index()])
@@ -491,10 +491,16 @@ fn unpack_even_k_neon(scratch: &[u8], k: usize, dst: &mut [u32; LAMBDA]) {
     }
 }
 
-/// One compiled garbler instruction. Operand fields are arena indices (the
-/// kind is implied by the opcode); `aux` carries the gate id for hash ops
-/// (the solo CCRH domain is `nonce_base + aux`), the shift for shift ops, or
-/// the scalar for muls. `k` is the lane width where one is needed.
+/// One compiled garbler instruction. The opcode implies the operand kinds.
+///
+/// * `dst`, `a` are arena slot indices; `b` is a second operand slot index for
+///   the binary ops, but doubles as an immediate **shift amount** for
+///   `OP_PACKBIT` / `OP_SHIFTMASK_L`.
+/// * `aux` is the **gate id** for the ops that read the live `System` at run
+///   time — `OP_MUL_*` (for the scalar) and `OP_HASH_*` (for the CCRH nonce
+///   `nonce_base + gid`); zero otherwise.
+/// * `k` is the destination lane width, used only by the lane ops that mask
+///   (it is 0 / ignored for Z₂ destinations).
 #[derive(Clone, Copy, Debug)]
 struct Instr {
     op: u8,
@@ -505,20 +511,75 @@ struct Instr {
     aux: u32,
 }
 
-const OP_XOR_Z2: u8 = 0;
-const OP_ADD_L: u8 = 1;
-const OP_SUB_L: u8 = 2;
-const OP_MUL_L: u8 = 3;
-const OP_ZERO_Z2: u8 = 4;
-const OP_ZERO_L: u8 = 5;
-const OP_COPY_Z2: u8 = 6;
-const OP_COPY_L: u8 = 7;
-const OP_PACKBIT: u8 = 8;
-const OP_SHIFTMASK_L: u8 = 9;
-const OP_HASH_XOR_Z2: u8 = 10;
-const OP_MUL_Z2: u8 = 13;
-const OP_HASH_ADD_L: u8 = 11;
-const OP_HASH_SUB_L: u8 = 12;
+// Opcodes, grouped by destination kind (Z₂ producers, then lane producers).
+// Values are internal — `compile_garble` writes them and `garble_compiled`
+// reads them by name — so the numbering is arbitrary, kept dense and grouped
+// only for legibility.
+const OP_XOR_Z2: u8 = 0; // dst = a ⊕ b
+const OP_COPY_Z2: u8 = 1; // dst = a
+const OP_ZERO_Z2: u8 = 2; // dst = 0
+const OP_MUL_Z2: u8 = 3; // dst = (scalar & 1) · a          [aux = gid]
+const OP_PACKBIT: u8 = 4; // dst[i] = bit `b` of lane a[i]   (lanes → Z₂)
+const OP_HASH_XOR_Z2: u8 = 5; // dst = a ⊕ H(ctrl = b)           [aux = gid]
+const OP_ADD_L: u8 = 6; // dst = a + b           (mod 2^k)
+const OP_SUB_L: u8 = 7; // dst = a − b           (mod 2^k)
+const OP_MUL_L: u8 = 8; // dst = scalar · a      (mod 2^k) [aux = gid]
+const OP_COPY_L: u8 = 9; // dst = a
+const OP_ZERO_L: u8 = 10; // dst = 0
+const OP_SHIFTMASK_L: u8 = 11; // dst = (a >> b) & mask(2^k)
+const OP_HASH_ADD_L: u8 = 12; // dst = a + H(ctrl = b)           [aux = gid]
+const OP_HASH_SUB_L: u8 = 13; // dst = a − H(ctrl = b)           [aux = gid]
+
+impl Instr {
+    /// An op that reads no operand slots: the `ZERO_*` ops.
+    fn nullary(op: u8, dst: Slot) -> Self {
+        Instr {
+            op,
+            k: dst.k() as u8,
+            dst: dst.index() as u32,
+            a: 0,
+            b: 0,
+            aux: 0,
+        }
+    }
+
+    /// A one-operand op: `COPY_*`, `MUL_*`, `PACKBIT`, `SHIFTMASK_L`.
+    fn unary(op: u8, dst: Slot, a: Slot) -> Self {
+        Instr {
+            op,
+            k: dst.k() as u8,
+            dst: dst.index() as u32,
+            a: a.index() as u32,
+            b: 0,
+            aux: 0,
+        }
+    }
+
+    /// A two-operand op: `XOR_Z2`, `ADD_L`, `SUB_L`, and the `HASH_*` ops
+    /// (whose second operand `b` is the control slot).
+    fn binary(op: u8, dst: Slot, a: Slot, b: Slot) -> Self {
+        Instr {
+            op,
+            k: dst.k() as u8,
+            dst: dst.index() as u32,
+            a: a.index() as u32,
+            b: b.index() as u32,
+            aux: 0,
+        }
+    }
+
+    /// Set the immediate `b` field (the shift for `PACKBIT` / `SHIFTMASK_L`).
+    fn imm(mut self, b: u32) -> Self {
+        self.b = b;
+        self
+    }
+
+    /// Set `aux` to the gate id (for the ops that read the live `System`).
+    fn gid(mut self, gid: usize) -> Self {
+        self.aux = gid as u32;
+        self
+    }
+}
 
 /// A fully compiled garbler program for one phase shape: constants, input
 /// slots, the instruction stream, and the emission lists. Executing it never
@@ -599,11 +660,13 @@ pub(crate) fn compile_garble(
         let ins = match system.gates[gid] {
             Gate::Add { in0, in1, out } | Gate::Sub { in0, in1, out } => {
                 let is_sub = matches!(system.gates[gid], Gate::Sub { .. });
+                // The wire being derived fixes the direction of out = in0 ± in1.
                 let (a, b, sub) = if wid == out.wid {
-                    (in0, in1, is_sub)
+                    (in0, in1, is_sub) // out = in0 ± in1
                 } else if wid == in0.wid {
-                    (out, in1, !is_sub)
+                    (out, in1, !is_sub) // in0 = out ∓ in1
                 } else if wid == in1.wid {
+                    // in1 = out − in0 (add) or in0 − out (sub)
                     if is_sub {
                         (in0, out, true)
                     } else {
@@ -613,25 +676,14 @@ pub(crate) fn compile_garble(
                     bad_wid()
                 };
                 check(&defined, &[a, b]);
-                if dst.is_z2() {
-                    Instr {
-                        op: OP_XOR_Z2,
-                        k: 1,
-                        dst: dst.index() as u32,
-                        a: sl(a).index() as u32,
-                        b: sl(b).index() as u32,
-                        aux: 0,
-                    }
+                let op = if dst.is_z2() {
+                    OP_XOR_Z2
+                } else if sub {
+                    OP_SUB_L
                 } else {
-                    Instr {
-                        op: if sub { OP_SUB_L } else { OP_ADD_L },
-                        k: dst.k() as u8,
-                        dst: dst.index() as u32,
-                        a: sl(a).index() as u32,
-                        b: sl(b).index() as u32,
-                        aux: 0,
-                    }
-                }
+                    OP_ADD_L
+                };
+                Instr::binary(op, dst, sl(a), sl(b))
             }
             Gate::Mul { in0, scalar, out } => {
                 if wid != out.wid {
@@ -639,39 +691,14 @@ pub(crate) fn compile_garble(
                 }
                 if scalar == 0 {
                     check(&defined, &[]);
-                    Instr {
-                        op: if dst.is_z2() { OP_ZERO_Z2 } else { OP_ZERO_L },
-                        k: 0,
-                        dst: dst.index() as u32,
-                        a: 0,
-                        b: 0,
-                        aux: 0,
-                    }
+                    Instr::nullary(if dst.is_z2() { OP_ZERO_Z2 } else { OP_ZERO_L }, dst)
                 } else {
                     check(&defined, &[in0]);
-                    // Scalar values may differ across same-shape phases (the
-                    // r_i coefficients vary per prime), so the instruction
-                    // stores the gate id and the scalar is read from the
-                    // current System at run time.
-                    if dst.is_z2() {
-                        Instr {
-                            op: OP_MUL_Z2,
-                            k: 1,
-                            dst: dst.index() as u32,
-                            a: sl(in0).index() as u32,
-                            b: 0,
-                            aux: gid as u32,
-                        }
-                    } else {
-                        Instr {
-                            op: OP_MUL_L,
-                            k: dst.k() as u8,
-                            dst: dst.index() as u32,
-                            a: sl(in0).index() as u32,
-                            b: 0,
-                            aux: gid as u32,
-                        }
-                    }
+                    // The scalar is read from the live System at run time — it
+                    // varies across same-shape phases (the r_i coefficients
+                    // differ per prime), so only the gate id is baked in.
+                    let op = if dst.is_z2() { OP_MUL_Z2 } else { OP_MUL_L };
+                    Instr::unary(op, dst, sl(in0)).gid(gid)
                 }
             }
             Gate::Mod2k { in0, out, .. } => {
@@ -679,34 +706,15 @@ pub(crate) fn compile_garble(
                     bad_wid()
                 }
                 check(&defined, &[in0]);
+                // Keep the low bits: Z₂→Z₂ copy, lanes→Z₂ bit-pack, or
+                // lanes→lanes truncate (shift 0, mask to dst width).
                 let src = sl(in0);
                 if src.is_z2() {
-                    Instr {
-                        op: OP_COPY_Z2,
-                        k: 1,
-                        dst: dst.index() as u32,
-                        a: src.index() as u32,
-                        b: 0,
-                        aux: 0,
-                    }
+                    Instr::unary(OP_COPY_Z2, dst, src)
                 } else if dst.is_z2() {
-                    Instr {
-                        op: OP_PACKBIT,
-                        k: src.k() as u8,
-                        dst: dst.index() as u32,
-                        a: src.index() as u32,
-                        b: 0,
-                        aux: 0,
-                    }
+                    Instr::unary(OP_PACKBIT, dst, src)
                 } else {
-                    Instr {
-                        op: OP_SHIFTMASK_L,
-                        k: dst.k() as u8,
-                        dst: dst.index() as u32,
-                        a: src.index() as u32,
-                        b: 0,
-                        aux: 0,
-                    }
+                    Instr::unary(OP_SHIFTMASK_L, dst, src)
                 }
             }
             Gate::Div2k { in0, k, out } => {
@@ -714,65 +722,37 @@ pub(crate) fn compile_garble(
                     bad_wid()
                 }
                 check(&defined, &[in0]);
+                // Drop the low `k` bits: k = 0 is a copy, else a shift (packing
+                // to Z₂ when the quotient is one bit wide).
                 let src = sl(in0);
                 if k == 0 {
-                    Instr {
-                        op: if dst.is_z2() { OP_COPY_Z2 } else { OP_COPY_L },
-                        k: dst.k() as u8,
-                        dst: dst.index() as u32,
-                        a: src.index() as u32,
-                        b: 0,
-                        aux: 0,
-                    }
+                    Instr::unary(if dst.is_z2() { OP_COPY_Z2 } else { OP_COPY_L }, dst, src)
                 } else if dst.is_z2() {
-                    Instr {
-                        op: OP_PACKBIT,
-                        k: src.k() as u8,
-                        dst: dst.index() as u32,
-                        a: src.index() as u32,
-                        b: k,
-                        aux: 0,
-                    }
+                    Instr::unary(OP_PACKBIT, dst, src).imm(k)
                 } else {
-                    Instr {
-                        op: OP_SHIFTMASK_L,
-                        k: dst.k() as u8,
-                        dst: dst.index() as u32,
-                        a: src.index() as u32,
-                        b: k,
-                        aux: 0,
-                    }
+                    Instr::unary(OP_SHIFTMASK_L, dst, src).imm(k)
                 }
             }
             Gate::Switch { data, ctrl, out } => {
                 if wid != out.wid && wid != data.wid {
                     bad_wid()
                 }
+                // out = data + H(ctrl) ⇔ data = out − H(ctrl); the CCRH nonce
+                // is read per-phase via the gate id.
                 let (a, sub) = if wid == out.wid {
                     (data, false)
                 } else {
                     (out, true)
                 };
                 check(&defined, &[ctrl, a]);
-                if dst.is_z2() {
-                    Instr {
-                        op: OP_HASH_XOR_Z2,
-                        k: 1,
-                        dst: dst.index() as u32,
-                        a: sl(a).index() as u32,
-                        b: sl(ctrl).index() as u32,
-                        aux: gid as u32,
-                    }
+                let op = if dst.is_z2() {
+                    OP_HASH_XOR_Z2
+                } else if sub {
+                    OP_HASH_SUB_L
                 } else {
-                    Instr {
-                        op: if sub { OP_HASH_SUB_L } else { OP_HASH_ADD_L },
-                        k: dst.k() as u8,
-                        dst: dst.index() as u32,
-                        a: sl(a).index() as u32,
-                        b: sl(ctrl).index() as u32,
-                        aux: gid as u32,
-                    }
-                }
+                    OP_HASH_ADD_L
+                };
+                Instr::binary(op, dst, sl(a), sl(ctrl)).gid(gid)
             }
             Gate::Join { .. } => panic!(
                 "compile_garble: tape entry for Join gate {gid} — joins never \
@@ -787,14 +767,11 @@ pub(crate) fn compile_garble(
                     bad_wid()
                 };
                 check(&defined, &[src]);
-                Instr {
-                    op: if dst.is_z2() { OP_COPY_Z2 } else { OP_COPY_L },
-                    k: dst.k() as u8,
-                    dst: dst.index() as u32,
-                    a: sl(src).index() as u32,
-                    b: 0,
-                    aux: 0,
-                }
+                Instr::unary(
+                    if dst.is_z2() { OP_COPY_Z2 } else { OP_COPY_L },
+                    dst,
+                    sl(src),
+                )
             }
         };
         defined[wid] = true;
@@ -865,6 +842,9 @@ pub(crate) fn garble_compiled(
         arena.store_label(slot, m);
     }
 
+    // The opcode fixes the operand kinds, so the arithmetic is inlined per op
+    // rather than calling the kind-dispatching `LabelArena` methods (which the
+    // fused evaluator uses) — this keeps the dispatch flat in the hot loop.
     for ins in &prog.instrs {
         let (d, a, b) = (ins.dst as usize, ins.a as usize, ins.b as usize);
         match ins.op {
