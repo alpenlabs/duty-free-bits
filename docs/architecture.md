@@ -176,7 +176,7 @@ such runs.
 ### Where the time goes (per party)
 
 | component | share | note |
-|---|---|---|
+| --- | --- | --- |
 | CCRH / AES (4-wide) | ~18 % | at the M1's two-AES-pipe floor (~1.75 ns/block) |
 | body-kernel MACs (8-wide NEON) | ~17 % | one multiply-accumulate per (slot, member); ~at floor |
 | fused evaluator (worklist + ops) | ~22 % | the one remaining fixpoint, doing value discovery |

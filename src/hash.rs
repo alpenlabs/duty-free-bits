@@ -7,9 +7,10 @@ use crate::label::{self, CfLabel, LAMBDA, Label, NcfLabel};
 
 /// `⌈log₂ modulus⌉` (number of bits needed to represent values < modulus).
 ///
-/// TODO: For a non-power-of-two NCF modulus `p`, this
-/// tight width makes an extracted slice's `value % p` *non-uniform* — residues
-/// `0..(2^⌈log₂ p⌉ − p)` occur twice, the rest once, which might leak something.
+/// Note (known limitation): for a non-power-of-two NCF modulus `p` — which the
+/// CRT primes are — reducing this tight `⌈log₂ p⌉`-bit slice mod `p` is
+/// slightly non-uniform: residues `0..(2^⌈log₂ p⌉ − p)` occur twice as often
+/// as the rest. The bias is not currently corrected.
 pub fn lg_modulus(modulus: u64) -> usize {
     if modulus <= 1 {
         0
@@ -161,7 +162,9 @@ pub fn extract_ncf(wide: &[u8], idx: usize, modulus: u64) -> Label {
         let b = (wide[bit / 8] >> (bit % 8)) & 1;
         acc |= (b as u64) << i;
     }
-    // TODO: `acc` is exactly `lg_m = ⌈log₂ modulus⌉` bits, so `acc % modulus` is slightly biased toward small residues for a non-power-of-two `modulus`.
+    // Note: `acc` is exactly `lg_m = ⌈log₂ modulus⌉` bits, so `acc % modulus` is
+    // slightly biased toward small residues for non-power-of-two `modulus` — the
+    // known limitation documented on `lg_modulus`.
     let rep = if modulus == 0 { 0 } else { acc % modulus };
     Label::Ncf(NcfLabel { rep, modulus })
 }
