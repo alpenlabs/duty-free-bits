@@ -76,22 +76,22 @@ pub fn fold_batch_garble(
     first_width: u32,
     nonce_base: u64,
 ) -> FoldGarbleOutput {
-    let pu = p as usize;
+    let p_usize = p as usize;
 
     // h init: h[r'] = Σ_{i ≡ r' (mod p)} first_bin_hot[i] — free Z₂ adds.
-    let mut h = vec![[0u64; 2]; pu];
+    let mut h = vec![[0u64; 2]; p_usize];
     for (i, m) in first_bin_hot_masks.iter().enumerate() {
         let w = z2_words(m);
-        let slot = &mut h[i % pu];
+        let slot = &mut h[i % p_usize];
         slot[0] ^= w[0];
         slot[1] ^= w[1];
     }
 
     let mut join_diffs = Vec::with_capacity(bit_masks.len());
-    let mut h_prime = vec![[0u64; 2]; pu];
+    let mut h_prime = vec![[0u64; 2]; p_usize];
     for (b_idx, bm) in bit_masks.iter().enumerate() {
         let shift = pow2_mod(first_width + b_idx as u32, p) as usize;
-        let bit_nonce_base = nonce_base + (b_idx * pu) as u64;
+        let bit_nonce_base = nonce_base + (b_idx * p_usize) as u64;
 
         // Pads + their running sum: X_h'[r] = H(X_h[r]), X_s = ⊕ X_h'[r].
         let mut s = [0u64; 2];
@@ -102,13 +102,13 @@ pub fn fold_batch_garble(
         }
 
         // The one residue communicated per bit: diff = X_s ⊕ X_bit.
-        let bw = z2_words(bm);
-        join_diffs.push(z2_label([s[0] ^ bw[0], s[1] ^ bw[1]]));
+        let bit_words = z2_words(bm);
+        join_diffs.push(z2_label([s[0] ^ bit_words[0], s[1] ^ bit_words[1]]));
 
         // h[r] ⊕= h'[r] ⊕ h'[src] — in place: the update at r reads only
         // h[r] itself and h_prime.
-        for r in 0..pu {
-            let src = (r + pu - shift) % pu;
+        for r in 0..p_usize {
+            let src = (r + p_usize - shift) % p_usize;
             h[r][0] ^= h_prime[r][0] ^ h_prime[src][0];
             h[r][1] ^= h_prime[r][1] ^ h_prime[src][1];
         }
@@ -145,25 +145,25 @@ pub fn fold_batch_eval(
     first_width: u32,
     nonce_base: u64,
 ) -> Vec<Label> {
-    let pu = p as usize;
+    let p_usize = p as usize;
     assert_eq!(bit_labels.len(), join_diffs.len());
     assert_eq!(first_bin_hot_labels.len(), 1usize << first_width);
 
-    let mut h = vec![[0u64; 2]; pu];
+    let mut h = vec![[0u64; 2]; p_usize];
     for (i, l) in first_bin_hot_labels.iter().enumerate() {
         let w = z2_words(l);
-        let slot = &mut h[i % pu];
+        let slot = &mut h[i % p_usize];
         slot[0] ^= w[0];
         slot[1] ^= w[1];
     }
     // Running hot position: starts at (r mod 2^first_width) mod p.
     let mut hot = ((r & ((1u64 << first_width) - 1)) % p) as usize;
 
-    let mut h_prime = vec![[0u64; 2]; pu];
+    let mut h_prime = vec![[0u64; 2]; p_usize];
     for (b_idx, (bl, diff)) in bit_labels.iter().zip(join_diffs).enumerate() {
         let pos = first_width + b_idx as u32;
         let shift = pow2_mod(pos, p) as usize;
-        let bit_nonce_base = nonce_base + (b_idx * pu) as u64;
+        let bit_nonce_base = nonce_base + (b_idx * p_usize) as u64;
 
         // Non-hot slots: control value is 0, so the pad recomputes exactly.
         let mut s_known = [0u64; 2];
@@ -177,18 +177,21 @@ pub fn fold_batch_eval(
         }
         // Hot slot, backward through the join: L_s = L_bit ⊕ diff, then
         // L_h'[hot] = L_s ⊕ (⊕_{r≠hot} L_h'[r]).
-        let bw = z2_words(bl);
-        let dw = z2_words(diff);
-        h_prime[hot] = [bw[0] ^ dw[0] ^ s_known[0], bw[1] ^ dw[1] ^ s_known[1]];
+        let bit_words = z2_words(bl);
+        let diff_words = z2_words(diff);
+        h_prime[hot] = [
+            bit_words[0] ^ diff_words[0] ^ s_known[0],
+            bit_words[1] ^ diff_words[1] ^ s_known[1],
+        ];
 
-        for rr in 0..pu {
-            let src = (rr + pu - shift) % pu;
+        for rr in 0..p_usize {
+            let src = (rr + p_usize - shift) % p_usize;
             h[rr][0] ^= h_prime[rr][0] ^ h_prime[src][0];
             h[rr][1] ^= h_prime[rr][1] ^ h_prime[src][1];
         }
         // Value-side: folding bit b moves the hot slot by bit·2^pos.
         if (r >> pos) & 1 == 1 {
-            hot = (hot + shift) % pu;
+            hot = (hot + shift) % p_usize;
         }
     }
     debug_assert_eq!(hot as u64, r % p, "hot tracking diverged");

@@ -1,44 +1,41 @@
-//! Flat-arena execution of recorded schedules.
+//! The fast garble + eval engines, over flat label storage.
 //!
-//! The worklist engines and tape/journal replayers store per-wire masks and
-//! labels as `Vec<Option<Label>>` — an enum behind an `Option` with a heap
-//! allocation per k > 1 result. For the streaming pipeline's hot phases
-//! (chunk conversion and per-prime extract, all CF wires) that representation
-//! is the dominant cost: every gate pays enum dispatch, `Option` bookkeeping
-//! and an allocator round-trip around ~30 ns of real lane arithmetic.
+//! These are the *production* execution paths; the worklist engines in
+//! [`super::garbler`] / [`super::evaluator`] stay as the readable references
+//! (and the fallback for shapes this module can't host). Differential tests
+//! pin both engines here against those references bit-for-bit. The speedup
+//! comes from two changes — how labels are *stored*, and how the gate
+//! schedule is *run*.
 //!
-//! This module re-executes the same schedules against dense typed arenas:
+//! # Storage: a handle-indexed arena instead of boxed labels
 //!
-//! * Z₂ wires live in `Vec<[u64; 2]>` (the packed wire format),
-//! * k ∈ [2, 32] wires live in `Vec<[u32; LAMBDA]>` (one lane per coordinate),
-//! * a per-shape [`WireLayout`] maps wire id → arena slot once, so execution
-//!   never touches `Label` at all; conversions happen only at phase
-//!   boundaries (carry items, join diffs, output masks).
+//! The reference engines hold per-wire masks/labels as `Vec<Option<Label>>` —
+//! an enum behind an `Option`, with a heap allocation per k > 1 result — so
+//! every gate pays enum dispatch + `Option` bookkeeping + an allocator
+//! round-trip around ~30 ns of real lane arithmetic. A [`LabelArena`] instead
+//! stores them densely, addressed by *handle*: a per-shape [`WireLayout`]
+//! assigns each wire a [`Slot`] (a packed integer handle), and the arena is
+//! two flat vectors — `[u64; 2]` per Z₂ wire (the packed wire format) and
+//! `[u32; LAMBDA]` per k>1 wire (one coordinate per lane). This is the
+//! id-arena pattern: no `Label`, no `Option`, no per-op allocation. A
+//! `Label` is materialized only at phase boundaries (carry items, join diffs,
+//! output masks). The arena persists across phases unchanged — a slot is
+//! always written (by the phase's seeds or schedule) before it is read.
 //!
-//! Two production engines run here:
+//! # Schedule: compiled garbling, fused evaluation
 //!
 //! * **[`compile_garble`] / [`garble_compiled`]** — the garbler's recorded
-//!   firing schedule compiles once per phase *shape* into a typed
-//!   instruction stream (with full structural validation at compile time);
-//!   same-shape phases then garble with no `System` access except dynamic
-//!   `Mul` scalar loads.
+//!   firing schedule compiles once per phase *shape* into a typed instruction
+//!   stream (fully validated at compile time); same-shape phases then garble
+//!   with no `System` access except dynamic `Mul` scalar loads.
 //! * **[`fused_eval_arena`]** — the evaluator derives cleartext values and
-//!   labels together through one worklist pass (a direction fires when its
-//!   value operands are known; inductively every value-known wire is also
-//!   label-known).
+//!   labels together in one worklist pass (a direction fires when its value
+//!   operands are known; inductively every value-known wire is also
+//!   label-known), replacing the reference's separate value- and label-passes.
 //!
-//! The `Label`-path worklist engines in [`super::garbler`] /
-//! [`super::evaluator`] remain the checked references (and the fallback for
-//! shapes the arena does not support); differential tests pin both
-//! production engines against them bit-for-bit.
-//!
-//! Arenas persist across phases: a slot is written by its phase's seeds or
-//! schedule before any read (the same induction that validates the
-//! schedule), so no clearing is needed.
-//!
-//! Security note: the garbler-side and evaluator-side runs use separate
-//! arenas (the parties never share state); hashing goes through the same
-//! CCRH calls as the `Label` path, with the same solo-domain nonces.
+//! Security note: the garbler and evaluator use separate arenas (the parties
+//! never share state); hashing goes through the same CCRH calls as the
+//! `Label` path, with the same solo-domain nonces.
 
 use super::program::Program;
 use crate::crypto::expand;
@@ -297,10 +294,10 @@ impl LabelArena {
     fn hash_solo_into(&mut self, dst: Slot, ctrl: Slot, domain: u64) {
         debug_assert!(ctrl.is_z2(), "switch controls are CF Z_2");
         debug_assert!(domain < (1u64 << 63), "solo domain uses bit 63");
-        let cw = self.z2[ctrl.index()];
+        let ctrl_words = self.z2[ctrl.index()];
         let mut seed = [0u8; 16];
-        seed[0..8].copy_from_slice(&cw[0].to_le_bytes());
-        seed[8..16].copy_from_slice(&cw[1].to_le_bytes());
+        seed[0..8].copy_from_slice(&ctrl_words[0].to_le_bytes());
+        seed[8..16].copy_from_slice(&ctrl_words[1].to_le_bytes());
         if dst.is_z2() {
             let mut out = [0u8; 16];
             expand(seed, domain, &mut out);
@@ -496,7 +493,7 @@ fn unpack_even_k_neon(scratch: &[u8], k: usize, dst: &mut [u32; LAMBDA]) {
 /// * `dst`, `a` are arena slot indices; `b` is a second operand slot index for
 ///   the binary ops, but doubles as an immediate **shift amount** for
 ///   `OP_PACKBIT` / `OP_SHIFTMASK_L`.
-/// * `aux` is the **gate id** for the ops that read the live `System` at run
+/// * `gid` is the **gate id** for the ops that read the live `System` at run
 ///   time — `OP_MUL_*` (for the scalar) and `OP_HASH_*` (for the CCRH nonce
 ///   `nonce_base + gid`); zero otherwise.
 /// * `k` is the destination lane width, used only by the lane ops that mask
@@ -508,7 +505,7 @@ struct Instr {
     dst: u32,
     a: u32,
     b: u32,
-    aux: u32,
+    gid: u32,
 }
 
 // Opcodes, grouped by destination kind (Z₂ producers, then lane producers).
@@ -518,17 +515,17 @@ struct Instr {
 const OP_XOR_Z2: u8 = 0; // dst = a ⊕ b
 const OP_COPY_Z2: u8 = 1; // dst = a
 const OP_ZERO_Z2: u8 = 2; // dst = 0
-const OP_MUL_Z2: u8 = 3; // dst = (scalar & 1) · a          [aux = gid]
+const OP_MUL_Z2: u8 = 3; // dst = (scalar & 1) · a          [reads gid]
 const OP_PACKBIT: u8 = 4; // dst[i] = bit `b` of lane a[i]   (lanes → Z₂)
-const OP_HASH_XOR_Z2: u8 = 5; // dst = a ⊕ H(ctrl = b)           [aux = gid]
+const OP_HASH_XOR_Z2: u8 = 5; // dst = a ⊕ H(ctrl = b)           [reads gid]
 const OP_ADD_L: u8 = 6; // dst = a + b           (mod 2^k)
 const OP_SUB_L: u8 = 7; // dst = a − b           (mod 2^k)
-const OP_MUL_L: u8 = 8; // dst = scalar · a      (mod 2^k) [aux = gid]
+const OP_MUL_L: u8 = 8; // dst = scalar · a      (mod 2^k) [reads gid]
 const OP_COPY_L: u8 = 9; // dst = a
 const OP_ZERO_L: u8 = 10; // dst = 0
 const OP_SHIFTMASK_L: u8 = 11; // dst = (a >> b) & mask(2^k)
-const OP_HASH_ADD_L: u8 = 12; // dst = a + H(ctrl = b)           [aux = gid]
-const OP_HASH_SUB_L: u8 = 13; // dst = a − H(ctrl = b)           [aux = gid]
+const OP_HASH_ADD_L: u8 = 12; // dst = a + H(ctrl = b)           [reads gid]
+const OP_HASH_SUB_L: u8 = 13; // dst = a − H(ctrl = b)           [reads gid]
 
 impl Instr {
     /// An op that reads no operand slots: the `ZERO_*` ops.
@@ -539,7 +536,7 @@ impl Instr {
             dst: dst.index() as u32,
             a: 0,
             b: 0,
-            aux: 0,
+            gid: 0,
         }
     }
 
@@ -551,7 +548,7 @@ impl Instr {
             dst: dst.index() as u32,
             a: a.index() as u32,
             b: 0,
-            aux: 0,
+            gid: 0,
         }
     }
 
@@ -564,7 +561,7 @@ impl Instr {
             dst: dst.index() as u32,
             a: a.index() as u32,
             b: b.index() as u32,
-            aux: 0,
+            gid: 0,
         }
     }
 
@@ -574,9 +571,10 @@ impl Instr {
         self
     }
 
-    /// Set `aux` to the gate id (for the ops that read the live `System`).
-    fn gid(mut self, gid: usize) -> Self {
-        self.aux = gid as u32;
+    /// Tag the instruction with the gate id it resolves against the live
+    /// `System` (the `MUL_*` scalar / the `HASH_*` CCRH nonce).
+    fn with_gid(mut self, gid: usize) -> Self {
+        self.gid = gid as u32;
         self
     }
 }
@@ -656,7 +654,6 @@ pub(crate) fn compile_garble(
                 );
             }
         };
-        let sl = |w: Wire| layout.slot(w);
         let ins = match system.gates[gid] {
             Gate::Add { in0, in1, out } | Gate::Sub { in0, in1, out } => {
                 let is_sub = matches!(system.gates[gid], Gate::Sub { .. });
@@ -683,7 +680,7 @@ pub(crate) fn compile_garble(
                 } else {
                     OP_ADD_L
                 };
-                Instr::binary(op, dst, sl(a), sl(b))
+                Instr::binary(op, dst, layout.slot(a), layout.slot(b))
             }
             Gate::Mul { in0, scalar, out } => {
                 if wid != out.wid {
@@ -698,7 +695,7 @@ pub(crate) fn compile_garble(
                     // varies across same-shape phases (the r_i coefficients
                     // differ per prime), so only the gate id is baked in.
                     let op = if dst.is_z2() { OP_MUL_Z2 } else { OP_MUL_L };
-                    Instr::unary(op, dst, sl(in0)).gid(gid)
+                    Instr::unary(op, dst, layout.slot(in0)).with_gid(gid)
                 }
             }
             Gate::Mod2k { in0, out, .. } => {
@@ -708,7 +705,7 @@ pub(crate) fn compile_garble(
                 check(&defined, &[in0]);
                 // Keep the low bits: Z₂→Z₂ copy, lanes→Z₂ bit-pack, or
                 // lanes→lanes truncate (shift 0, mask to dst width).
-                let src = sl(in0);
+                let src = layout.slot(in0);
                 if src.is_z2() {
                     Instr::unary(OP_COPY_Z2, dst, src)
                 } else if dst.is_z2() {
@@ -724,7 +721,7 @@ pub(crate) fn compile_garble(
                 check(&defined, &[in0]);
                 // Drop the low `k` bits: k = 0 is a copy, else a shift (packing
                 // to Z₂ when the quotient is one bit wide).
-                let src = sl(in0);
+                let src = layout.slot(in0);
                 if k == 0 {
                     Instr::unary(if dst.is_z2() { OP_COPY_Z2 } else { OP_COPY_L }, dst, src)
                 } else if dst.is_z2() {
@@ -752,7 +749,7 @@ pub(crate) fn compile_garble(
                 } else {
                     OP_HASH_ADD_L
                 };
-                Instr::binary(op, dst, sl(a), sl(ctrl)).gid(gid)
+                Instr::binary(op, dst, layout.slot(a), layout.slot(ctrl)).with_gid(gid)
             }
             Gate::Join { .. } => panic!(
                 "compile_garble: tape entry for Join gate {gid} — joins never \
@@ -770,7 +767,7 @@ pub(crate) fn compile_garble(
                 Instr::unary(
                     if dst.is_z2() { OP_COPY_Z2 } else { OP_COPY_L },
                     dst,
-                    sl(src),
+                    layout.slot(src),
                 )
             }
         };
@@ -827,10 +824,10 @@ pub(crate) fn garble_compiled(
 ) -> Program {
     assert_eq!(prog.inputs.len(), input_masks.len());
     arena.ensure(prog.z2_count, prog.lanes_count);
-    let dw = [delta as u64, (delta >> 64) as u64];
+    let delta_words = [delta as u64, (delta >> 64) as u64];
     for &(slot, neg_c) in &prog.consts {
         if slot.is_z2() {
-            arena.z2[slot.index()] = if neg_c == 0 { [0; 2] } else { dw };
+            arena.z2[slot.index()] = if neg_c == 0 { [0; 2] } else { delta_words };
         } else {
             let d = &mut arena.lanes[slot.index()];
             for (i, lane) in d.iter_mut().enumerate() {
@@ -884,8 +881,8 @@ pub(crate) fn garble_compiled(
             }
             OP_MUL_L => {
                 let mask = lane_mask(ins.k as u32);
-                let Gate::Mul { scalar, .. } = system.gates[ins.aux as usize] else {
-                    panic!("compiled Mul at gid {} is not a Mul gate", ins.aux)
+                let Gate::Mul { scalar, .. } = system.gates[ins.gid as usize] else {
+                    panic!("compiled Mul at gid {} is not a Mul gate", ins.gid)
                 };
                 let s = (scalar & mask as u64) as u32;
                 let [dv, av] = arena
@@ -897,8 +894,8 @@ pub(crate) fn garble_compiled(
                 }
             }
             OP_MUL_Z2 => {
-                let Gate::Mul { scalar, .. } = system.gates[ins.aux as usize] else {
-                    panic!("compiled Mul at gid {} is not a Mul gate", ins.aux)
+                let Gate::Mul { scalar, .. } = system.gates[ins.gid as usize] else {
+                    panic!("compiled Mul at gid {} is not a Mul gate", ins.gid)
                 };
                 arena.z2[d] = if scalar & 1 == 1 { arena.z2[a] } else { [0; 2] };
             }
@@ -938,7 +935,7 @@ pub(crate) fn garble_compiled(
             }
             OP_HASH_XOR_Z2 => {
                 let dst = Slot::z2(d);
-                arena.hash_solo_into(dst, Slot::z2(b), nonce_base + ins.aux as u64);
+                arena.hash_solo_into(dst, Slot::z2(b), nonce_base + ins.gid as u64);
                 let av = arena.z2[a];
                 let dv = &mut arena.z2[d];
                 dv[0] ^= av[0];
@@ -946,7 +943,7 @@ pub(crate) fn garble_compiled(
             }
             OP_HASH_ADD_L | OP_HASH_SUB_L => {
                 let dst = Slot::lanes(d, ins.k as u32);
-                arena.hash_solo_into(dst, Slot::z2(b), nonce_base + ins.aux as u64);
+                arena.hash_solo_into(dst, Slot::z2(b), nonce_base + ins.gid as u64);
                 let mask = lane_mask(ins.k as u32);
                 let [dv, av] = arena
                     .lanes
@@ -1106,18 +1103,18 @@ fn fused_fire(
             ];
             for (dst, a, b, sub) in dirs {
                 if !known(wl, dst) && known(wl, a) && known(wl, b) {
-                    let ds = layout.slot(dst);
-                    let m = val_mask(ds);
+                    let dst_slot = layout.slot(dst);
+                    let m = val_mask(dst_slot);
                     let v = if sub {
                         vals[a.wid].wrapping_sub(vals[b.wid]) & m
                     } else {
                         vals[a.wid].wrapping_add(vals[b.wid]) & m
                     };
                     set!(dst, v, {
-                        if ds.is_z2() {
-                            arena.xor_z2(ds, layout.slot(a), layout.slot(b));
+                        if dst_slot.is_z2() {
+                            arena.xor_z2(dst_slot, layout.slot(a), layout.slot(b));
                         } else {
-                            arena.addsub_lanes(ds, layout.slot(a), layout.slot(b), sub);
+                            arena.addsub_lanes(dst_slot, layout.slot(a), layout.slot(b), sub);
                         }
                     });
                 }
@@ -1126,20 +1123,20 @@ fn fused_fire(
         }
         Gate::Mul { in0, scalar, out } => {
             if !known(wl, out) && known(wl, in0) {
-                let ds = layout.slot(out);
-                let v = scalar.wrapping_mul(vals[in0.wid]) & val_mask(ds);
+                let dst_slot = layout.slot(out);
+                let v = scalar.wrapping_mul(vals[in0.wid]) & val_mask(dst_slot);
                 set!(out, v, {
                     let src = layout.slot(in0);
                     if scalar == 0 {
-                        arena.zero(ds);
-                    } else if ds.is_z2() {
+                        arena.zero(dst_slot);
+                    } else if dst_slot.is_z2() {
                         if scalar & 1 == 1 {
-                            arena.copy(ds, src);
+                            arena.copy(dst_slot, src);
                         } else {
-                            arena.zero(ds);
+                            arena.zero(dst_slot);
                         }
                     } else {
-                        arena.mul_lanes(ds, src, scalar);
+                        arena.mul_lanes(dst_slot, src, scalar);
                     }
                 });
             }
@@ -1147,14 +1144,14 @@ fn fused_fire(
         }
         Gate::Mod2k { in0, out, .. } => {
             if !known(wl, out) && known(wl, in0) {
-                let ds = layout.slot(out);
-                let v = vals[in0.wid] & val_mask(ds);
+                let dst_slot = layout.slot(out);
+                let v = vals[in0.wid] & val_mask(dst_slot);
                 set!(out, v, {
                     let src = layout.slot(in0);
                     if src.is_z2() {
-                        arena.copy(ds, src);
+                        arena.copy(dst_slot, src);
                     } else {
-                        arena.shift_mask(ds, src, 0);
+                        arena.shift_mask(dst_slot, src, 0);
                     }
                 });
             }
@@ -1162,20 +1159,20 @@ fn fused_fire(
         }
         Gate::Div2k { in0, k, out } => {
             if !known(wl, out) && known(wl, in0) {
-                let ds = layout.slot(out);
+                let dst_slot = layout.slot(out);
                 debug_assert!(
                     k == 0 || vals[in0.wid] & ((1u64 << k) - 1) == 0,
                     "div2k: {} not divisible by 2^{}",
                     vals[in0.wid],
                     k
                 );
-                let v = (vals[in0.wid] >> k) & val_mask(ds);
+                let v = (vals[in0.wid] >> k) & val_mask(dst_slot);
                 set!(out, v, {
                     let src = layout.slot(in0);
                     if k == 0 {
-                        arena.copy(ds, src);
+                        arena.copy(dst_slot, src);
                     } else {
-                        arena.shift_mask(ds, src, k);
+                        arena.shift_mask(dst_slot, src, k);
                     }
                 });
             }

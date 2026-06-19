@@ -332,7 +332,7 @@ fn accumulate_pads_neon(
     debug_assert!((1..=11).contains(&lg_p), "NEON gate admits 2 ≤ p ≤ 1625");
     // Per-slot weights g = truth_table[i] mod p, hoisted out of the
     // member-major walk (g < p ≤ 1625 fits u32 by the gate).
-    let gs: Vec<u32> = truth_table.iter().map(|&t| (t % p_i) as u32).collect();
+    let weights: Vec<u32> = truth_table.iter().map(|&t| (t % p_i) as u32).collect();
     let full = b & !3; // members [0, full) in groups of 4; tail goes scalar.
 
     // SAFETY: NEON intrinsics — the cfg above pins target_arch + feature. The
@@ -380,7 +380,7 @@ fn accumulate_pads_neon(
 
         // 8 members per slot pass: two independent accumulator pairs keep
         // both halves' dependency chains in flight on the NEON pipes and
-        // halve the per-slot loop overhead (gs load, skip check, pointers).
+        // halve the per-slot loop overhead (weights load, skip check, pointers).
         let full8 = b & !7;
         for j0 in (0..full8).step_by(8) {
             let (off_a, sh01_a, sh23_a) = group_consts(j0);
@@ -389,7 +389,7 @@ fn accumulate_pads_neon(
             let mut ro_a = vdupq_n_u32(0);
             let mut ps_b = vdupq_n_u32(0);
             let mut ro_b = vdupq_n_u32(0);
-            for (i, &g) in gs.iter().enumerate() {
+            for (i, &g) in weights.iter().enumerate() {
                 if Some(i) == skip {
                     continue;
                 }
@@ -411,7 +411,7 @@ fn accumulate_pads_neon(
             let (off_a, sh01_a, sh23_a) = group_consts(j0);
             let mut ps = vdupq_n_u32(0);
             let mut ro = vdupq_n_u32(0);
-            for (i, &g) in gs.iter().enumerate() {
+            for (i, &g) in weights.iter().enumerate() {
                 if Some(i) == skip {
                     continue;
                 }
