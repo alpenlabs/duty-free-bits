@@ -11,7 +11,7 @@
 //!
 //! NOTE: this table-based AES is **not constant-time**. It exists so the crate
 //! compiles and CI runs off-aarch64; the production target is aarch64. A
-//! constant-time / bitsliced fallback is future work (see the architecture spec).
+//! constant-time / bitsliced fallback is future work.
 
 /// The 11 AES-128 round keys (round 0 = whitening, rounds 1..=10 the rounds).
 pub type RoundKeys = [[u8; 16]; 11];
