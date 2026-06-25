@@ -131,8 +131,7 @@ fn seed_masks(
 
 /// Emission phase shared by every entry point: join diffs (the only
 /// switch-system communication) and output masks in deterministic order.
-/// Switches emit nothing — the evaluator derives every control from cleartext
-/// `x` (paper §3.3).
+/// Switches emit nothing — the evaluator derives every control from cleartext.
 fn emit_program(system: &System, masks: &[Option<Label>], output_wires: &[Wire]) -> Program {
     let mut program = Program::with_num_gates(system.num_gates());
     for (gid, &g) in system.gates.iter().enumerate() {
