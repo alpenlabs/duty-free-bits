@@ -278,8 +278,7 @@ impl System {
     /// Group indices key bulk-domain CCRH calls and restart at 0 per System;
     /// the streaming kernels draw their bulk ids above
     /// `affine::KERNEL_NONCE_FLOOR` (2^32), so in-System groups own
-    /// `[0, 2^32)`. A System registering ≥ 2^32 groups would violate
-    /// Definition-4 nonce freshness against the kernels.
+    /// `[0, 2^32)`. A System cannot register more than 2^32 groups.
     ///
     /// The garbler/evaluator will derive each member's hash from a single wide
     /// CCRH call keyed on the shared control label and the group id, slicing
