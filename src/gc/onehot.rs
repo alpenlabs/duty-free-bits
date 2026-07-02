@@ -264,7 +264,7 @@ pub(crate) fn tree_garble(k: u32, lvl1: [Z2; 2], bulk_base: u64) -> (Vec<Z2>, Ve
 /// casts (halved in place).
 pub(crate) fn peel_chain(mut acc: Vec<Wide>) -> (Vec<Wide>, Wide) {
     let k = acc.len().trailing_zeros();
-    let mut res_chain: Vec<Wide> = Vec::with_capacity(k as usize);
+    let mut chain: Vec<Wide> = Vec::with_capacity(k as usize);
     // H_j for j = k−1 down to 1, gathered during halving.
     let mut highs: Vec<Wide> = Vec::with_capacity(k as usize);
     while acc.len() > 2 {
@@ -280,17 +280,17 @@ pub(crate) fn peel_chain(mut acc: Vec<Wide>) -> (Vec<Wide>, Wide) {
     }
     // Level 1: res_1 = S_1[1]; H_0-style entry not needed (bit 0 is native).
     let mut res = acc[1];
-    res_chain.push(res);
+    chain.push(res);
     // res_{j+1} = res_j + 2^j·H_j, H_j in reverse gather order.
     for (j, high) in (1..k).zip(highs.iter().rev()) {
         let mut r = res;
         wide_madd(&mut r, 1u32 << j, high);
-        res_chain.push(r);
+        chain.push(r);
         res = r;
     }
     let mut root = acc[0];
     wide_add(&mut root, &acc[1]);
-    (res_chain, root)
+    (chain, root)
 }
 
 #[cfg(test)]
