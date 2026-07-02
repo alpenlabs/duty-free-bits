@@ -140,7 +140,8 @@ impl GarnerDecoder {
         let t = primes.len();
         // Hard bound (not debug-only: decode runs in release): reconstruct's
         // delayed-reduction accumulator needs Σ_{j<t} c_j·w_j < 2^64 with
-        // c_j < p_max and w_j < p_max, and diff·inv < 2^64 with both < p_max.
+        // c_j, w_j < p_max, and diff·inv < 2^64 with both < p_max. The assert
+        // uses p²·t < 2^63 — one bit under that 2^64 ceiling, for headroom.
         for &p in primes {
             assert!(
                 (p as u128) * (p as u128) * (t as u128) < (1u128 << 63),
@@ -263,7 +264,7 @@ pub fn crt_reconstruct(residues: &[u64], primes: &[u64]) -> U576 {
     }
 
     // Reconstruct from mixed-radix coefficients into U576.
-    // coeffs[i] < p_i <= 409, so casting to u64 is safe.
+    // coeffs[i] < p_i (a u64), so the u128 → u64 cast is safe.
     let mut result = U576::from_u64(coeffs[0] as u64);
     let mut product = U576::ONE;
     for i in 1..t {

@@ -49,11 +49,9 @@ pub(crate) fn wide_label(w: &Wide, modulus: u64) -> Label {
 /// `dst += src` lane-wise, mod 2^32.
 ///
 /// The lane ops run UNMASKED: wrapping u32 arithmetic is a ring homomorphism
-/// onto Z_{2^l} under truncation, so the `& (2^l − 1)` happens once at the
-/// boundaries that make wire objects canonical ([`wide_label`], the pin
-/// emission, and the Z₂ packing of bits below the preserved width — the peel
-/// shifts and [`peel_bit`] masks are defensive, not load-bearing) instead of
-/// on every op.
+/// onto Z_{2^l} under truncation, so the `& (2^l − 1)` is applied only at the
+/// boundaries that make a wire canonical ([`wide_label`], the pin emission, and
+/// the Z₂ packing of bits below the preserved width) — not on every op.
 #[inline]
 pub(crate) fn wide_add(dst: &mut Wide, src: &Wide) {
     for (d, s) in dst.iter_mut().zip(src) {

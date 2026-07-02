@@ -194,7 +194,7 @@ impl Fp {
             rng.random::<u64>(),
             rng.random::<u64>() & ((1u64 << 62) - 1),
         ];
-        Fp(csub_p(v)) // v < 2²⁵⁴ < 2p, so one conditional subtract suffices
+        Fp(csub_p(v))
     }
 
     /// Canonical 32-byte little-endian encoding.
@@ -466,14 +466,13 @@ pub fn eval(g: &Garbling, active: &[Block], x: Fp, ledger: &mut HashLedger) -> V
             None
         };
         match ct {
-            // Stored: rᵢⱼ = ctⱼ + pad (both field elements, mod p).
+            // Stored row: rᵢⱼ = ctⱼ ⊕ pad — XOR-unmask to the canonical value (< p).
             Some(ct) => {
                 for ((cj, pj), accj) in ct
                     .chunks_exact(FE_LIMBS)
                     .zip(pad_raw.chunks_exact(FE_LIMBS))
                     .zip(acc.iter_mut())
                 {
-                    // rᵢⱼ = ctⱼ ⊕ pad — the decrypted canonical value (< p).
                     let r = Fp([cj[0] ^ pj[0], cj[1] ^ pj[1], cj[2] ^ pj[2], cj[3] ^ pj[3]]);
                     *accj = accj.double_add(r);
                 }

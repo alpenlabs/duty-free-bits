@@ -313,9 +313,8 @@ pub fn build_s_aff<R: rand::Rng>(
 /// steps): the fold/body per-prime windows from [`BULK_NONCE_FLOOR`], then
 /// the chunk tree windows, then the per-prime extract tree windows above
 /// those. This struct is the single source of truth the driver draws its
-/// bases from, and `test_nonce_windows_disjoint` pins the partition —
-/// nonce-collision regressions are otherwise invisible to output tests
-/// (both parties share the layout, so colliding windows still decode).
+/// bases from; `test_nonce_windows_disjoint` pins the partition (a regression
+/// output tests cannot catch — the test explains why).
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct NonceLayout {
     pub chunk_solo_ids: u64,

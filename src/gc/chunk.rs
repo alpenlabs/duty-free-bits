@@ -24,7 +24,7 @@ pub fn chunk_nonces(n_bits: u32) -> (u64, u64) {
 pub struct ChunkGarbleOutput {
     /// Mask of the chunk word (CF Z_{2^ell}).
     pub word_mask: Label,
-    /// The n−1 scale-join diffs and the width-ell pin diff.
+    /// Scale-join diff per tree level (lg n − 1 of them, Z₂).
     pub scale: Vec<Z2>,
     /// Pin-join diff (width ell).
     pub pin: Wide,
@@ -45,7 +45,7 @@ pub fn chunk_batch_garble(
     let nb = bit_masks.len() as u32;
     assert!(
         (2..=31).contains(&ell) && ell >= nb,
-        "chunk step requires 2 <= nb <= ell <= 31 (got nb={nb}, ell={ell})"
+        "chunk step requires nb <= ell and 2 <= ell <= 31 (got nb={nb}, ell={ell})"
     );
     let mask_l = ((1u64 << ell) - 1) as u32;
     let d2 = {
@@ -65,6 +65,9 @@ pub fn chunk_batch_garble(
     let (chain, root) = peel_chain(casts);
     let word_mask = chain[nb as usize - 1]; // Σ p·A_p
 
+    // Scale diffs (y_m ⊕ X_{bit_m}) let the evaluator solve each level's open
+    // slot; the pin diff (root + Δ_ℓ = X_root − X_one, X_one = −Δ_ℓ) solves the
+    // one open root cast.
     let scale: Vec<Z2> = ysums
         .iter()
         .zip(bit_masks.iter().skip(1))
@@ -102,7 +105,7 @@ pub fn chunk_batch_eval(
     let nb = bit_labels.len() as u32;
     assert!(
         (2..=31).contains(&ell) && ell >= nb,
-        "chunk step requires 2 <= nb <= ell <= 31 (got nb={nb}, ell={ell})"
+        "chunk step requires nb <= ell and 2 <= ell <= 31 (got nb={nb}, ell={ell})"
     );
 
     // Tree: expand every level; the hot slot solves through the scale join.

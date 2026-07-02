@@ -69,7 +69,7 @@ pub fn body_batch_garble(
     // pad_i = H(h_p[i]) for each one-hot slot, bulk-packed across the b members.
     let slot_hash = slot_pads(h_p_masks, group_id_base, b, p_i);
 
-    // Σ pad_i and Σ g_i·pad_i per member, delayed reduction (see accumulate_pads).
+    // Delayed reduction — see accumulate_pads.
     let mut pad_sum_raw = vec![0u64; b]; // Σ_i pad_i (unreduced)
     let mut readout_raw = vec![0u64; b]; // Σ_i g_i·pad_i (unreduced)
     accumulate_pads(
@@ -133,7 +133,7 @@ pub fn body_batch_eval(
     let slot_hash = slot_pads(h_p_labels, group_id_base, b, p_i);
     let g_hot = weights[hot] % p_i;
 
-    // Σ pads over every slot but `hot`, delayed reduction (see accumulate_pads).
+    // Delayed reduction — see accumulate_pads.
     let mut pad_sum_raw = vec![0u64; b]; // Σ_{i≠hot} pad_i  (every pad we can recompute)
     let mut readout_raw = vec![0u64; b]; // Σ_{i≠hot} g(i)·pad_i
     accumulate_pads(
@@ -549,9 +549,6 @@ mod tests {
                 a_batch[j], b_batch[j],
             );
         }
-
-        // Accidentally getting the hash invocations wrong would fail this — just keep h_p_masks alive.
-        let _ = h_p_masks;
     }
 
     /// Differential test for the SIMD dispatch: the auto kernel (NEON on
