@@ -169,19 +169,22 @@ own `[0, 2^32)`, the kernels draw above `KERNEL_NONCE_FLOOR = 2^32`.
 ## 6. Performance
 
 On an Apple M1 P-core (single-threaded, `cargo test --release`), the kernel
-path runs the reference workload in **~0.033 s/rep**, **~0.58 G instructions /
-~0.10 G cycles** per rep, ~8 MB peak (`bench_kernel_loop`). The `System`
-reference path measures ~0.058 s / ~0.93 G instructions / ~0.18 G cycles on
-the same binary (`bench_stream_loop`). The full `x + y` application is two
-such runs.
+path runs the reference workload in **~0.030 s/rep**, ~8 MB peak
+(`bench_kernel_loop`). The `System` reference path measures ~0.058 s on the
+same binary (`bench_stream_loop`). The full `x + y` application is two such
+runs.
 
-Per-stage split of the kernel path (ms/rep, garble + eval): body ≈ 19 (at its
-MAC floor: one multiply-accumulate per (slot, member), ~46 M per rep across
-both parties), extract ≈ 9.5, fold ≈ 2, chunk ≈ 1.5. The extract/chunk/fold
-kernels sit near their AES-block + lane-op floors (a cast measures ~46 ns
-averaged over the production widths, against a ~29 ns AES floor at the same
-mix); the remaining headroom is protocol-level
-(fewer MACs/hashes) or cross-prime parallelism, not execution machinery.
+Per-stage split of the kernel path (ms/rep, garble + eval): body ≈ 16,
+extract ≈ 9.5, fold ≈ 2, chunk ≈ 1.5. The body's pads are nibble-aligned raw
+slices (see `it_gc::pad_bits`): extraction is load + shift + mask with no
+per-pad reduction, trading ~23 % more body AES blocks for eliminating the
+bit-surgery that previously dominated its non-hash time (−24 % on the body
+at large S), and shrinking the pad-sampling bias from `2^⌈lg p⌉ mod p` to
+`2^w mod p`. The extract/chunk/fold kernels sit near their AES-block +
+lane-op floors (a cast measures ~46 ns averaged over the production widths,
+against a ~29 ns AES floor at the same mix); the remaining headroom is
+protocol-level (fewer MACs/hashes) or cross-prime parallelism, not execution
+machinery.
 
 > Measure with hardware counters, not wall time — the M1 throttles under
 > ambient load (scaling wall time but not instructions/cycles):

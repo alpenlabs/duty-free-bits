@@ -101,14 +101,15 @@ pub fn body_batch_garble(
 }
 
 /// Garbled-material footprint of a `b`-member body batch mod `p_i`: one join diff
-/// of `lg|p_i|` bits per member, and `p_i` switch hashes of `b·lg|p_i|` bits each
-/// (one CCRH block per `λ` bits).
+/// of `lg|p_i|` bits per member (communication is unchanged by the pad
+/// layout), and `p_i` switch hashes of `b·pad_bits` bits each (one CCRH
+/// block per `λ` bits — see [`pad_bits`] for the alignment trade).
 fn batch_cost(p_i: u64, b: usize) -> BatchCost {
     let join_bits = b * hash::lg_modulus(p_i);
     BatchCost {
         program_bits: join_bits,
         join_complexity_ncf: join_bits,
-        hash_count_ncf: p_i as usize * join_bits.div_ceil(LAMBDA),
+        hash_count_ncf: p_i as usize * (b * pad_bits(p_i)).div_ceil(LAMBDA),
     }
 }
 
@@ -197,7 +198,25 @@ fn eval_outputs_from_sums(
         .collect()
 }
 
-/// Slot-major slab of the per-slot bulk hashes: slot `i`'s `b·lg|p_i|` pad
+/// Bits of hash output sliced per pad: `lg|p_i|` rounded up to a nibble
+/// (4, 8, or 12 for our prime range).
+///
+/// Nibble alignment makes every pad's bit phase 0 or 4, so extraction is a
+/// load + fixed shift + mask with NO per-pad reduction: the raw `w`-bit slice
+/// is accumulated as-is and the fold's single `% p` per member reduces it
+/// (`pad ≡ slice mod p`; both parties slice identically, so the shared Z_p
+/// pad value is unchanged in kind). Two effects, both bought with more AES
+/// blocks per slot (`⌈b·w/λ⌉` vs `⌈b·lg p/λ⌉`, ≤ 4/3 at the dominant widths):
+/// the extraction bit-surgery that dominated the body's non-hash time
+/// disappears, and the pad-sampling bias shrinks from `2^⌈lg p⌉ mod p`
+/// (documented on [`hash::lg_modulus`], up to ~20% at p = 409) to
+/// `2^w mod p` (< 0.2%). Join diffs — the actual communication — remain
+/// `lg|p_i|`-bit residues.
+fn pad_bits(p_i: u64) -> usize {
+    hash::lg_modulus(p_i).next_multiple_of(4)
+}
+
+/// Slot-major slab of the per-slot bulk hashes: slot `i`'s `b·pad_bits` pad
 /// bits occupy `bytes[i·stride .. i·stride + exact_len]`, where `stride` is
 /// `exact_len` rounded up to a u64 boundary. 8 trailing zero bytes guarantee
 /// that any u64 load starting inside a slot's exact region stays in bounds.
@@ -211,8 +230,8 @@ struct HashSlab {
 /// Garbler and evaluator call this identically (on masks / labels); at every
 /// non-hot slot the two agree, which is what lets `pad_i` line up.
 fn switch_hashes(ohe: &[Label], group_id_base: usize, b: usize, p_i: u64) -> HashSlab {
-    let lg_p = hash::lg_modulus(p_i);
-    let total_bits = b * lg_p;
+    let w = pad_bits(p_i);
+    let total_bits = b * w;
     let exact_len = total_bits.div_ceil(8);
     let stride = exact_len.div_ceil(8) * 8;
     // One allocation for the whole batch; intra-slot padding and the 8-byte
@@ -234,9 +253,10 @@ fn switch_hashes(ohe: &[Label], group_id_base: usize, b: usize, p_i: u64) -> Has
 /// `pad_sum_raw` / `readout_raw`, skipping slot `skip` entirely when given
 /// (eval's hot slot — always a whole-slot skip, never a per-member one).
 ///
-/// Delayed reduction: pads and weights are both < p, so with p³ < 2⁶³ the u64
-/// sums `Σ pad_i` (< p²) and `Σ g_i·pad_i` (< p³, at most p terms) cannot
-/// overflow — one `% p` per member at the fold replaces one per slot.
+/// Delayed reduction: pads are raw `w`-bit slices (< 2^w, see [`pad_bits`])
+/// and weights are < p, so with p²·2^w < 2⁶³ the u64 sums `Σ pad_i`
+/// (< p·2^w) and `Σ g_i·pad_i` (< p²·2^w, at most p terms) cannot overflow —
+/// one `% p` per member at the fold replaces one per pad.
 ///
 /// Dispatches to the NEON kernel on aarch64 when the modulus fits its u32
 /// accumulators (see the gate below); the scalar kernel is both the portable
@@ -251,19 +271,20 @@ fn accumulate_pads(
     pad_sum_raw: &mut [u64],
     readout_raw: &mut [u64],
 ) {
+    let w = pad_bits(p_i);
     assert!(
-        (p_i as u128) * (p_i as u128) * (p_i as u128) < (1u128 << 63),
+        (p_i as u128) * (p_i as u128) * (1u128 << w) < (1u128 << 63),
         "delayed-reduction accumulators would overflow for p = {p_i}"
     );
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
     {
         // u32-accumulator bound, b-independent: readout_raw[j] sums at most
-        // p terms (one per slot), each g·pad < p², so the total is < p³; u32
-        // is exact iff p³ < 2³², i.e. p ≤ 1625. That bound also caps
-        // lg_p ≤ 11, which the NEON kernel's single-u64 group load needs.
-        // p ≥ 2 keeps the slab's exact region non-empty (lg_p ≥ 1).
+        // p terms (one per slot), each g·pad < p·2^w (pads are raw w-bit
+        // slices), so the total is < p²·2^w; u32 is exact iff p²·2^w < 2³²,
+        // i.e. p ≤ 1023 at w = 12. w ≤ 12 also keeps a 4-pad group inside
+        // one u64 load. p ≥ 2 keeps the slab's exact region non-empty.
         let p128 = p_i as u128;
-        if p_i >= 2 && p128 * p128 * p128 < (1u128 << 32) {
+        if p_i >= 2 && p128 * p128 * (1u128 << w) < (1u128 << 32) {
             accumulate_pads_neon(slab, truth_table, skip, p_i, pad_sum_raw, readout_raw);
             return;
         }
@@ -283,7 +304,7 @@ fn accumulate_pads_scalar(
     pad_sum_raw: &mut [u64],
     readout_raw: &mut [u64],
 ) {
-    let lg_p = hash::lg_modulus(p_i);
+    let w = pad_bits(p_i);
     for (i, &t) in truth_table.iter().enumerate() {
         if Some(i) == skip {
             continue;
@@ -296,7 +317,7 @@ fn accumulate_pads_scalar(
             .enumerate()
             .skip(j_lo)
         {
-            let pad = extract_pad(&slab.bytes, base, j, lg_p, p_i);
+            let pad = extract_pad(&slab.bytes, base, j, w);
             *ps += pad;
             *ro += g * pad;
         }
@@ -306,16 +327,19 @@ fn accumulate_pads_scalar(
 /// NEON pad accumulation: 4 members per u32 lane group, member-major so each
 /// group's accumulators stay in registers across the whole slot walk.
 ///
-/// Caller-guaranteed bounds (the dispatch gate): `2 ≤ p` and `p³ < 2³²`. Then
-/// * the u32 lanes are exact — pad-sum lanes stay < p² and readout lanes
-///   < p³ < 2³² across all ≤ p slots, so no lane ever wraps and one widening
-///   into the u64 sums per group reproduces the scalar totals bit for bit;
-/// * lg_p ≤ 11, so a group's four pads span ≤ 7 + 4·11 = 51 bits of one
-///   unaligned u64 load (≤ 7 is the load's bit phase, `shift0`).
+/// Caller-guaranteed bounds (the dispatch gate): `2 ≤ p` and `p²·2^w < 2³²`.
+/// Then
+/// * the u32 lanes are exact — pad-sum lanes stay < p·2^w and readout lanes
+///   < p²·2^w < 2³² across all ≤ p slots, so no lane ever wraps and one
+///   widening into the u64 sums per group reproduces the scalar totals bit
+///   for bit;
+/// * w ≤ 12 with nibble alignment, so a group's four pads span
+///   ≤ 4 + 4·12 = 52 bits of one unaligned u64 load (≤ 4 is the load's bit
+///   phase, `shift0`).
 ///
 /// Per lane this is the vector transcription of [`extract_pad`]: right-shift
 /// the group word so the lane's pad starts at bit 0 (vshlq by a negative
-/// count), mask to lg_p bits, one compare-subtract — identical pad values.
+/// count), mask to w bits — raw slices, no per-pad reduction.
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 fn accumulate_pads_neon(
     slab: &HashSlab,
@@ -328,10 +352,10 @@ fn accumulate_pads_neon(
     use core::arch::aarch64::*;
 
     let b = pad_sum_raw.len();
-    let lg_p = hash::lg_modulus(p_i);
-    debug_assert!((1..=11).contains(&lg_p), "NEON gate admits 2 ≤ p ≤ 1625");
+    let w = pad_bits(p_i);
+    debug_assert!((4..=12).contains(&w), "NEON gate admits 2 ≤ p ≤ 1023");
     // Per-slot weights g = truth_table[i] mod p, hoisted out of the
-    // member-major walk (g < p ≤ 1625 fits u32 by the gate).
+    // member-major walk (g < p ≤ 1023 fits u32 by the gate).
     let weights: Vec<u32> = truth_table.iter().map(|&t| (t % p_i) as u32).collect();
     let full = b & !3; // members [0, full) in groups of 4; tail goes scalar.
 
@@ -340,32 +364,29 @@ fn accumulate_pads_neon(
     // i.e. inside slot i's exact region (j0·lg_p < total_bits), which the
     // slab's 8 trailing bytes keep in bounds for an 8-byte read (see HashSlab).
     unsafe {
-        let p_v = vdupq_n_u32(p_i as u32);
-        let mask_v = vdupq_n_u32((1u32 << lg_p) - 1);
+        let mask_v = vdupq_n_u32((1u32 << w) - 1);
         // Per-4-member-group constants: the group's byte offset into a slot
         // and the per-lane alignment shifts.
         let group_consts = |j0: usize| {
-            let bit_off = j0 * lg_p;
+            let bit_off = j0 * w;
             let shift0 = (bit_off & 7) as i64;
             // vshlq with a negative count right-shifts: lane k's count drops
-            // the bits below its pad, [shift0 + k·lg_p ..][..lg_p].
-            let shifts = [0i64, 1, 2, 3].map(|k| -(shift0 + k * lg_p as i64));
+            // the bits below its pad, [shift0 + k·w ..][..w].
+            let shifts = [0i64, 1, 2, 3].map(|k| -(shift0 + k * w as i64));
             (
                 bit_off >> 3,
                 vld1q_s64(shifts.as_ptr()),
                 vld1q_s64(shifts.as_ptr().add(2)),
             )
         };
-        // One group of 4 pads from a slot's raw u64 window.
+        // One group of 4 raw pads from a slot's u64 window (no reduction:
+        // the fold's % p absorbs it — see extract_pad).
         let pads4 = |raw: u64, sh01, sh23| {
             let v = vdupq_n_u64(raw);
-            let acc = vandq_u32(
+            vandq_u32(
                 vcombine_u32(vmovn_u64(vshlq_u64(v, sh01)), vmovn_u64(vshlq_u64(v, sh23))),
                 mask_v,
-            );
-            // acc < 2^⌈log₂ p⌉ < 2p, so subtracting p exactly where
-            // acc ≥ p matches extract_pad's compare-subtract.
-            vsubq_u32(acc, vandq_u32(vcgeq_u32(acc, p_v), p_v))
+            )
         };
         let widen = |j0: usize, ps, ro, pad_sum_raw: &mut [u64], readout_raw: &mut [u64]| {
             let mut ps_arr = [0u32; 4];
@@ -430,23 +451,19 @@ fn accumulate_pads_neon(
     }
 }
 
-/// Member `j`'s pad `pad_i` (an NCF Z_p residue) sliced from slot `i`'s bulk
-/// hash: bits `[j·lg_p .. (j+1)·lg_p)` past `base = i·stride`, reduced into Z_p.
-///
-/// Computes the same value as [`hash::extract_ncf`] (LSB-first bit slice, then
-/// `% p`), but via a single unconditional u64 load instead of a per-bit loop —
-/// the slab's 8-byte tail keeps the load in bounds, and the `lg_p`-bit mask
-/// keeps padding bytes out of the value — and a compare-subtract instead of a
-/// division (`acc < 2^⌈lg p⌉ < 2p`).
+/// Member `j`'s RAW pad slice from slot `i`'s bulk hash: bits
+/// `[j·w .. (j+1)·w)` past `base = i·stride`, w = [`pad_bits`]. The value is
+/// NOT reduced mod p — the accumulators run unreduced and the fold's single
+/// `% p` per member reduces the sums (see [`accumulate_pads`]). Nibble
+/// alignment keeps the bit phase in {0, 4}; the slab's 8-byte tail keeps the
+/// unconditional u64 load in bounds.
 #[inline(always)]
-fn extract_pad(slab: &[u8], base: usize, member_idx: usize, lg_p: usize, p: u64) -> u64 {
-    debug_assert!(lg_p <= 57, "extract_pad u64 load covers ≤ 57-bit slices");
-    let bit_off = member_idx * lg_p;
+fn extract_pad(slab: &[u8], base: usize, member_idx: usize, w: usize) -> u64 {
+    debug_assert!(w <= 57, "extract_pad u64 load covers ≤ 57-bit slices");
+    let bit_off = member_idx * w;
     let byte = base + (bit_off >> 3);
     let raw = u64::from_le_bytes(slab[byte..byte + 8].try_into().unwrap());
-    let acc = (raw >> (bit_off & 7)) & ((1u64 << lg_p) - 1);
-    // acc < 2^⌈log₂ p⌉ < 2p, so one conditional subtract equals `acc % p`.
-    if acc >= p { acc - p } else { acc }
+    (raw >> (bit_off & 7)) & ((1u64 << w) - 1)
 }
 
 // NCF Z_p label algebra. A label is its residue, so the gate operations are
