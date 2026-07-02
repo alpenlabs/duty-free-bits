@@ -1,7 +1,7 @@
 //! Benchmarks and end-to-end correctness tests for the a·x+b protocol.
 //!
 //! Unit tests for the individual steps live in their modules' `#[cfg(test)]`
-//! blocks (`comp_gc::extract`, `comp_gc::fold`, `it_gc`, `crt`, `label`).
+//! blocks (`gc::extract`, `gc::fold`, `it_gc`, `crt`, `label`).
 
 use crate::crt::bigint::{FIRST_80_PRIMES, U576};
 use crate::crt::{CrtParams, GarnerDecoder};

@@ -10,7 +10,7 @@ use crate::label::Label;
 /// primes are — reducing this tight `⌈log₂ p⌉`-bit slice mod `p` is slightly
 /// non-uniform: residues `0..(2^⌈log₂ p⌉ − p)` occur twice as often as the
 /// rest. The IT-GC body widens its slice to a nibble to shrink this bias (see
-/// `it_gc::pad_bits`).
+/// `gc::body::pad_bits`).
 pub fn lg_modulus(modulus: u64) -> usize {
     if modulus <= 1 {
         0

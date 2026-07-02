@@ -6,22 +6,22 @@
 //! straight-line steps over bare labels — no gate graph, no worklist:
 //!
 //!   1. **Chunk conversion**: partition n bits into ⌈n/lg n⌉ chunks, convert
-//!      each to a word in Z_{2^ℓ} ([`crate::comp_gc::extract`]).
+//!      each to a word in Z_{2^ℓ} ([`crate::gc::extract`]).
 //!   2. **Extract**: per prime, form r_i ≡ x (mod p_i) and decompose it into
-//!      sub-chunk bits + a binary one-hot ([`crate::comp_gc::extract`]).
+//!      sub-chunk bits + a binary one-hot ([`crate::gc::extract`]).
 //!   3. **Fold**: reduce to a length-p_i binary one-hot `h_p` of x mod p_i
-//!      ([`crate::comp_gc::fold`]).
+//!      ([`crate::gc::fold`]).
 //!   4. **Body**: the information-theoretic GC delivers a·(x mod p_i) + b
-//!      from `h_p` ([`crate::it_gc`]).
+//!      from `h_p` ([`crate::gc::body`]).
 
-use crate::comp_gc::extract::{
-    chunk_batch_eval, chunk_batch_garble, chunk_nonces, compute_sub_widths,
-    extract_batch_eval, extract_batch_garble, extract_nonces,
-};
-use crate::comp_gc::fold::{fold_batch_eval, fold_batch_garble};
 use crate::crt::{CrtParams, pow2_mod};
 use crate::crypto::nonce;
-use crate::it_gc::{body_batch_eval, body_batch_garble};
+use crate::gc::body::{body_batch_eval, body_batch_garble};
+use crate::gc::chunk::{chunk_batch_eval, chunk_batch_garble, chunk_nonces};
+use crate::gc::extract::{
+    compute_sub_widths, extract_batch_eval, extract_batch_garble, extract_nonces,
+};
+use crate::gc::fold::{fold_batch_eval, fold_batch_garble};
 use crate::label::{self, LAMBDA, Label};
 use rand::Rng;
 
@@ -99,7 +99,7 @@ impl Stats {
 
 /// Garble + evaluate the affine maps: chunk conversion → per-prime extract
 /// → fold → body, all straight-line loops over bare labels
-/// ([`crate::comp_gc::extract`], [`crate::comp_gc::fold`], [`crate::it_gc`]).
+/// ([`crate::gc::extract`], [`crate::gc::fold`], [`crate::gc::body`]).
 /// No gate graph, no worklist: the evaluator knows `x_bits` (switch-private /
 /// data-public), so every derivation order is closed-form.
 ///
