@@ -54,7 +54,7 @@ pub struct BodyBatchGarbleOutput {
     pub cost: BatchCost,
 }
 
-/// Garbler kernel for one per-prime body batch (see the module docs): forms the
+/// Garbler side of one per-prime body batch (see the module docs): forms the
 /// per-slot pads, sends `diff = Σ pad_i + a` per member.
 ///
 /// `h_p_masks` are the carry-in CF Z_2 masks for the length-`p_i` one-hot;
@@ -113,7 +113,7 @@ fn batch_cost(p_i: u64, b: usize) -> BatchCost {
     }
 }
 
-/// Evaluator kernel for one per-prime body batch: the label-side mirror of
+/// Evaluator side of one per-prime body batch: the label-side mirror of
 /// [`body_batch_garble`] (see the module docs).
 ///
 /// `hot = x mod p_i` is supplied in cleartext — the evaluator knows `x`, so the

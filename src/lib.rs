@@ -14,7 +14,7 @@
 //!   chunk conversion, sub-chunk extraction, and the mod-p fold.
 //! * [`it_gc`] — the information-theoretic GC (Phase 3: hot(CRT(x)) → `a·x+b`).
 //! * [`affine`] — composes the steps into the production driver
-//!   ([`affine::build_s_aff_kernels`]).
+//!   ([`affine::build_s_aff`]).
 //! * [`bitdecomp`] — standalone switch-free `a·x+b` baseline for hash-count comparison.
 
 use mimalloc::MiMalloc;

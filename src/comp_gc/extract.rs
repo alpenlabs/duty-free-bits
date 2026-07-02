@@ -1,7 +1,7 @@
 //! Chunk conversion and sub-chunk extraction: straight-line garble/eval over
 //! bare labels (the [`super::fold`] pattern, extended to width-`l` wires).
 //!
-//! Both kernels are built from the same two moves:
+//! Both steps are built from the same two moves:
 //!
 //! * **The one-hot doubling tree.** Level `m` holds the binary one-hot of the
 //!   low `m` bits. The garbler hashes EVERY slot (its pass is x-blind); the
@@ -15,25 +15,25 @@
 //!   functional `Σ c_p·A_p` with a constant coefficient `q` on the unsolved
 //!   hot class evaluates as `Σ_{solved} c_p·A_p + q·(L_root − Σ_{solved} A_p)`.
 //!
-//! The extract kernel runs the fused `word_to_bin_up` schedule per sub-chunk:
+//! The extract step runs the fused `word_to_bin_up` schedule per sub-chunk:
 //! residues `x mod 2^i` from per-level accumulators peel the bits LSB-first,
 //! and the level-`k` functional `Σ p·A_p` is the peel upcast. Values are never
 //! discovered — the evaluator knows `x`, so every hot index is index
-//! arithmetic. No worklist, no `System`, no `Label` heap traffic in the inner
-//! loops: Z₂ wires are `[u64; 2]` words and width-`l` wires are `[u32; λ]`
-//! lane arrays.
+//! arithmetic. No gate graph, no worklist, no `Label` heap traffic in the
+//! inner loops: Z₂ wires are `[u64; 2]` words and width-`l` wires are
+//! `[u32; λ]` lane arrays.
 //!
 //! Nonce discipline (paper App. A, Def. 4): Z₂ tree hashes draw bulk-domain
 //! ids and width-`l` cast hashes draw solo-domain ids, each from
-//! caller-supplied fresh windows ([`chunk_kernel_nonces`],
-//! [`extract_kernel_nonces`]); the garbler and evaluator share the window and
+//! caller-supplied fresh windows ([`chunk_nonces`],
+//! [`extract_nonces`]); the garbler and evaluator share the window and
 //! index it by slot position, so pads agree at every closed slot.
 
 use crate::crypto::expand;
 use crate::hash;
 use crate::label::{LAMBDA, Label, delta_r};
 
-/// Packed words of a CF Z₂ label (the fold-kernel working type).
+/// Packed words of a CF Z₂ label (the bare-word working type).
 pub(crate) type Z2 = [u64; 2];
 
 /// One coordinate per u32 lane of a width-`l` CF label (2 ≤ l ≤ 32).
@@ -247,11 +247,10 @@ fn peel_bit(sub: &Wide, res: &Wide, i: u32, k: u32) -> Z2 {
 
 // ---- cost / nonce accounting ----
 
-/// Garbled-material + hash footprint of one kernel (the units `System::cost`
-/// charges the equivalent circuit: a CF switch on Z_{2^w} costs `w` blocks, a
-/// CF join `w` λ-bit units).
+/// Garbled-material + hash footprint of one step: a CF switch on Z_{2^w}
+/// costs `w` CCRH blocks, a CF join `w` λ-bit units of communication.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct KernelCost {
+pub struct StepCost {
     /// Bits the garbler emits (join diffs).
     pub program_bits: usize,
     /// CF join width, in `lg|G|` units.
@@ -260,8 +259,8 @@ pub struct KernelCost {
     pub hash_count_cf: usize,
 }
 
-impl KernelCost {
-    fn add(&mut self, o: KernelCost) {
+impl StepCost {
+    fn add(&mut self, o: StepCost) {
         self.program_bits += o.program_bits;
         self.join_complexity_cf += o.join_complexity_cf;
         self.hash_count_cf += o.hash_count_cf;
@@ -269,9 +268,9 @@ impl KernelCost {
 }
 
 /// One tree-plus-casts stage: `n_bits` one-hot bits, casts at width `l`.
-fn stage_cost(n_bits: u32, l: u32) -> KernelCost {
+fn stage_cost(n_bits: u32, l: u32) -> StepCost {
     let n = 1usize << n_bits;
-    KernelCost {
+    StepCost {
         program_bits: (n_bits as usize - 1 + l as usize) * LAMBDA,
         join_complexity_cf: n_bits as usize - 1 + l as usize,
         hash_count_cf: (n - 2) + l as usize * n,
@@ -285,26 +284,25 @@ fn tree_ids(k: u32) -> u64 {
     (1u64 << k) - 2
 }
 
-/// (bulk ids, solo ids) consumed by one chunk kernel over `n_bits` input bits.
-pub fn chunk_kernel_nonces(n_bits: u32) -> (u64, u64) {
+/// (bulk ids, solo ids) consumed by one chunk step over `n_bits` input bits.
+pub fn chunk_nonces(n_bits: u32) -> (u64, u64) {
     (tree_ids(n_bits), 1u64 << n_bits)
 }
 
-/// The extract kernels' lane machinery represents width-`l` wires as u32
+/// The extract step's lane machinery represents width-`l` wires as u32
 /// lanes, so every sub-chunk width must be in `2..=31`; a width-1 trailing
-/// sub-chunk (`ell ≡ 1 mod 8` under `compute_sub_widths(·, 8)`) is NOT
-/// supported here — the `System` reference path handles it. Rejected loudly
-/// in release builds too.
+/// sub-chunk (`ell ≡ 1 mod 8` under `compute_sub_widths(·, 8)`) is not
+/// supported. Rejected loudly in release builds too.
 fn assert_sub_widths(sub_widths: &[u32]) {
     assert!(
         sub_widths.iter().all(|&w| (2..=31).contains(&w)),
-        "extract kernel requires sub-chunk widths in 2..=31 (got {sub_widths:?}); \
-         width-1 trailing sub-chunks are only supported on the System reference path"
+        "extract step requires sub-chunk widths in 2..=31 (got {sub_widths:?}); \
+         width-1 trailing sub-chunks are not supported"
     );
 }
 
-/// (bulk ids, solo ids) consumed by one extract kernel.
-pub fn extract_kernel_nonces(sub_widths: &[u32]) -> (u64, u64) {
+/// (bulk ids, solo ids) consumed by one extract step.
+pub fn extract_nonces(sub_widths: &[u32]) -> (u64, u64) {
     let mut bulk = 0;
     let mut solo = 0;
     for &w in sub_widths {
@@ -379,9 +377,9 @@ fn residues_all(mut acc: Vec<Wide>) -> (Vec<Wide>, Wide) {
     (res_chain, root)
 }
 
-// ---- extract kernel ----
+// ---- extract step ----
 
-/// Garbler-side output of one extract kernel.
+/// Garbler-side output of one extract step.
 #[derive(Debug)]
 pub struct ExtractGarbleOutput {
     /// Masks of the first sub-chunk's binary one-hot (CF Z₂, 2^{w₀} entries).
@@ -391,7 +389,7 @@ pub struct ExtractGarbleOutput {
     /// Per sub-chunk: the k−1 scale-join diffs and the width-`l` pin diff.
     pub diffs: Vec<SubChunkDiffs>,
     /// Ledger footprint.
-    pub cost: KernelCost,
+    pub cost: StepCost,
 }
 
 /// The communicated material of one sub-chunk stage.
@@ -436,12 +434,12 @@ fn plan_stages(ell: u32, sub_widths: &[u32], bulk_base: u64, solo_base: u64) -> 
     plans
 }
 
-/// Garbler kernel: `r = Σ_c coeff_c·w_c`, then the fused `word_to_bin_up`
+/// Garbler side: `r = Σ_c coeff_c·w_c`, then the fused `word_to_bin_up`
 /// per sub-chunk. X-blind: hashes every tree slot and every cast, including
 /// the (unknown) hot ones.
 ///
 /// `chunk_word_masks` are CF Z_{2^ell} masks of the chunk words; `nonce_bulk`
-/// / `nonce_solo` are fresh windows sized by [`extract_kernel_nonces`].
+/// / `nonce_solo` are fresh windows sized by [`extract_nonces`].
 pub fn extract_batch_garble(
     chunk_word_masks: &[Label],
     coeffs: &[u64],
@@ -455,8 +453,7 @@ pub fn extract_batch_garble(
     assert_eq!(
         sub_widths.iter().sum::<u32>(),
         ell,
-        "sub-chunk widths must sum to the chunk-word width (the System \
-         reference asserts this too)"
+        "sub-chunk widths must sum to the chunk-word width"
     );
     debug_assert!(chunk_word_masks.iter().all(|m| m.k() == ell));
     let mask_ell = ((1u64 << ell) - 1) as u32;
@@ -476,7 +473,7 @@ pub fn extract_batch_garble(
     let mut first_bin_hot_masks = Vec::new();
     let mut fold_bit_masks = Vec::new();
     let mut diffs = Vec::with_capacity(plans.len());
-    let mut cost = KernelCost::default();
+    let mut cost = StepCost::default();
     let mut rem_bits = ell;
 
     for (q, p) in plans.iter().enumerate() {
@@ -555,7 +552,7 @@ pub fn extract_batch_garble(
     }
 }
 
-/// Evaluator kernel: the label-side mirror of [`extract_batch_garble`],
+/// Evaluator side: the label-side mirror of [`extract_batch_garble`],
 /// following the straight-line `word_to_bin_up` schedule. `r_value` is the
 /// evaluator's cleartext `Σ coeff_c·v_c` (it knows `x`): every hot index and
 /// class residue is index arithmetic; hot slots are solved through the scale
@@ -780,9 +777,9 @@ fn expand_and_fold_class(
     }
 }
 
-// ---- chunk kernel (bin_to_word) ----
+// ---- chunk conversion (bin_to_word) ----
 
-/// Garbler-side output of one chunk-conversion kernel.
+/// Garbler-side output of one chunk-conversion step.
 #[derive(Debug)]
 pub struct ChunkGarbleOutput {
     /// Mask of the chunk word (CF Z_{2^ell}).
@@ -792,10 +789,10 @@ pub struct ChunkGarbleOutput {
     /// Pin-join diff (width ell).
     pub pin: Wide,
     /// Ledger footprint.
-    pub cost: KernelCost,
+    pub cost: StepCost,
 }
 
-/// Garbler kernel: pack `bits` (CF Z₂ masks, LSB-first) into a Z_{2^ell}
+/// Garbler side: pack `bits` (CF Z₂ masks, LSB-first) into a Z_{2^ell}
 /// word — the straight-line `bin_to_word` (one-hot tree over the input bits,
 /// width-ell casts, `Σ p·A_p`).
 pub fn chunk_batch_garble(
@@ -851,7 +848,7 @@ pub fn chunk_batch_garble(
     }
 }
 
-/// Evaluator kernel: the label-side mirror of [`chunk_batch_garble`].
+/// Evaluator side: the label-side mirror of [`chunk_batch_garble`].
 /// `value` is the chunk's cleartext value (the evaluator knows its bits).
 pub fn chunk_batch_eval(
     bit_labels: &[Label],
@@ -963,15 +960,15 @@ mod tests {
         Label::from_coords(&coords, modulus)
     }
 
-    /// Chunk kernel: word label = word mask + v·Δ for every value, at the
+    /// Chunk step: word label = word mask + v·Δ for every value, at the
     /// production shape (nb = 8, ell = 22) and a small one.
     #[test]
-    fn test_chunk_kernel_label_mask_invariant_production() {
+    fn test_chunk_label_mask_invariant_production() {
         chunk_invariant_shape(8, 22);
     }
 
     #[test]
-    fn test_chunk_kernel_label_mask_invariant() {
+    fn test_chunk_label_mask_invariant() {
         chunk_invariant_shape(4, 12);
     }
 
@@ -1009,21 +1006,21 @@ mod tests {
         }
     }
 
-    /// The extract kernels reject width-1 sub-chunks loudly (the reference
-    /// path handles them; the kernel lane machinery requires widths ≥ 2).
+    /// The extract step rejects width-1 sub-chunks loudly (the lane
+    /// machinery requires widths ≥ 2).
     #[test]
     #[should_panic(expected = "sub-chunk widths in 2..=31")]
-    fn test_extract_kernel_rejects_width1() {
+    fn test_extract_rejects_width1() {
         let mut rng = rand::rng();
         let delta: u128 = rng.random::<u128>() | 1;
         let masks = vec![rand_wide(&mut rng, 1 << 9)];
         let _ = extract_batch_garble(&masks, &[1], &[8, 1], delta, 0, 0);
     }
 
-    /// Extract kernel: OHE labels + fold-bit labels satisfy the carry
+    /// Extract step: OHE labels + fold-bit labels satisfy the carry
     /// invariant for every r, at the production shape and a small one.
     #[test]
-    fn test_extract_kernel_label_mask_invariant() {
+    fn test_extract_label_mask_invariant() {
         let mut rng = rand::rng();
         let delta: u128 = rng.random::<u128>() | 1;
         let d2 = delta_r(delta, 2);
@@ -1035,7 +1032,7 @@ mod tests {
             let m_ell = 1u64 << ell;
             let word_masks: Vec<Label> =
                 (0..coeffs.len()).map(|_| rand_wide(&mut rng, m_ell)).collect();
-            let (bulk_n, solo_n) = extract_kernel_nonces(&sub_widths);
+            let (bulk_n, solo_n) = extract_nonces(&sub_widths);
 
             let g = extract_batch_garble(&word_masks, &coeffs, &sub_widths, delta, 100, 200);
             // Emitted material must be canonical: every pin lane < 2^l.
@@ -1116,12 +1113,12 @@ mod micro {
     use super::*;
     use std::time::Instant;
 
-    /// Attribute extract-kernel time to its primitives at production shape.
+    /// Attribute extract-step time to its primitives at production shape.
     /// Run: cargo test --release --lib bench_extract_micro -- --ignored --nocapture
     #[test]
     #[ignore]
     fn bench_extract_micro() {
-        let reps = 80 * 30; // 80 primes × 30 reps, i.e. "per bench_kernel_loop run"
+        let reps = 80 * 30; // 80 primes × 30 reps, i.e. "per bench_axb_stages run"
         let ctrl: Z2 = [0x1234_5678_9ABC_DEF0, 0x0FED_CBA9_8765_4321];
         let mut cast = [7u32; LAMBDA];
 
@@ -1150,7 +1147,7 @@ mod micro {
         }
         let tree_secs = t.elapsed().as_secs_f64();
 
-        // 3. Accumulator folds, PER-LEAF REFERENCE form: what the eval kernel
+        // 3. Accumulator folds, PER-LEAF REFERENCE form: what the eval step
         //    would cost without the subtree/W-chain fold it actually uses —
         //    kept as the comparison point for that optimization.
         let mut acc_r = vec![[0u32; LAMBDA]; 8];
@@ -1184,7 +1181,7 @@ mod micro {
         }
         let resid_secs = t.elapsed().as_secs_f64();
 
-        let per = |s: f64| 1e3 * s / 30.0; // ms per bench_kernel_loop rep (80 primes)
+        let per = |s: f64| 1e3 * s / 30.0; // ms per bench_axb_stages rep (80 primes)
         eprintln!("per-rep (80 primes): cast hashing {:.2}ms | tree z2 {:.2}ms | eval folds {:.2}ms | garbler residues {:.2}ms",
             per(cast_secs), per(tree_secs), per(fold_secs), per(resid_secs));
     }

@@ -2,7 +2,7 @@
 //! evaluate the affine maps over a primorial ring.
 //!
 //! Given an n-bit input x and coefficients (a, b) reduced mod each CRT prime,
-//! [`build_s_aff_kernels`] computes a·x + b in Z_M (where M = Π p_i) as four
+//! [`build_s_aff`] computes a·x + b in Z_M (where M = Π p_i) as four
 //! straight-line steps over bare labels — no gate graph, no worklist:
 //!
 //!   1. **Chunk conversion**: partition n bits into ⌈n/lg n⌉ chunks, convert
@@ -15,8 +15,8 @@
 //!      from `h_p` ([`crate::it_gc`]).
 
 use crate::comp_gc::extract::{
-    chunk_batch_eval, chunk_batch_garble, chunk_kernel_nonces, compute_sub_widths,
-    extract_batch_eval, extract_batch_garble, extract_kernel_nonces,
+    chunk_batch_eval, chunk_batch_garble, chunk_nonces, compute_sub_widths,
+    extract_batch_eval, extract_batch_garble, extract_nonces,
 };
 use crate::comp_gc::fold::{fold_batch_eval, fold_batch_garble};
 use crate::crt::{CrtParams, pow2_mod};
@@ -37,7 +37,7 @@ const RESIDUE_BATCH_SIZE: usize = 128;
 /// First bulk-domain CCRH id available to the fold/body steps; the
 /// chunk/extract tree hashes allocate their windows above it. Reserving a
 /// `2^32` floor keeps the space open for future bulk consumers.
-const KERNEL_NONCE_FLOOR: u64 = 1 << 32;
+const BULK_NONCE_FLOOR: u64 = 1 << 32;
 
 /// Sample a uniform CF mask in Z_modulus (modulus must be a power of two).
 fn sample_cf_mask<R: Rng>(rng: &mut R, modulus: u64) -> Label {
@@ -48,31 +48,28 @@ fn sample_cf_mask<R: Rng>(rng: &mut R, modulus: u64) -> Label {
 
 
 
-/// Per-stage telemetry of one [`build_s_aff_kernels`] run. Times are
-/// wall-clock seconds; `*_hash_blocks` are CCRH AES blocks (nonzero only
-/// under the `count-hashes` feature); the ledger fields are the same units
-/// `System::cost` charges the equivalent circuits.
+/// Per-stage telemetry of one [`build_s_aff`] run. Times are wall-clock
+/// seconds; `*_hash_blocks` are CCRH AES blocks (nonzero only under the
+/// `count-hashes` feature); the ledger fields count communication + hashes.
 #[derive(Clone, Copy, Debug, Default)]
-pub struct KernelStats {
-    /// Chunk-kernel garble wall time.
+pub struct Stats {
+    /// Chunk-step garble wall time.
     pub chunk_garble_secs: f64,
-    /// Chunk-kernel eval wall time.
+    /// Chunk-step eval wall time.
     pub chunk_eval_secs: f64,
-    /// Extract-kernel garble wall time.
+    /// Extract-step garble wall time.
     pub extract_garble_secs: f64,
-    /// Extract-kernel eval wall time.
+    /// Extract-step eval wall time.
     pub extract_eval_secs: f64,
-    /// Fold-kernel garble wall time.
+    /// Fold-step garble wall time.
     pub fold_garble_secs: f64,
-    /// Fold-kernel eval wall time.
+    /// Fold-step eval wall time.
     pub fold_eval_secs: f64,
-    /// Body-kernel garble wall time.
+    /// Body-step garble wall time.
     pub body_garble_secs: f64,
-    /// Body-kernel eval wall time.
+    /// Body-step eval wall time.
     pub body_eval_secs: f64,
-    /// Garbler-emitted material in bits. Per-driver emitted material — NOT
-    /// comparable to `Pipeline::total_program_bits`, which additionally
-    /// counts System-phase program overhead.
+    /// Garbler-emitted material in bits (the join diffs).
     pub program_bits: usize,
     /// CF join width, in `lg|G|` units (each pays λ bits).
     pub join_complexity_cf: usize,
@@ -88,7 +85,7 @@ pub struct KernelStats {
     pub eval_hash_blocks: u64,
 }
 
-impl KernelStats {
+impl Stats {
     /// Total garble/eval wall time.
     pub fn garble_secs(&self) -> f64 {
         self.chunk_garble_secs + self.extract_garble_secs + self.fold_garble_secs
@@ -100,26 +97,23 @@ impl KernelStats {
     }
 }
 
-/// Garble + evaluate the affine maps on the kernel-only path: chunk
-/// conversion → per-prime extract → fold → body, all straight-line loops over
-/// bare labels ([`crate::comp_gc::extract`], [`crate::comp_gc::fold`],
-/// [`crate::it_gc`]). No `System`, no `Pipeline`, no worklist: the evaluator
-/// knows `x_bits` (switch-private / data-public), so every derivation order is
-/// closed-form.
+/// Garble + evaluate the affine maps: chunk conversion → per-prime extract
+/// → fold → body, all straight-line loops over bare labels
+/// ([`crate::comp_gc::extract`], [`crate::comp_gc::fold`], [`crate::it_gc`]).
+/// No gate graph, no worklist: the evaluator knows `x_bits` (switch-private /
+/// data-public), so every derivation order is closed-form.
 ///
-/// Semantics, inputs, and the smudging caveat are those of
-/// [`build_s_aff_streaming`]; the two are differentially tested to produce
-/// identical decoded outputs. One parameter restriction: the extract kernels
-/// require every sub-chunk width in `2..=31`, so shapes with a width-1
-/// trailing sub-chunk (`ell ≡ 1 mod 8`, e.g. n = 1 or n = 26..=32 with the 80-prime
-/// set) are rejected loudly — use the reference path for those.
-pub fn build_s_aff_kernels<R: rand::Rng>(
+/// One parameter restriction: the extract step represents width-`l` wires as
+/// u32 lanes, so every sub-chunk width must be in `2..=31`; shapes with a
+/// width-1 trailing sub-chunk (`ell ≡ 1 mod 8`, e.g. n = 1 or n = 26..=32
+/// with the 80-prime set) are rejected loudly.
+pub fn build_s_aff<R: rand::Rng>(
     rng: &mut R,
     x_bits: &[u64],
     params: &CrtParams,
     a_residues: &[Vec<u64>],
     b_residues: &[Vec<u64>],
-) -> (Vec<Vec<u64>>, KernelStats) {
+) -> (Vec<Vec<u64>>, Stats) {
     let n = params.n as usize;
     assert_eq!(x_bits.len(), n);
     for &b in x_bits {
@@ -142,10 +136,10 @@ pub fn build_s_aff_kernels<R: rand::Rng>(
 
     let delta: u128 = rng.random::<u128>() | 1;
     let d2 = label::delta_r(delta, 2);
-    let mut stats = KernelStats::default();
+    let mut stats = Stats::default();
 
     // ---- Nonce windows (paper App. A, Def. 4) ----
-    let nw = KernelNonceLayout::new(params, s_dim, &sub_widths);
+    let nw = NonceLayout::new(params, s_dim, &sub_widths);
     let chunk_solo_ids = nw.chunk_solo_ids;
     let chunk_bulk_ids = nw.chunk_bulk_ids;
     let ex_solo_ids = nw.ex_solo_ids;
@@ -171,7 +165,7 @@ pub fn build_s_aff_kernels<R: rand::Rng>(
         })
         .collect();
 
-    // ---- Stage 1: chunk conversion kernels. ----
+    // ---- Stage 1: chunk conversion. ----
     let zero_bit_mask = Label::zero(2); // constant-0 padding for a short last chunk
     let mut chunk_word_masks: Vec<Label> = Vec::with_capacity(num_chunks);
     let mut chunk_word_labels: Vec<Label> = Vec::with_capacity(num_chunks);
@@ -216,7 +210,7 @@ pub fn build_s_aff_kernels<R: rand::Rng>(
         chunk_word_labels.push(w);
     }
 
-    // ---- Stage 2..4 per prime: extract kernel → fold kernel → body. ----
+    // ---- Stage 2..4 per prime: extract → fold → body. ----
     let mut all_outputs: Vec<Vec<u64>> = Vec::with_capacity(params.num_primes);
     for (i, &p_i) in params.primes.iter().enumerate() {
         let coeffs: Vec<u64> = (0..num_chunks)
@@ -260,7 +254,7 @@ pub fn build_s_aff_kernels<R: rand::Rng>(
         stats.join_complexity_cf += g.cost.join_complexity_cf;
         stats.hash_count_cf += g.cost.hash_count_cf;
 
-        // ---- Fold kernel (unchanged from the streaming path). ----
+        // ---- Fold step. ----
         let fold_nonce_base = prime_nonce_bases[i] + num_batches as u64 * p_i;
         let gb0 = crate::crypto::hash_blocks();
         let t = std::time::Instant::now();
@@ -292,7 +286,7 @@ pub fn build_s_aff_kernels<R: rand::Rng>(
         stats.hash_count_cf += fold_g.cost.hash_count_cf;
         let h_p_masks = fold_g.h_p_masks;
 
-        // ---- Body batches (unchanged). ----
+        // ---- Body batches. ----
         let identity_table: Vec<u64> = (0..p_i).collect();
         let mut prime_outputs: Vec<u64> = Vec::with_capacity(s_dim);
         let mut start = 0usize;
@@ -345,20 +339,19 @@ pub fn build_s_aff_kernels<R: rand::Rng>(
     (all_outputs, stats)
 }
 
-/// The kernel path's complete CCRH nonce-window layout (paper App. A,
-/// Def. 4: no two garbler queries may share a (domain, id)).
+/// The complete CCRH nonce-window layout (paper App. A, Def. 4: no two
+/// garbler queries may share a (domain, id)).
 ///
-/// Solo domain (width-`l` cast pads): chunk-kernel windows first, then the
+/// Solo domain (width-`l` cast pads): chunk-step windows first, then the
 /// per-prime extract windows. Bulk domain (Z₂ tree hashes + the fold/body
-/// kernels): the fold/body per-prime windows exactly as the streaming path
-/// lays them out from [`KERNEL_NONCE_FLOOR`], then the chunk tree windows,
-/// then the per-prime extract tree windows above those. This struct is the
-/// single source of truth the driver draws its bases from, and
-/// `test_kernel_nonce_windows_disjoint` pins the partition — nonce-collision
-/// regressions are invisible to output/differential tests (both parties
-/// share the layout, so colliding windows still decode correctly).
+/// steps): the fold/body per-prime windows from [`BULK_NONCE_FLOOR`], then
+/// the chunk tree windows, then the per-prime extract tree windows above
+/// those. This struct is the single source of truth the driver draws its
+/// bases from, and `test_nonce_windows_disjoint` pins the partition —
+/// nonce-collision regressions are otherwise invisible to output tests
+/// (both parties share the layout, so colliding windows still decode).
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct KernelNonceLayout {
+pub(crate) struct NonceLayout {
     pub chunk_solo_ids: u64,
     pub chunk_bulk_ids: u64,
     pub ex_solo_ids: u64,
@@ -374,11 +367,11 @@ pub(crate) struct KernelNonceLayout {
     num_primes: usize,
 }
 
-impl KernelNonceLayout {
+impl NonceLayout {
     pub(crate) fn new(params: &CrtParams, s_dim: usize, sub_widths: &[u32]) -> Self {
         let fold_bits: u32 = sub_widths[1..].iter().sum();
-        let (chunk_bulk_ids, chunk_solo_ids) = chunk_kernel_nonces(params.chunk_size);
-        let (ex_bulk_ids, ex_solo_ids) = extract_kernel_nonces(sub_widths);
+        let (chunk_bulk_ids, chunk_solo_ids) = chunk_nonces(params.chunk_size);
+        let (ex_bulk_ids, ex_solo_ids) = extract_nonces(sub_widths);
         let solo_chunk_base = 0u64;
         let solo_extract_base = solo_chunk_base + params.num_chunks as u64 * chunk_solo_ids;
         let num_batches = s_dim.div_ceil(RESIDUE_BATCH_SIZE);
@@ -387,23 +380,23 @@ impl KernelNonceLayout {
             .iter()
             .map(|&p| (num_batches as u64 + fold_bits as u64) * p)
             .collect();
-        let prime_nonce_bases = nonce::windows(KERNEL_NONCE_FLOOR, &prime_window_sizes);
+        let prime_nonce_bases = nonce::windows(BULK_NONCE_FLOOR, &prime_window_sizes);
         let bulk_tree_base = prime_nonce_bases
             .last()
             .zip(prime_window_sizes.last())
             .map(|(&b, &s)| b + s)
-            .unwrap_or(KERNEL_NONCE_FLOOR);
+            .unwrap_or(BULK_NONCE_FLOOR);
         let bulk_chunk_base = bulk_tree_base;
         let bulk_extract_base = bulk_chunk_base + params.num_chunks as u64 * chunk_bulk_ids;
         assert!(
             bulk_extract_base + params.num_primes as u64 * ex_bulk_ids < (1u64 << 63),
-            "kernel CCRH nonce space exhausted"
+            "CCRH nonce space exhausted"
         );
         assert!(
             solo_extract_base + params.num_primes as u64 * ex_solo_ids < (1u64 << 63),
-            "kernel solo-domain nonce space exhausted"
+            "solo-domain nonce space exhausted"
         );
-        KernelNonceLayout {
+        NonceLayout {
             chunk_solo_ids,
             chunk_bulk_ids,
             ex_solo_ids,
@@ -423,7 +416,7 @@ impl KernelNonceLayout {
     /// Every reserved window as `(is_bulk, base, len)` — the disjointness test
     /// walks this enumeration, so it covers exactly what the driver uses.
     /// The per-prime fold/body reservation is treated as one window (its
-    /// internal body-batch/fold split shares the streaming layout).
+    /// internal body-batch/fold split is defined by the driver).
     #[cfg(test)]
     pub(crate) fn windows(&self) -> Vec<(bool, u64, u64)> {
         let mut w = Vec::new();
@@ -447,11 +440,11 @@ mod nonce_layout_tests {
     /// Def-4 freshness rests on this partition: colliding windows would still
     /// decode correctly (both parties share the layout), so no output test
     /// can catch a regression — this test is the guard. It pins, per domain,
-    /// that every reserved window is pairwise disjoint, that kernel bulk ids
+    /// that every reserved window is pairwise disjoint, that bulk ids
     /// respect the `[0, 2^32)` switch-group reservation, and that everything
     /// stays below the bit-63 domain flag.
     #[test]
-    fn test_kernel_nonce_windows_disjoint() {
+    fn test_nonce_windows_disjoint() {
         use crate::crt::bigint::FIRST_80_PRIMES;
         for (primes, n, s_dim) in [
             (&FIRST_80_PRIMES[..], 256u32, 1536usize),
@@ -464,9 +457,9 @@ mod nonce_layout_tests {
             let params = CrtParams::from_primes(primes, n);
             let sub_widths = compute_sub_widths(params.ell, MAX_SUB_CHUNK_WIDTH);
             if sub_widths.iter().any(|&w| w < 2) {
-                continue; // width-1 shapes are kernel-rejected
+                continue; // width-1 shapes are rejected
             }
-            let nw = KernelNonceLayout::new(&params, s_dim, &sub_widths);
+            let nw = NonceLayout::new(&params, s_dim, &sub_widths);
             for bulk in [false, true] {
                 let mut ws: Vec<(u64, u64)> = nw
                     .windows()
@@ -489,8 +482,8 @@ mod nonce_layout_tests {
                 assert!(last_base + last_len < (1u64 << 63), "domain-flag overflow");
                 if bulk {
                     assert!(
-                        ws[0].0 >= KERNEL_NONCE_FLOOR,
-                        "kernel bulk ids must stay above the switch-group reservation"
+                        ws[0].0 >= BULK_NONCE_FLOOR,
+                        "bulk ids must stay above the reserved floor"
                     );
                 }
             }

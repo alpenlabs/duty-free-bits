@@ -1,8 +1,8 @@
-//! Kernel-path mod-p OHE folding: the straight-line garble/eval of
-//! [`fold_to_mod_ohe`](super::convert::fold_to_mod_ohe) (see
-//! [`super::convert`]), bypassing the `System`.
+//! Mod-p one-hot folding: reduce the first sub-chunk's binary one-hot mod
+//! `p_i`, then fold in the remaining bits — straight-line garble/eval over
+//! bare labels.
 //!
-//! The fold circuit is regular — per folded bit `b`, per slot `r`:
+//! The fold is regular — per folded bit `b`, per slot `r`:
 //!
 //! ```text
 //!   h'[r]    = switch(0, h[r])            X_h'[r] = H(X_h[r])   (one CCRH block)
@@ -15,8 +15,8 @@
 //! XOR. The garbler is fully forward. The evaluator knows every control in
 //! cleartext (it knows `r`), so at the single *hot* slot — where the switch is
 //! open — it recovers the pad backward through the join:
-//! `L_h'[hot] = L_s ⊕ (⊕_{r≠hot} L_h'[r])` with `L_s = L_bit ⊕ diff`,
-//! exactly the System evaluator's backward chain, telescoped.
+//! `L_h'[hot] = L_s ⊕ (⊕_{r≠hot} L_h'[r])` with `L_s = L_bit ⊕ diff` — the
+//! open switch's backward chain, telescoped.
 //!
 //! Switch hashes draw fresh bulk-domain CCRH nonces from a caller-supplied
 //! window of `bits.len()·p` ids (see [`crate::crypto::nonce`]); the garbler and
@@ -26,8 +26,7 @@ use crate::crt::pow2_mod;
 use crate::hash;
 use crate::label::Label;
 
-/// Garbled-material footprint of one fold (for the pipeline cost ledger; the
-/// same units `System::cost` would charge the equivalent circuit).
+/// Garbled-material footprint of one fold (communication + hash counts).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FoldCost {
     /// Bits the garbler emits: one λ-bit CF Z₂ join diff per folded bit.
@@ -52,9 +51,8 @@ pub struct FoldGarbleOutput {
 /// Packed words of a CF Z₂ label.
 #[inline]
 fn z2_words(l: &Label) -> [u64; 2] {
-    let c = l;
-    debug_assert_eq!(c.modulus(), 2, "fold kernel wires are CF Z_2");
-    let raw = c.raw_bits();
+    debug_assert_eq!(l.modulus(), 2, "fold wires are CF Z_2");
+    let raw = l.raw_bits();
     [raw[0], raw[1]]
 }
 
@@ -63,7 +61,7 @@ fn z2_label(w: [u64; 2]) -> Label {
     Label::from_raw_bits(vec![w[0], w[1]], 2)
 }
 
-/// Garbler kernel: fold the first sub-chunk's binary OHE into a mod-p OHE.
+/// Garbler side: fold the first sub-chunk's binary OHE into a mod-p OHE.
 ///
 /// `first_bin_hot_masks` are the masks of the binary OHE of the low
 /// `first_width` bits; `bit_masks` the masks of bit positions `first_width..`.
@@ -121,8 +119,8 @@ pub fn fold_batch_garble(
     }
 }
 
-/// Footprint of folding `bits` bit positions mod `p` (per side; hashes are
-/// charged once, as `System::cost` charges a switch once).
+/// Footprint of folding `bits` bit positions mod `p` (per side; each switch
+/// is charged once).
 fn fold_cost(p: u64, bits: usize) -> FoldCost {
     FoldCost {
         program_bits: bits * crate::label::LAMBDA,
@@ -131,7 +129,7 @@ fn fold_cost(p: u64, bits: usize) -> FoldCost {
     }
 }
 
-/// Evaluator kernel: the label-side mirror of [`fold_batch_garble`].
+/// Evaluator side: the label-side mirror of [`fold_batch_garble`].
 ///
 /// `r` is the cleartext value whose OHE is being folded (the evaluator knows
 /// `x`, hence `r`): bit values and every intermediate hot position derive from
@@ -213,7 +211,7 @@ mod tests {
     /// labels = masks + value·Δ₂ in: garble + eval a fold and check the final
     /// OHE satisfies the carry invariant with exactly slot `r mod p` hot.
     #[test]
-    fn test_fold_kernel_label_mask_invariant() {
+    fn test_fold_label_mask_invariant() {
         let mut rng = rand::rng();
         let delta: u128 = rng.random();
         let d2 = label::delta_r(delta, 2);

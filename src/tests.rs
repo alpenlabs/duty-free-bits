@@ -12,8 +12,6 @@ fn rng() -> impl Rng {
     rand::rng()
 }
 
-/// Assert the streaming pipeline computes `a_j·x + b_j (mod p_i)` for every prime
-/// and component, against a direct known-answer oracle (the streaming pipeline is
 
 struct BenchRng {
     state: u64,
@@ -112,8 +110,8 @@ fn test_u576_mod_q_helper() {
 /// `bitdecomp::tests::test_garble_eval_matches_plaintext` and the assert in
 /// `test_s_aff_scaling`). Input-label provisioning is outside the timed
 /// region for both (bit-decomp `encode`; the switch driver samples input
-/// masks outside its per-stage timers). The switch side runs the kernel
-/// production path ([`crate::affine::build_s_aff_kernels`]).
+/// masks outside its per-stage timers). The switch side runs
+/// [`crate::affine::build_s_aff`].
 ///
 /// Workload boundary: available are field elements (a, b) and input labels;
 /// required output is a·x+b as field elements. The switch garble column
@@ -235,12 +233,12 @@ fn bench_axb_comparison() {
             .collect();
         let t_enc = t.elapsed().as_secs_f64();
 
-        // The kernel driver samples input masks internally but outside its
+        // The driver samples input masks internally but outside its
         // per-stage timers, so garble/eval exclude label provisioning —
         // matching bit-decomp's untimed encode().
         let t = Instant::now();
         let (out, stats) =
-            crate::affine::build_s_aff_kernels(&mut rng, &x_bits, &params, &a_res, &b_res);
+            crate::affine::build_s_aff(&mut rng, &x_bits, &params, &a_res, &b_res);
         let core = t.elapsed().as_secs_f64();
         black_box(&out);
 
@@ -442,7 +440,7 @@ fn bench_axb_network() {
             .collect();
         let t_enc = t.elapsed().as_secs_f64();
         let (out, stats) =
-            crate::affine::build_s_aff_kernels(&mut rng, &x_bits, &params, &a_res, &b_res);
+            crate::affine::build_s_aff(&mut rng, &x_bits, &params, &a_res, &b_res);
         black_box(&out);
         // Evaluator ends with a·x+b over the field: Garner + mod-q is eval-side.
         let t = Instant::now();
@@ -581,7 +579,7 @@ fn bench_axb_hashcounts() {
     let x_bits: Vec<u64> = (0..n as usize).map(|_| rng.random_range(0..2u64)).collect();
     reset_hash_blocks();
     let (_, stats) =
-        crate::affine::build_s_aff_kernels(&mut rng, &x_bits, &params, &a_res, &b_res);
+        crate::affine::build_s_aff(&mut rng, &x_bits, &params, &a_res, &b_res);
     let sw_total = hash_blocks();
     let sw_g = stats.garble_hash_blocks;
     let sw_e = stats.eval_hash_blocks;
@@ -623,12 +621,10 @@ fn bench_axb_hashcounts() {
     );
 }
 
-// ==================== the kernel-only path ====================
+// ==================== end-to-end correctness ====================
 
-/// Kernel-path analogue of [`assert_s_aff_streaming_correct`]: known-answer
-/// check against the direct oracle (the System-path differential lives in
-/// `test_s_aff_kernels_matches_streaming`).
-fn assert_s_aff_kernels_correct(
+/// Known-answer check of [`build_s_aff`] against the direct mod-p oracle.
+fn assert_s_aff_correct(
     params: &CrtParams,
     a_vals: &[u64],
     b_vals: &[u64],
@@ -650,7 +646,7 @@ fn assert_s_aff_kernels_correct(
     let input_bits: Vec<u64> = (0..n).map(|j| (x >> j) & 1).collect();
 
     let (outputs, _stats) =
-        crate::affine::build_s_aff_kernels(rng, &input_bits, params, &a_residues, &b_residues);
+        crate::affine::build_s_aff(rng, &input_bits, params, &a_residues, &b_residues);
 
     for (i, &p_i) in params.primes.iter().enumerate() {
         let x_mod = x % p_i;
@@ -665,9 +661,8 @@ fn assert_s_aff_kernels_correct(
 }
 
 #[test]
-fn test_s_aff_kernels_sweep() {
-    // The kernel-only production path against the oracle, across the same
-    // parameter sweep as test_streaming_sweep.
+fn test_s_aff_sweep() {
+    // build_s_aff against the oracle, across a parameter sweep.
     let mut rng = rng();
     for n in [8u32, 12, 16, 24, 33, 64] {
         let params = CrtParams::from_primes(&FIRST_80_PRIMES, n);
@@ -680,7 +675,7 @@ fn test_s_aff_kernels_sweep() {
                 .map(|_| rng.random_range(0..1u64 << 40))
                 .collect();
             let x = rng.random_range(0..=max_x) & max_x;
-            assert_s_aff_kernels_correct(&params, &a_vals, &b_vals, x, &mut rng);
+            assert_s_aff_correct(&params, &a_vals, &b_vals, x, &mut rng);
         }
     }
 }
@@ -688,9 +683,9 @@ fn test_s_aff_kernels_sweep() {
 
 #[test]
 #[ignore]
-fn bench_kernel_loop() {
-    // Kernel-path twin of bench_stream_loop.
-    // Run: N=256 S=1536 REPS=30 cargo test --release bench_kernel_loop -- --ignored --nocapture
+fn bench_axb_stages() {
+    // Per-stage wall-clock profiler for build_s_aff.
+    // Run: N=256 S=1536 REPS=30 cargo test --release bench_axb_stages -- --ignored --nocapture
     let n: u32 = std::env::var("N")
         .unwrap_or_else(|_| "256".into())
         .parse()
@@ -715,12 +710,12 @@ fn bench_kernel_loop() {
         .iter()
         .map(|&pi| (0..s_dim).map(|_| rng.random_range(0..pi)).collect())
         .collect();
-    let mut agg = crate::affine::KernelStats::default();
+    let mut agg = crate::affine::Stats::default();
     let t = std::time::Instant::now();
     for _ in 0..reps {
         let x: u64 = rng.random_range(0..u64::MAX >> (64 - n.min(63)));
         let x_bits: Vec<u64> = (0..n).map(|j| (x >> (j % 64)) & 1).collect();
-        let (outputs, stats) = crate::affine::build_s_aff_kernels(
+        let (outputs, stats) = crate::affine::build_s_aff(
             &mut rng,
             &x_bits,
             &params,
@@ -739,7 +734,7 @@ fn bench_kernel_loop() {
     }
     let per_rep = t.elapsed().as_secs_f64() / reps as f64;
     let r = reps as f64;
-    eprintln!("{} reps, {:.4}s/rep (kernel path)", reps, per_rep);
+    eprintln!("{} reps, {:.4}s/rep", reps, per_rep);
     eprintln!(
         "  per-rep garble: chunk {:.2}ms extract {:.2}ms fold {:.2}ms body {:.2}ms",
         1e3 * agg.chunk_garble_secs / r,
@@ -763,11 +758,10 @@ fn bench_kernel_loop() {
 }
 
 #[test]
-fn test_s_aff_kernels_edge_regimes() {
-    // Kernel-path twin of test_streaming_edge_regimes, minus the width-1
-    // trailing sub-chunk (ell ≡ 1 mod 8), which the kernel path rejects by
-    // design (covered by test_extract_kernel_rejects_width1; use the
-    // reference path for those shapes).
+fn test_s_aff_edge_regimes() {
+    // Edge-parameter regimes, minus the width-1 trailing sub-chunk
+    // (ell ≡ 1 mod 8), which build_s_aff rejects by design (covered by
+    // test_extract_rejects_width1).
     let mut rng = rng();
 
     // p > 2^first_width and p = 2 alone, one odd prime, short padded chunk.
@@ -776,12 +770,12 @@ fn test_s_aff_kernels_edge_regimes() {
         let a = vec![rng.random_range(0..1u64 << 30)];
         let b = vec![rng.random_range(0..1u64 << 30)];
         let x = rng.random_range(0..1u64 << 16);
-        assert_s_aff_kernels_correct(&params, &a, &b, x, &mut rng);
+        assert_s_aff_correct(&params, &a, &b, x, &mut rng);
     }
     // Single sub-chunk (ell <= 8): tiny prime set keeps the sum small.
     let params = CrtParams::from_primes(&[3u64, 5], 4);
     assert!(params.ell <= 8, "want a single-sub-chunk regime");
     for x in 0..16u64 {
-        assert_s_aff_kernels_correct(&params, &[7], &[11], x, &mut rng);
+        assert_s_aff_correct(&params, &[7], &[11], x, &mut rng);
     }
 }
