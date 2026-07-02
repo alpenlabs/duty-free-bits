@@ -500,14 +500,13 @@ fn mod_mul(a: u64, b: u64, p: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::label::CfLabel;
-    use rand::{Rng, RngExt};
+    use rand::Rng;
 
     fn rand_cf2_label<R: Rng>(rng: &mut R) -> Label {
         let coords: Vec<u64> = (0..crate::label::LAMBDA)
             .map(|_| rng.random_range(0..2u64))
             .collect();
-        Label::Cf(CfLabel::from_coords(&coords, 2))
+        Label::from_coords(&coords, 2)
     }
 
     #[test]
@@ -525,9 +524,9 @@ mod tests {
             .map(|i| {
                 if i == hot_idx {
                     // h_p[hot] = 1 ⇒ label = mask + Δ_2 (we just need the LSB to differ).
-                    let mut coords = h_p_masks[i].as_cf().to_coords();
+                    let mut coords = h_p_masks[i].to_coords();
                     coords[0] ^= 1;
-                    Label::Cf(CfLabel::from_coords(&coords, 2))
+                    Label::from_coords(&coords, 2)
                 } else {
                     h_p_masks[i].clone()
                 }
@@ -615,9 +614,9 @@ mod tests {
                         .enumerate()
                         .map(|(i, m)| {
                             if i == hot {
-                                let mut coords = m.as_cf().to_coords();
+                                let mut coords = m.to_coords();
                                 coords[0] ^= 1;
-                                Label::Cf(CfLabel::from_coords(&coords, 2))
+                                Label::from_coords(&coords, 2)
                             } else {
                                 m.clone()
                             }
@@ -676,9 +675,9 @@ mod tests {
             let h_p_labels: Vec<Label> = (0..p)
                 .map(|i| {
                     if i == hot_idx {
-                        let mut coords = h_p_masks[i].as_cf().to_coords();
+                        let mut coords = h_p_masks[i].to_coords();
                         coords[0] ^= 1;
-                        Label::Cf(CfLabel::from_coords(&coords, 2))
+                        Label::from_coords(&coords, 2)
                     } else {
                         h_p_masks[i].clone()
                     }

@@ -1,16 +1,16 @@
-//! Label-aware CCRH for switch gates.
-//!
-//! Wraps the `Label`-free CCRH core ([`crate::crypto`]) with the label↔block encoding.
+//! Label-aware CCRH: wraps the `Label`-free CCRH core ([`crate::crypto`]) with
+//! the label↔block encoding the protocol's switch pads need.
 
 use crate::crypto::{Block, expand};
-use crate::label::{self, CfLabel, LAMBDA, Label, NcfLabel};
+use crate::label::Label;
 
 /// `⌈log₂ modulus⌉` (number of bits needed to represent values < modulus).
 ///
-/// Note (known limitation): for a non-power-of-two NCF modulus `p` — which the
-/// CRT primes are — reducing this tight `⌈log₂ p⌉`-bit slice mod `p` is
-/// slightly non-uniform: residues `0..(2^⌈log₂ p⌉ − p)` occur twice as often
-/// as the rest. The bias is not currently corrected.
+/// Note (known limitation): for a non-power-of-two modulus `p` — which the CRT
+/// primes are — reducing this tight `⌈log₂ p⌉`-bit slice mod `p` is slightly
+/// non-uniform: residues `0..(2^⌈log₂ p⌉ − p)` occur twice as often as the
+/// rest. The IT-GC body widens its slice to a nibble to shrink this bias (see
+/// `it_gc::pad_bits`).
 pub fn lg_modulus(modulus: u64) -> usize {
     if modulus <= 1 {
         0
@@ -19,102 +19,27 @@ pub fn lg_modulus(modulus: u64) -> usize {
     }
 }
 
-/// Convert a switch control label to a 128-bit block for CCRND's `x` input.
-///
-/// Switch controls are always CF Z_2, whose bit-packed storage is exactly
-/// 2 u64 = 16 bytes — so this is a direct copy. Any other label kind is a
-/// caller bug.
+/// Pack a CF Z_2 control label into a 128-bit block for CCRND's `x` input
+/// (its bit-packed storage is exactly 2 u64 = 16 bytes — a direct copy).
 fn label_to_block(l: &Label) -> Block {
-    let Label::Cf(c) = l else {
-        panic!("label_to_block: switch control must be CF Z_2, got NCF");
-    };
-    debug_assert_eq!(c.modulus(), 2, "label_to_block: switch control must be Z_2");
-    let raw = c.raw_bits();
-    debug_assert_eq!(raw.len(), 2, "CF Z_2 label must be exactly 2 u64 words");
+    debug_assert_eq!(l.modulus(), 2, "control must be Z_2");
+    let raw = l.raw_bits();
+    debug_assert_eq!(raw.len(), 2, "Z_2 label must be exactly 2 u64 words");
     let mut bytes = [0u8; 16];
     bytes[0..8].copy_from_slice(&raw[0].to_le_bytes());
     bytes[8..16].copy_from_slice(&raw[1].to_le_bytes());
     bytes
 }
 
-/// CCRH for a single switch gate.
+/// CCRH covering a whole switch group: `total_bits` pseudorandom bits keyed on
+/// a CF Z_2 control label, written into the prefix of `out` (which must be at
+/// least `total_bits.div_ceil(8)` long; bytes past the prefix are untouched,
+/// so callers may pack many groups into one slab without per-group alloc).
 ///
-/// `nonce` must be globally fresh for the garbling (paper App. A, Def. 4: no
-/// two queries share a nonce) — callers offset per-phase gate ids by a
-/// monotonically allocated base.
-pub fn hash_solo(ctrl_mask: &Label, nonce: u64, out_is_cf: bool, out_modulus: u64) -> Label {
-    debug_assert!(
-        matches!(ctrl_mask, Label::Cf(c) if c.modulus() == 2),
-        "ctrl mask must be CF Z_2"
-    );
-    let seed = label_to_block(ctrl_mask);
-    // Bit 63 is the solo/bulk domain flag, so the nonce must leave it clear.
-    debug_assert!(nonce < (1u64 << 63), "solo nonce uses the bulk-domain bit");
-    let domain = nonce; // solo: bit 63 = 0.
-    if out_is_cf {
-        let k = out_modulus.trailing_zeros() as usize;
-        if k == 1 {
-            // Z_2: exactly LAMBDA = 128 bits = 16 bytes, one AES block.
-            let mut buf = [0u8; 16];
-            expand(seed, domain, &mut buf);
-            return Label::Cf(CfLabel::from_packed_bytes(&buf, out_modulus));
-        }
-        let words = (LAMBDA * k).div_ceil(64);
-        // k ≤ 32 ⇒ words ≤ ⌈128·32/64⌉ = 64 ⇒ 512 bytes bound the output.
-        debug_assert!(words * 8 <= 512, "CF modulus 2^{k} exceeds the u32 lanes");
-        let mut buf = [0u8; 512];
-        let buf = &mut buf[..words * 8];
-        expand(seed, domain, buf);
-        Label::Cf(CfLabel::from_packed_bytes(buf, out_modulus))
-    } else {
-        let lg_m = lg_modulus(out_modulus);
-        debug_assert!(lg_m <= 64, "NCF modulus {} too large for u64", out_modulus);
-        let mut buf = [0u8; 8];
-        expand(seed, domain, &mut buf[..lg_m.div_ceil(8)]);
-        // Unfilled high bytes are zero, so the LE word load masked to lg_m
-        // bits equals the LSB-first per-bit assembly of the expanded bytes.
-        let word = u64::from_le_bytes(buf);
-        let value = if lg_m >= 64 {
-            word
-        } else {
-            word & ((1u64 << lg_m) - 1)
-        };
-        // value < 2^lg_m ≤ 2·(out_modulus − 1) < 2·out_modulus (lg_m = ⌈log₂ m⌉),
-        // so one compare-subtract equals `value % out_modulus`. For modulus ≤ 1,
-        // lg_m = 0 forces value = 0, consistent with the `out_modulus == 0` guard.
-        let rep = if out_modulus != 0 && value >= out_modulus {
-            value - out_modulus
-        } else {
-            value
-        };
-        Label::Ncf(NcfLabel {
-            rep,
-            modulus: out_modulus,
-        })
-    }
-}
-
-/// CCRH for a switch group: one wide call covering all members.
-pub fn hash_bulk(ctrl_mask: &Label, group_id: usize, total_bits: usize) -> Vec<u8> {
-    let mut out = vec![0u8; total_bits.div_ceil(8)];
-    hash_bulk_into(ctrl_mask, group_id, total_bits, &mut out);
-    out
-}
-
-/// As [`hash_bulk`], but writes the `total_bits.div_ceil(8)` output bytes into
-/// the prefix of `out` (which must be at least that long); bytes past the
-/// prefix are left untouched.
-///
-/// Byte-identical to [`hash_bulk`] — callers may pack many groups into one
-/// slab without per-group allocation.
+/// Bulk domain: bit 63 of the tweak is set to disambiguate from the solo
+/// domain. `group_id` must be globally fresh (paper App. A, Def. 4).
 pub fn hash_bulk_into(ctrl_mask: &Label, group_id: usize, total_bits: usize, out: &mut [u8]) {
-    debug_assert!(
-        matches!(ctrl_mask, Label::Cf(c) if c.modulus() == 2),
-        "ctrl mask must be CF Z_2"
-    );
     let seed = label_to_block(ctrl_mask);
-    // Bulk: set bit 63 of the domain to disambiguate from solo.
-    // Below the solo/bulk flag bit, so distinct group ids stay in the bulk domain.
     debug_assert!(
         (group_id as u64) < (1u64 << 63),
         "group id uses the bulk-domain bit"
@@ -125,13 +50,10 @@ pub fn hash_bulk_into(ctrl_mask: &Label, group_id: usize, total_bits: usize, out
     expand(seed, domain, &mut out[..len]);
 }
 
-/// CCRH for one Z₂-payload kernel switch, allocation-free.
-///
-/// 128 pseudorandom bits keyed on a packed CF Z₂ control label, in the bulk
-/// domain — byte-identical to [`hash_bulk`] on the same control and
-/// `group_id` with `total_bits = 128`, reinterpreted as two little-endian
-/// words. For kernels whose working representation is bare label words.
-/// `group_id` must be fresh per control (see [`crate::crypto::nonce`]).
+/// CCRH for one Z₂-payload switch, allocation-free: 128 pseudorandom bits
+/// keyed on a packed CF Z₂ control label, in the bulk domain, returned as two
+/// little-endian words. For the steps whose working representation is bare
+/// label words. `group_id` must be fresh per control (see [`crate::crypto::nonce`]).
 pub fn hash_z2(ctrl_words: &[u64; 2], group_id: u64) -> [u64; 2] {
     debug_assert!(group_id < (1u64 << 63), "group id uses the bulk-domain bit");
     let mut seed = [0u8; 16];
@@ -146,162 +68,45 @@ pub fn hash_z2(ctrl_words: &[u64; 2], group_id: u64) -> [u64; 2] {
     ]
 }
 
-/// Extract member `idx`'s NCF label from a wide bulk-hash output.
-pub fn extract_ncf(wide: &[u8], idx: usize, modulus: u64) -> Label {
-    let lg_m = lg_modulus(modulus);
-    debug_assert!(
-        lg_m <= 64,
-        "extract_ncf: modulus {} too large for u64",
-        modulus
-    );
-    let bit_off = idx * lg_m;
-    let mut acc: u64 = 0;
-    for i in 0..lg_m {
-        let bit = bit_off + i;
-        debug_assert!(bit / 8 < wide.len(), "extract_ncf: slice overrun");
-        let b = (wide[bit / 8] >> (bit % 8)) & 1;
-        acc |= (b as u64) << i;
-    }
-    // Note: `acc` is exactly `lg_m = ⌈log₂ modulus⌉` bits, so `acc % modulus` is
-    // slightly biased toward small residues for non-power-of-two `modulus` — the
-    // known limitation documented on `lg_modulus`.
-    let rep = if modulus == 0 { 0 } else { acc % modulus };
-    Label::Ncf(NcfLabel { rep, modulus })
-}
-
-/// Re-export so external callers can build matching Δ_R material.
-pub fn delta_r(delta: u128, modulus: u64) -> CfLabel {
-    label::delta_r(delta, modulus)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::super::label::{CfLabel, Label};
     use super::*;
+    use crate::label::{LAMBDA, Label};
+    use rand::Rng;
 
     fn rand_ctrl() -> Label {
-        use rand::RngExt;
         let mut r = rand::rng();
         let coords: Vec<u64> = (0..LAMBDA).map(|_| r.random_range(0..2u64)).collect();
-        Label::Cf(CfLabel::from_coords(&coords, 2))
+        Label::from_coords(&coords, 2)
     }
 
+    /// Golden vector pinning the full CCRH pipeline (label→block, domain
+    /// encoding, AES-CTR expansion) byte-for-byte for the bulk path.
     #[test]
-    fn test_solo_deterministic() {
-        let s = rand_ctrl();
-        let a = hash_solo(&s, 17, true, 1 << 10);
-        let b = hash_solo(&s, 17, true, 1 << 10);
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn test_solo_gid_changes_output() {
-        let s = rand_ctrl();
-        let a = hash_solo(&s, 1, true, 1 << 10);
-        let b = hash_solo(&s, 2, true, 1 << 10);
-        assert_ne!(a, b);
-    }
-
-    /// Golden vectors pinning the full CCRH pipeline (label→block, domain
-    /// encoding, AES-CTR expansion, NCF bit extraction) byte-for-byte. R1
-    /// refactors hash.rs behind a `Ccrh` trait; these must not change.
-    #[test]
-    fn test_ccrh_golden_vectors() {
+    fn test_bulk_golden_vector() {
         let coords: Vec<u64> = (0..LAMBDA).map(|i| ((i * 7 + 3) % 5 == 0) as u64).collect();
-        let ctrl = Label::Cf(CfLabel::from_coords(&coords, 2));
-
-        match hash_solo(&ctrl, 42, false, 31) {
-            Label::Ncf(n) => assert_eq!((n.rep, n.modulus), (20, 31), "hash_solo NCF golden"),
-            _ => panic!("expected NCF"),
-        }
-        assert_eq!(
-            hash_bulk(&ctrl, 7, 80),
-            [175, 72, 194, 184, 45, 188, 159, 234, 245, 163],
-            "hash_bulk golden"
-        );
+        let ctrl = Label::from_coords(&coords, 2);
+        let mut out = vec![0u8; 10];
+        hash_bulk_into(&ctrl, 7, 80, &mut out);
+        assert_eq!(out, [175, 72, 194, 184, 45, 188, 159, 234, 245, 163]);
     }
 
     #[test]
-    fn test_solo_ctrl_changes_output() {
-        let mut r = rand::rng();
-        use rand::RngExt;
-        let s_a: Vec<u64> = (0..LAMBDA).map(|_| r.random_range(0..2u64)).collect();
-        let mut s_b = s_a.clone();
-        s_b[0] ^= 1;
-        let la = Label::Cf(CfLabel::from_coords(&s_a, 2));
-        let lb = Label::Cf(CfLabel::from_coords(&s_b, 2));
-        let a = hash_solo(&la, 5, false, 409);
-        let b = hash_solo(&lb, 5, false, 409);
-        assert_ne!(a, b);
+    fn test_hash_z2_deterministic_and_gid_sensitive() {
+        let c = rand_ctrl();
+        let words = [c.raw_bits()[0], c.raw_bits()[1]];
+        assert_eq!(hash_z2(&words, 17), hash_z2(&words, 17));
+        assert_ne!(hash_z2(&words, 1), hash_z2(&words, 2));
     }
 
     #[test]
-    fn test_bulk_deterministic_and_correct_length() {
+    fn test_bulk_into_preserves_tail() {
         let s = rand_ctrl();
-        let total_bits = 5 * 9;
-        let a = hash_bulk(&s, 0, total_bits);
-        let b = hash_bulk(&s, 0, total_bits);
-        assert_eq!(a, b);
-        assert_eq!(a.len(), total_bits.div_ceil(8));
-    }
-
-    #[test]
-    fn test_bulk_into_matches_bulk_and_preserves_tail() {
-        let s = rand_ctrl();
-        let total_bits: usize = 5 * 9; // exact length 6 bytes, not a multiple of 8.
-        let exact_len = total_bits.div_ceil(8);
-        let expected = hash_bulk(&s, 3, total_bits);
-        let mut out = vec![0xAAu8; exact_len + 8];
+        let total_bits: usize = 5 * 9; // 6 bytes, not a multiple of 8
+        let exact = total_bits.div_ceil(8);
+        let mut out = vec![0xAAu8; exact + 8];
         hash_bulk_into(&s, 3, total_bits, &mut out);
-        assert_eq!(&out[..exact_len], &expected[..]);
-        assert!(out[exact_len..].iter().all(|&b| b == 0xAA));
-    }
-
-    #[test]
-    fn test_bulk_group_id_changes_output() {
-        let s = rand_ctrl();
-        let a = hash_bulk(&s, 0, 64);
-        let b = hash_bulk(&s, 1, 64);
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn test_solo_bulk_no_collision() {
-        // Solo with gid g and bulk with group_id g must not collide (the
-        // high bit in `domain` distinguishes them). Compare 32 bits so the
-        // false-failure probability is ~2^-32 (an 8-bit compare flaked at
-        // ~0.4% per run).
-        let s = rand_ctrl();
-        let solo = hash_solo(&s, 7, false, 1 << 32);
-        let bulk = hash_bulk(&s, 7, 32);
-        let solo_rep = match solo {
-            Label::Ncf(n) => n.rep,
-            _ => panic!(),
-        };
-        let bulk_rep = u32::from_le_bytes(bulk[..4].try_into().unwrap()) as u64;
-        assert_ne!(solo_rep, bulk_rep);
-    }
-
-    #[test]
-    fn test_extract_ncf_recovers_planted_bits() {
-        let lg_m: usize = 4;
-        let n: usize = 16;
-        let mut wide = vec![0u8; (n * lg_m).div_ceil(8)];
-        for i in 0..n {
-            let bit_off = i * lg_m;
-            for b in 0..lg_m {
-                let bit = bit_off + b;
-                let v = ((i as u64) >> b) & 1;
-                wide[bit / 8] |= (v as u8) << (bit % 8);
-            }
-        }
-        for i in 0..n {
-            let l = extract_ncf(&wide, i, 16);
-            match l {
-                Label::Ncf(n) => assert_eq!(n.rep, i as u64),
-                _ => panic!("expected NCF"),
-            }
-        }
+        assert!(out[exact..].iter().all(|&b| b == 0xAA));
     }
 
     #[test]

@@ -22,7 +22,7 @@ use crate::comp_gc::fold::{fold_batch_eval, fold_batch_garble};
 use crate::crt::{CrtParams, pow2_mod};
 use crate::crypto::nonce;
 use crate::it_gc::{body_batch_eval, body_batch_garble};
-use crate::label::{self, CfLabel, LAMBDA, Label};
+use crate::label::{self, LAMBDA, Label};
 use rand::Rng;
 
 /// Maximum sub-chunk width for the sub-chunk extraction optimization.
@@ -43,7 +43,7 @@ const KERNEL_NONCE_FLOOR: u64 = 1 << 32;
 fn sample_cf_mask<R: Rng>(rng: &mut R, modulus: u64) -> Label {
     assert!(modulus.is_power_of_two());
     let coords: Vec<u64> = (0..LAMBDA).map(|_| rng.random_range(0..modulus)).collect();
-    Label::Cf(CfLabel::from_coords(&coords, modulus))
+    Label::from_coords(&coords, modulus)
 }
 
 
@@ -141,7 +141,7 @@ pub fn build_s_aff_kernels<R: rand::Rng>(
     let first_width = sub_widths[0];
 
     let delta: u128 = rng.random::<u128>() | 1;
-    let d2 = Label::Cf(label::delta_r(delta, 2));
+    let d2 = label::delta_r(delta, 2);
     let mut stats = KernelStats::default();
 
     // ---- Nonce windows (paper App. A, Def. 4) ----
@@ -172,7 +172,7 @@ pub fn build_s_aff_kernels<R: rand::Rng>(
         .collect();
 
     // ---- Stage 1: chunk conversion kernels. ----
-    let zero_bit_mask = Label::zero_cf(2); // constant-0 padding for a short last chunk
+    let zero_bit_mask = Label::zero(2); // constant-0 padding for a short last chunk
     let mut chunk_word_masks: Vec<Label> = Vec::with_capacity(num_chunks);
     let mut chunk_word_labels: Vec<Label> = Vec::with_capacity(num_chunks);
     let chunk_values: Vec<u64> = (0..num_chunks)

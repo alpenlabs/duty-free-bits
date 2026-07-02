@@ -52,7 +52,7 @@ pub struct FoldGarbleOutput {
 /// Packed words of a CF Z₂ label.
 #[inline]
 fn z2_words(l: &Label) -> [u64; 2] {
-    let c = l.as_cf();
+    let c = l;
     debug_assert_eq!(c.modulus(), 2, "fold kernel wires are CF Z_2");
     let raw = c.raw_bits();
     [raw[0], raw[1]]
@@ -60,7 +60,7 @@ fn z2_words(l: &Label) -> [u64; 2] {
 
 #[inline]
 fn z2_label(w: [u64; 2]) -> Label {
-    Label::Cf(crate::label::CfLabel::from_raw_bits(vec![w[0], w[1]], 2))
+    Label::from_raw_bits(vec![w[0], w[1]], 2)
 }
 
 /// Garbler kernel: fold the first sub-chunk's binary OHE into a mod-p OHE.
@@ -202,12 +202,12 @@ pub fn fold_batch_eval(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::label::{self, CfLabel, LAMBDA};
+    use crate::label::{self, LAMBDA};
     use rand::Rng;
 
     fn rand_z2(rng: &mut impl Rng) -> Label {
         let coords: Vec<u64> = (0..LAMBDA).map(|_| rng.random_range(0..2u64)).collect();
-        Label::Cf(CfLabel::from_coords(&coords, 2))
+        Label::from_coords(&coords, 2)
     }
 
     /// labels = masks + value·Δ₂ in: garble + eval a fold and check the final
@@ -216,7 +216,7 @@ mod tests {
     fn test_fold_kernel_label_mask_invariant() {
         let mut rng = rand::rng();
         let delta: u128 = rng.random();
-        let d2 = Label::Cf(label::delta_r(delta, 2));
+        let d2 = label::delta_r(delta, 2);
 
         for &p in &[2u64, 3, 5, 7, 11, 29] {
             let first_width = 4u32;

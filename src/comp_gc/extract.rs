@@ -31,7 +31,7 @@
 
 use crate::crypto::expand;
 use crate::hash;
-use crate::label::{CfLabel, LAMBDA, Label, delta_r};
+use crate::label::{LAMBDA, Label, delta_r};
 
 /// Packed words of a CF Z₂ label (the fold-kernel working type).
 pub(crate) type Z2 = [u64; 2];
@@ -43,27 +43,25 @@ pub(crate) type Wide = [u32; LAMBDA];
 
 #[inline]
 fn z2_of(l: &Label) -> Z2 {
-    let c = l.as_cf();
-    debug_assert_eq!(c.modulus(), 2);
-    let raw = c.raw_bits();
+    debug_assert_eq!(l.modulus(), 2);
+    let raw = l.raw_bits();
     [raw[0], raw[1]]
 }
 
 #[inline]
 fn z2_label(w: Z2) -> Label {
-    Label::Cf(CfLabel::from_raw_bits(vec![w[0], w[1]], 2))
+    Label::from_raw_bits(vec![w[0], w[1]], 2)
 }
 
 #[inline]
 fn wide_of(l: &Label) -> Wide {
-    let c = l.as_cf();
-    c.lanes().try_into().expect("CF lanes are LAMBDA wide")
+    l.lanes().try_into().expect("lanes are LAMBDA wide")
 }
 
 #[inline]
 fn wide_label(w: &Wide, modulus: u64) -> Label {
     let mask = (modulus - 1) as u32;
-    Label::Cf(CfLabel::from_lanes(w.iter().map(|&l| l & mask).collect(), modulus))
+    Label::from_lanes(w.iter().map(|&l| l & mask).collect(), modulus)
 }
 
 /// `dst += src` lane-wise, mod 2^32.
@@ -453,14 +451,14 @@ pub fn extract_batch_garble(
     nonce_solo: u64,
 ) -> ExtractGarbleOutput {
     assert_sub_widths(sub_widths);
-    let ell = chunk_word_masks[0].as_cf().k();
+    let ell = chunk_word_masks[0].k();
     assert_eq!(
         sub_widths.iter().sum::<u32>(),
         ell,
         "sub-chunk widths must sum to the chunk-word width (the System \
          reference asserts this too)"
     );
-    debug_assert!(chunk_word_masks.iter().all(|m| m.as_cf().k() == ell));
+    debug_assert!(chunk_word_masks.iter().all(|m| m.k() == ell));
     let mask_ell = ((1u64 << ell) - 1) as u32;
     let d2 = {
         let d = delta_r(delta, 2);
@@ -521,7 +519,7 @@ pub fn extract_batch_garble(
             .collect();
         let mut pin = root;
         let dl = delta_r(delta, 1u64 << l);
-        wide_add(&mut pin, &wide_of(&Label::Cf(dl)));
+        wide_add(&mut pin, &wide_of(&dl));
         let mask_l = ((1u64 << l) - 1) as u32;
         for lane in pin.iter_mut() {
             *lane &= mask_l;
@@ -572,14 +570,14 @@ pub fn extract_batch_eval(
     nonce_solo: u64,
 ) -> (Vec<Label>, Vec<Label>) {
     assert_sub_widths(sub_widths);
-    let ell = chunk_word_labels[0].as_cf().k();
+    let ell = chunk_word_labels[0].k();
     assert_eq!(
         sub_widths.iter().sum::<u32>(),
         ell,
         "sub-chunk widths must sum to the chunk-word width"
     );
     assert_eq!(diffs.len(), sub_widths.len(), "one SubChunkDiffs per sub-chunk");
-    debug_assert!(chunk_word_labels.iter().all(|m| m.as_cf().k() == ell));
+    debug_assert!(chunk_word_labels.iter().all(|m| m.k() == ell));
     let mask_ell = ((1u64 << ell) - 1) as u32;
 
     let mut rem = [0u32; LAMBDA];
@@ -840,7 +838,7 @@ pub fn chunk_batch_garble(
         .collect();
     let mut pin = root;
     let dl = delta_r(delta, 1u64 << ell);
-    wide_add(&mut pin, &wide_of(&Label::Cf(dl)));
+    wide_add(&mut pin, &wide_of(&dl));
     for lane in pin.iter_mut() {
         *lane &= mask_l;
     }
@@ -955,14 +953,14 @@ mod tests {
 
     fn rand_z2(rng: &mut impl Rng) -> Label {
         let coords: Vec<u64> = (0..LAMBDA).map(|_| rng.random_range(0..2u64)).collect();
-        Label::Cf(CfLabel::from_coords(&coords, 2))
+        Label::from_coords(&coords, 2)
     }
 
     fn rand_wide(rng: &mut impl Rng, modulus: u64) -> Label {
         let coords: Vec<u64> = (0..LAMBDA)
             .map(|_| rng.random_range(0..modulus))
             .collect();
-        Label::Cf(CfLabel::from_coords(&coords, modulus))
+        Label::from_coords(&coords, modulus)
     }
 
     /// Chunk kernel: word label = word mask + v·Δ for every value, at the
@@ -980,8 +978,8 @@ mod tests {
     fn chunk_invariant_shape(nb: u32, ell: u32) {
         let mut rng = rand::rng();
         let delta: u128 = rng.random::<u128>() | 1;
-        let d2 = Label::Cf(delta_r(delta, 2));
-        let dl = Label::Cf(delta_r(delta, 1u64 << ell));
+        let d2 = delta_r(delta, 2);
+        let dl = delta_r(delta, 1u64 << ell);
 
         let bit_masks: Vec<Label> = (0..nb).map(|_| rand_z2(&mut rng)).collect();
         let g = chunk_batch_garble(&bit_masks, ell, delta, 5_000, 9_000);
@@ -1028,7 +1026,7 @@ mod tests {
     fn test_extract_kernel_label_mask_invariant() {
         let mut rng = rand::rng();
         let delta: u128 = rng.random::<u128>() | 1;
-        let d2 = Label::Cf(delta_r(delta, 2));
+        let d2 = delta_r(delta, 2);
 
         for (ell, sub_widths, coeffs) in [
             (8u32, vec![4u32, 4], vec![1u64, 16]),
@@ -1068,7 +1066,7 @@ mod tests {
                     .iter()
                     .zip(&coeffs)
                     .fold(0u64, |a, (&v, &c)| (a + v.wrapping_mul(c)) & (m_ell - 1));
-                let dl_ell = Label::Cf(delta_r(delta, m_ell));
+                let dl_ell = delta_r(delta, m_ell);
                 let word_labels: Vec<Label> = word_masks
                     .iter()
                     .zip(&values)
