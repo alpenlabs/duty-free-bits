@@ -301,9 +301,6 @@ mod tests {
     /// The NEON even-k unpacker must agree with the scalar window loop on
     /// every width it claims (the cast pads flow through this).
     #[cfg(target_arch = "aarch64")]
-    /// The NEON even-k unpacker must agree with the scalar window loop on
-    /// every width it claims (the cast pads flow through this).
-    #[cfg(target_arch = "aarch64")]
     #[test]
     fn test_unpack_even_k_neon_matches_generic() {
         let mut rng = rand::rng();

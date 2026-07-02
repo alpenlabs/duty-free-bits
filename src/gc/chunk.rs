@@ -1,12 +1,12 @@
 //! Step 1 / 4 (computational GC): pack `lg n` input bits into a ring word
 //! `w_c ∈ Z_{2^ℓ}` — the straight-line `bin_to_word`.
 //!
-//! Inputs: the `n` input-bit labels of one chunk.  Output: the chunk word `w_c`
-//! (its garbled label). Built on the shared one-hot tree + casts (the
-//! crate-internal onehot machinery):
-//! a one-hot over the chunk's bits, width-ℓ casts of the leaves, and
-//! `word = Σ_p p·A_p`. The pin join lets the evaluator recover the one hot cast
-//! it cannot derive.
+//! Inputs: one chunk's input-bit labels (`lg n` of them). Output: the chunk
+//! word `w_c` (its garbled label), which the extract step (`super::extract`)
+//! accumulates into `r_i` per prime. Built on the shared one-hot tree + casts
+//! (the crate-internal onehot machinery): a one-hot over the chunk's bits,
+//! width-ℓ casts of the leaves, and `word = Σ_p p·A_p`. The pin join lets the
+//! evaluator recover the one one-hot cast it cannot derive.
 
 use super::Cost;
 use super::onehot::*;

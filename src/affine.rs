@@ -6,7 +6,7 @@
 //! straight-line steps over bare labels — no gate graph, no worklist:
 //!
 //!   1. **Chunk conversion**: partition n bits into ⌈n/lg n⌉ chunks, convert
-//!      each to a word in Z_{2^ℓ} ([`crate::gc::extract`]).
+//!      each to a word in Z_{2^ℓ} ([`crate::gc::chunk`]).
 //!   2. **Extract**: per prime, form r_i ≡ x (mod p_i) and decompose it into
 //!      sub-chunk bits + a binary one-hot ([`crate::gc::extract`]).
 //!   3. **Fold**: reduce to a length-p_i binary one-hot `h_p` of x mod p_i
@@ -124,8 +124,8 @@ impl Stats {
 }
 
 /// Garble + evaluate the affine maps: chunk conversion → per-prime extract
-/// → fold → body, all straight-line loops over bare labels
-/// ([`crate::gc::extract`], [`crate::gc::fold`], [`crate::gc::body`]).
+/// → fold → body, all straight-line loops over bare labels ([`crate::gc::chunk`],
+/// [`crate::gc::extract`], [`crate::gc::fold`], [`crate::gc::body`]).
 /// No gate graph, no worklist: the evaluator knows `x_bits` (switch-private /
 /// data-public), so every derivation order is closed-form.
 ///

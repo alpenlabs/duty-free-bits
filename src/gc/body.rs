@@ -526,16 +526,16 @@ mod tests {
 
         let a_batch: Vec<u64> = (0..b).map(|_| rng.random_range(0..p_i)).collect();
         let b_batch: Vec<u64> = (0..b).map(|_| rng.random_range(0..p_i)).collect();
-        let truth: Vec<u64> = (0..p_i).collect();
+        let weights: Vec<u64> = (0..p_i).collect();
 
-        let g_out = body_batch_garble(p_i, &h_p_masks, &a_batch, &b_batch, &truth, 0);
+        let g_out = body_batch_garble(p_i, &h_p_masks, &a_batch, &b_batch, &weights, 0);
         let result_labels = body_batch_eval(
             p_i,
             hot_idx,
             &h_p_labels,
             &g_out.join_diffs,
             &b_batch,
-            &truth,
+            &weights,
             0,
         );
 
@@ -568,7 +568,7 @@ mod tests {
         let gid = 17usize;
         for &p_i in &moduli {
             let p = p_i as usize;
-            let truth: Vec<u64> = (0..p_i).collect();
+            let weights: Vec<u64> = (0..p_i).collect();
             let mut hots = vec![0usize, 1 % p, p / 2, p - 1];
             hots.sort_unstable();
             hots.dedup();
@@ -579,12 +579,12 @@ mod tests {
 
                 // Garbler: full kernel (auto dispatch) vs the forced-scalar
                 // reference rebuilt from the same deterministic slab.
-                let g_out = body_batch_garble(p_i, &h_p_masks, &a_batch, &b_batch, &truth, gid);
+                let g_out = body_batch_garble(p_i, &h_p_masks, &a_batch, &b_batch, &weights, gid);
                 let slab = slot_pads(&h_p_masks, gid, b, p_i);
                 let (mut ps_auto, mut ro_auto) = (vec![0u64; b], vec![0u64; b]);
-                accumulate_pads(&slab, &truth, None, p_i, &mut ps_auto, &mut ro_auto);
+                accumulate_pads(&slab, &weights, None, p_i, &mut ps_auto, &mut ro_auto);
                 let (mut ps_ref, mut ro_ref) = (vec![0u64; b], vec![0u64; b]);
-                accumulate_pads_scalar(&slab, &truth, None, p_i, 0, &mut ps_ref, &mut ro_ref);
+                accumulate_pads_scalar(&slab, &weights, None, p_i, 0, &mut ps_ref, &mut ro_ref);
                 assert_eq!(ps_auto, ps_ref, "pad sums diverge: p={p_i} b={b}");
                 assert_eq!(ro_auto, ro_ref, "readouts diverge: p={p_i} b={b}");
                 let (jd_ref, rm_ref) =
@@ -619,14 +619,14 @@ mod tests {
                         &h_p_labels,
                         &g_out.join_diffs,
                         &b_batch,
-                        &truth,
+                        &weights,
                         gid,
                     );
                     let slab_l = slot_pads(&h_p_labels, gid, b, p_i);
                     let (mut ps_e, mut ro_e) = (vec![0u64; b], vec![0u64; b]);
                     accumulate_pads_scalar(
                         &slab_l,
-                        &truth,
+                        &weights,
                         Some(hot),
                         p_i,
                         0,
@@ -635,7 +635,7 @@ mod tests {
                     );
                     let ev_ref = eval_outputs_from_sums(
                         p_i,
-                        truth[hot] % p_i,
+                        weights[hot] % p_i,
                         &g_out.join_diffs,
                         &ps_e,
                         &ro_e,
@@ -659,7 +659,7 @@ mod tests {
         let p = p_i as usize;
         let b = 6usize;
         let mut rng = rand::rng();
-        let truth: Vec<u64> = (0..p_i).collect();
+        let weights: Vec<u64> = (0..p_i).collect();
 
         for hot_idx in 0..p {
             let h_p_masks: Vec<Label> = (0..p).map(|_| rand_cf2_label(&mut rng)).collect();
@@ -678,14 +678,14 @@ mod tests {
             let a_batch: Vec<u64> = (0..b).map(|_| rng.random_range(0..p_i)).collect();
             let b_batch: Vec<u64> = (0..b).map(|_| rng.random_range(0..p_i)).collect();
 
-            let g_out = body_batch_garble(p_i, &h_p_masks, &a_batch, &b_batch, &truth, 0);
+            let g_out = body_batch_garble(p_i, &h_p_masks, &a_batch, &b_batch, &weights, 0);
             let result_labels = body_batch_eval(
                 p_i,
                 hot_idx,
                 &h_p_labels,
                 &g_out.join_diffs,
                 &b_batch,
-                &truth,
+                &weights,
                 0,
             );
 
