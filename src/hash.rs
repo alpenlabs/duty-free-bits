@@ -31,13 +31,14 @@ fn label_to_block(l: &Label) -> Block {
     bytes
 }
 
-/// CCRH covering a whole switch group: `total_bits` pseudorandom bits keyed on
-/// a CF Z_2 control label, written into the prefix of `out` (which must be at
-/// least `total_bits.div_ceil(8)` long; bytes past the prefix are untouched,
-/// so callers may pack many groups into one slab without per-group alloc).
+/// CCRH covering a whole switch group.
 ///
-/// Bulk domain: bit 63 of the tweak is set to disambiguate from the solo
-/// domain. `group_id` must be globally fresh (paper App. A, Def. 4).
+/// `total_bits` pseudorandom bits keyed on a CF Z_2 control label, written
+/// into the prefix of `out` (which must be at least `total_bits.div_ceil(8)`
+/// long; bytes past the prefix are untouched, so callers may pack many groups
+/// into one slab without per-group alloc). Bulk domain: bit 63 of the tweak
+/// is set to disambiguate from the solo domain. `group_id` must be globally
+/// fresh (paper App. A, Def. 4).
 pub fn hash_bulk_into(ctrl_mask: &Label, group_id: usize, total_bits: usize, out: &mut [u8]) {
     let seed = label_to_block(ctrl_mask);
     debug_assert!(
@@ -50,10 +51,12 @@ pub fn hash_bulk_into(ctrl_mask: &Label, group_id: usize, total_bits: usize, out
     expand(seed, domain, &mut out[..len]);
 }
 
-/// CCRH for one Z₂-payload switch, allocation-free: 128 pseudorandom bits
-/// keyed on a packed CF Z₂ control label, in the bulk domain, returned as two
-/// little-endian words. For the steps whose working representation is bare
-/// label words. `group_id` must be fresh per control (see [`crate::crypto::nonce`]).
+/// CCRH for one Z₂-payload switch, allocation-free.
+///
+/// 128 pseudorandom bits keyed on a packed CF Z₂ control label, in the bulk
+/// domain, returned as two little-endian words — for the steps whose working
+/// representation is bare label words. `group_id` must be fresh per control
+/// (see [`crate::crypto::nonce`]).
 pub fn hash_z2(ctrl_words: &[u64; 2], group_id: u64) -> [u64; 2] {
     debug_assert!(group_id < (1u64 << 63), "group id uses the bulk-domain bit");
     let mut seed = [0u8; 16];
