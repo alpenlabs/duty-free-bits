@@ -50,7 +50,7 @@ pub struct BodyBatchGarbleOutput {
     pub join_diffs: Vec<u64>,
     /// Garbler's output mask per batch member (NCF Z_p rep).
     pub result_masks: Vec<u64>,
-    /// Garbled-material footprint of this batch, for pipeline telemetry.
+    /// Garbled-material footprint of this batch, for telemetry.
     pub cost: BatchCost,
 }
 
