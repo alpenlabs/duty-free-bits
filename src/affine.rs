@@ -46,6 +46,18 @@ fn sample_cf_mask<R: Rng>(rng: &mut R, modulus: u64) -> Label {
     Label::from_coords(&coords, modulus)
 }
 
+/// Run `f`, adding its wall time to `*secs` and its CCRH-block delta to
+/// `*blocks` (the latter nonzero only under the `count-hashes` feature). Wraps
+/// each garble/eval step so the driver reads as the pipeline, not the timers.
+fn measure<T>(secs: &mut f64, blocks: &mut u64, f: impl FnOnce() -> T) -> T {
+    let b0 = crate::crypto::hash_blocks();
+    let t = std::time::Instant::now();
+    let out = f();
+    *secs += t.elapsed().as_secs_f64();
+    *blocks += crate::crypto::hash_blocks() - b0;
+    out
+}
+
 
 
 /// Per-stage telemetry of one [`build_s_aff`] run. Times are wall-clock
@@ -94,6 +106,20 @@ impl Stats {
     /// See [`garble_secs`](Self::garble_secs).
     pub fn eval_secs(&self) -> f64 {
         self.chunk_eval_secs + self.extract_eval_secs + self.fold_eval_secs + self.body_eval_secs
+    }
+
+    /// Fold a CF step's cost (chunk/extract/fold) into the ledger.
+    fn add_cf(&mut self, c: crate::gc::Cost) {
+        self.program_bits += c.program_bits;
+        self.join_complexity_cf += c.join_complexity;
+        self.hash_count_cf += c.hash_count;
+    }
+
+    /// Fold the NCF body's cost into the ledger.
+    fn add_ncf(&mut self, c: crate::gc::Cost) {
+        self.program_bits += c.program_bits;
+        self.join_complexity_ncf += c.join_complexity;
+        self.hash_count_ncf += c.hash_count;
     }
 }
 
@@ -191,21 +217,15 @@ pub fn build_s_aff<R: rand::Rng>(
         let bulk = bulk_chunk_base + c as u64 * chunk_bulk_ids;
         let solo = solo_chunk_base + c as u64 * chunk_solo_ids;
 
-        let gb0 = crate::crypto::hash_blocks();
-        let t = std::time::Instant::now();
-        let g = chunk_batch_garble(&masks, ell, delta, bulk, solo);
-        stats.chunk_garble_secs += t.elapsed().as_secs_f64();
-        stats.garble_hash_blocks += crate::crypto::hash_blocks() - gb0;
+        let g = measure(&mut stats.chunk_garble_secs, &mut stats.garble_hash_blocks, || {
+            chunk_batch_garble(&masks, ell, delta, bulk, solo)
+        });
 
-        let eb0 = crate::crypto::hash_blocks();
-        let t = std::time::Instant::now();
-        let w = chunk_batch_eval(&labels, chunk_values[c], ell, &g.scale, &g.pin, bulk, solo);
-        stats.chunk_eval_secs += t.elapsed().as_secs_f64();
-        stats.eval_hash_blocks += crate::crypto::hash_blocks() - eb0;
+        let w = measure(&mut stats.chunk_eval_secs, &mut stats.eval_hash_blocks, || {
+            chunk_batch_eval(&labels, chunk_values[c], ell, &g.scale, &g.pin, bulk, solo)
+        });
 
-        stats.program_bits += g.cost.program_bits;
-        stats.join_complexity_cf += g.cost.join_complexity_cf;
-        stats.hash_count_cf += g.cost.hash_count_cf;
+        stats.add_cf(g.cost);
         chunk_word_masks.push(g.word_mask);
         chunk_word_labels.push(w);
     }
@@ -230,60 +250,27 @@ pub fn build_s_aff<R: rand::Rng>(
         let bulk = bulk_extract_base + i as u64 * ex_bulk_ids;
         let solo = solo_extract_base + i as u64 * ex_solo_ids;
 
-        let gb0 = crate::crypto::hash_blocks();
-        let t = std::time::Instant::now();
-        let g = extract_batch_garble(&chunk_word_masks, &coeffs, &sub_widths, delta, bulk, solo);
-        stats.extract_garble_secs += t.elapsed().as_secs_f64();
-        stats.garble_hash_blocks += crate::crypto::hash_blocks() - gb0;
+        let g = measure(&mut stats.extract_garble_secs, &mut stats.garble_hash_blocks, || {
+            extract_batch_garble(&chunk_word_masks, &coeffs, &sub_widths, delta, bulk, solo)
+        });
 
-        let eb0 = crate::crypto::hash_blocks();
-        let t = std::time::Instant::now();
-        let (first_bin_hot_labels, fold_bit_labels) = extract_batch_eval(
-            &chunk_word_labels,
-            &coeffs,
-            r_value,
-            &sub_widths,
-            &g.diffs,
-            bulk,
-            solo,
-        );
-        stats.extract_eval_secs += t.elapsed().as_secs_f64();
-        stats.eval_hash_blocks += crate::crypto::hash_blocks() - eb0;
+        let ex = measure(&mut stats.extract_eval_secs, &mut stats.eval_hash_blocks, || {
+            extract_batch_eval(&chunk_word_labels, &coeffs, r_value, &sub_widths, &g.diffs, bulk, solo)
+        });
 
-        stats.program_bits += g.cost.program_bits;
-        stats.join_complexity_cf += g.cost.join_complexity_cf;
-        stats.hash_count_cf += g.cost.hash_count_cf;
+        stats.add_cf(g.cost);
 
         // ---- Fold step. ----
         let fold_nonce_base = prime_nonce_bases[i] + num_batches as u64 * p_i;
-        let gb0 = crate::crypto::hash_blocks();
-        let t = std::time::Instant::now();
-        let fold_g = fold_batch_garble(
-            p_i,
-            &g.first_bin_hot_masks,
-            &g.fold_bit_masks,
-            first_width,
-            fold_nonce_base,
-        );
-        stats.fold_garble_secs += t.elapsed().as_secs_f64();
-        stats.garble_hash_blocks += crate::crypto::hash_blocks() - gb0;
+        let fold_g = measure(&mut stats.fold_garble_secs, &mut stats.garble_hash_blocks, || {
+            fold_batch_garble(p_i, &g.first_bin_hot_masks, &g.fold_bit_masks, first_width, fold_nonce_base)
+        });
 
-        let eb0 = crate::crypto::hash_blocks();
-        let t = std::time::Instant::now();
-        let h_p_labels = fold_batch_eval(
-            p_i,
-            r_value,
-            &first_bin_hot_labels,
-            &fold_bit_labels,
-            &fold_g.join_diffs,
-            first_width,
-            fold_nonce_base,
-        );
-        stats.fold_eval_secs += t.elapsed().as_secs_f64();
-        stats.eval_hash_blocks += crate::crypto::hash_blocks() - eb0;
-        stats.program_bits += fold_g.cost.program_bits;
-        stats.join_complexity_cf += fold_g.cost.join_complexity_cf;
-        stats.hash_count_cf += fold_g.cost.hash_count_cf;
+        let h_p_labels = measure(&mut stats.fold_eval_secs, &mut stats.eval_hash_blocks, || {
+            fold_batch_eval(p_i, r_value, &ex.first_bin_hot_labels, &ex.fold_bit_labels,
+                &fold_g.join_diffs, first_width, fold_nonce_base)
+        });
+        stats.add_cf(fold_g.cost);
         let h_p_masks = fold_g.h_p_masks;
 
         // ---- Body batches. ----
@@ -297,40 +284,19 @@ pub fn build_s_aff<R: rand::Rng>(
             let batch_idx = start / RESIDUE_BATCH_SIZE;
             let nonce_base = prime_nonce_bases[i] as usize + batch_idx * p_i as usize;
 
-            let gb0 = crate::crypto::hash_blocks();
-            let t = std::time::Instant::now();
-            let g_out = body_batch_garble(
-                p_i,
-                &h_p_masks,
-                &a_batch,
-                &b_batch,
-                &weights,
-                nonce_base,
-            );
-            stats.body_garble_secs += t.elapsed().as_secs_f64();
-            stats.garble_hash_blocks += crate::crypto::hash_blocks() - gb0;
+            let g_out = measure(&mut stats.body_garble_secs, &mut stats.garble_hash_blocks, || {
+                body_batch_garble(p_i, &h_p_masks, &a_batch, &b_batch, &weights, nonce_base)
+            });
 
-            let eb0 = crate::crypto::hash_blocks();
-            let t = std::time::Instant::now();
-            let result_labels = body_batch_eval(
-                p_i,
-                hot_i,
-                &h_p_labels,
-                &g_out.join_diffs,
-                &b_batch,
-                &weights,
-                nonce_base,
-            );
-            stats.body_eval_secs += t.elapsed().as_secs_f64();
-            stats.eval_hash_blocks += crate::crypto::hash_blocks() - eb0;
+            let result_labels = measure(&mut stats.body_eval_secs, &mut stats.eval_hash_blocks, || {
+                body_batch_eval(p_i, hot_i, &h_p_labels, &g_out.join_diffs, &b_batch, &weights, nonce_base)
+            });
 
             for (l, m) in result_labels.iter().zip(g_out.result_masks.iter()) {
                 let value = if l >= m { l - m } else { l + p_i - m };
                 prime_outputs.push(value);
             }
-            stats.program_bits += g_out.cost.program_bits;
-            stats.join_complexity_ncf += g_out.cost.join_complexity_ncf;
-            stats.hash_count_ncf += g_out.cost.hash_count_ncf;
+            stats.add_ncf(g_out.cost);
             start = end;
         }
         all_outputs.push(prime_outputs);

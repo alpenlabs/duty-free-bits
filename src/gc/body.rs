@@ -25,19 +25,9 @@
 //! `b`), turning the `a` in slot `hot` into `a·(x mod p_i) + b`.
 //! `(a, b)` stay hidden information-theoretically: single Z_p residues.
 
+use crate::gc::Cost;
 use crate::hash;
 use crate::label::{LAMBDA, Label};
-
-/// Cost of one IT-GC body batch (garbled-material footprint, for telemetry).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct BatchCost {
-    /// Program bits the garbler emitted for the batch (the join diffs).
-    pub program_bits: usize,
-    /// NCF join width, in bits.
-    pub join_complexity_ncf: usize,
-    /// NCF CCRH block invocations.
-    pub hash_count_ncf: usize,
-}
 
 /// Garbler-side output of one body batch, length `B` (one entry per member).
 ///
@@ -51,7 +41,7 @@ pub struct BodyBatchGarbleOutput {
     /// Garbler's output mask per batch member (NCF Z_p rep).
     pub result_masks: Vec<u64>,
     /// Garbled-material footprint of this batch, for telemetry.
-    pub cost: BatchCost,
+    pub cost: Cost,
 }
 
 /// Garbler side of one per-prime body batch (see the module docs): forms the
@@ -104,12 +94,12 @@ pub fn body_batch_garble(
 /// of `lg|p_i|` bits per member (communication is unchanged by the pad
 /// layout), and `p_i` switch hashes of `b·pad_bits` bits each (one CCRH
 /// block per `λ` bits — see [`pad_bits`] for the alignment trade).
-fn batch_cost(p_i: u64, b: usize) -> BatchCost {
+fn batch_cost(p_i: u64, b: usize) -> Cost {
     let join_bits = b * hash::lg_modulus(p_i);
-    BatchCost {
+    Cost {
         program_bits: join_bits,
-        join_complexity_ncf: join_bits,
-        hash_count_ncf: p_i as usize * (b * pad_bits(p_i)).div_ceil(LAMBDA),
+        join_complexity: join_bits,
+        hash_count: p_i as usize * (b * pad_bits(p_i)).div_ceil(LAMBDA),
     }
 }
 

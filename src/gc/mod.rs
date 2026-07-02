@@ -19,3 +19,25 @@ pub mod chunk;
 pub mod extract;
 pub mod fold;
 pub mod onehot;
+
+/// The garbled-material + hash footprint of one step (for [`crate::affine::Stats`]).
+/// A CF switch on Z_{2^w} costs `w` CCRH blocks, a CF join `w` λ-bit units; an
+/// NCF switch/join costs one residue. Which side of the CF/NCF ledger a step's
+/// cost lands on is decided by the driver, not the step.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Cost {
+    /// Bits the garbler emits (the join diffs).
+    pub program_bits: usize,
+    /// Join width: `lg|G|` units for CF steps, bits for the NCF body.
+    pub join_complexity: usize,
+    /// CCRH blocks (garbler-side: every switch).
+    pub hash_count: usize,
+}
+
+impl Cost {
+    pub(crate) fn add(&mut self, o: Cost) {
+        self.program_bits += o.program_bits;
+        self.join_complexity += o.join_complexity;
+        self.hash_count += o.hash_count;
+    }
+}

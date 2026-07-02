@@ -23,19 +23,9 @@
 //! evaluator use the same window, so pads agree at every non-hot slot.
 
 use crate::crt::pow2_mod;
+use crate::gc::Cost;
 use crate::hash;
 use crate::label::Label;
-
-/// Garbled-material footprint of one fold (communication + hash counts).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct FoldCost {
-    /// Bits the garbler emits: one λ-bit CF Z₂ join diff per folded bit.
-    pub program_bits: usize,
-    /// CF join width, in `lg|G|` units (1 per Z₂ join).
-    pub join_complexity_cf: usize,
-    /// CCRH blocks: one per (bit, slot) switch.
-    pub hash_count_cf: usize,
-}
 
 /// Garbler-side output of one fold.
 #[derive(Debug)]
@@ -45,7 +35,7 @@ pub struct FoldGarbleOutput {
     /// Join diff per folded bit (`X_s ⊕ X_bit`, CF Z₂).
     pub join_diffs: Vec<Label>,
     /// Footprint for telemetry.
-    pub cost: FoldCost,
+    pub cost: Cost,
 }
 
 /// Packed words of a CF Z₂ label.
@@ -121,11 +111,11 @@ pub fn fold_batch_garble(
 
 /// Footprint of folding `bits` bit positions mod `p` (per side; each switch
 /// is charged once).
-fn fold_cost(p: u64, bits: usize) -> FoldCost {
-    FoldCost {
+fn fold_cost(p: u64, bits: usize) -> Cost {
+    Cost {
         program_bits: bits * crate::label::LAMBDA,
-        join_complexity_cf: bits,
-        hash_count_cf: bits * p as usize,
+        join_complexity: bits,
+        hash_count: bits * p as usize,
     }
 }
 

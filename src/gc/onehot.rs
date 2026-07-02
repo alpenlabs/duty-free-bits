@@ -12,6 +12,7 @@
 //! canonical.
 
 use crate::crypto::expand;
+use crate::gc::Cost;
 use crate::hash;
 use crate::label::{LAMBDA, Label};
 
@@ -212,33 +213,13 @@ pub(crate) fn peel_bit(sub: &Wide, res: &Wide, i: u32, k: u32) -> Z2 {
     out
 }
 
-/// Garbled-material + hash footprint of one step: a CF switch on Z_{2^w}
-/// costs `w` CCRH blocks, a CF join `w` λ-bit units of communication.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct StepCost {
-    /// Bits the garbler emits (join diffs).
-    pub program_bits: usize,
-    /// CF join width, in `lg|G|` units.
-    pub join_complexity_cf: usize,
-    /// CCRH blocks charged by the ledger (garbler-side: every switch).
-    pub hash_count_cf: usize,
-}
-
-impl StepCost {
-    pub(crate) fn add(&mut self, o: StepCost) {
-        self.program_bits += o.program_bits;
-        self.join_complexity_cf += o.join_complexity_cf;
-        self.hash_count_cf += o.hash_count_cf;
-    }
-}
-
 /// One tree-plus-casts stage: `n_bits` one-hot bits, casts at width `l`.
-pub(crate) fn stage_cost(n_bits: u32, l: u32) -> StepCost {
+pub(crate) fn stage_cost(n_bits: u32, l: u32) -> Cost {
     let n = 1usize << n_bits;
-    StepCost {
+    Cost {
         program_bits: (n_bits as usize - 1 + l as usize) * LAMBDA,
-        join_complexity_cf: n_bits as usize - 1 + l as usize,
-        hash_count_cf: (n - 2) + l as usize * n,
+        join_complexity: n_bits as usize - 1 + l as usize,
+        hash_count: (n - 2) + l as usize * n,
     }
 }
 

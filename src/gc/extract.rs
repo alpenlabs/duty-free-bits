@@ -8,6 +8,7 @@
 //! peel. Outputs the first sub-chunk's binary one-hot + the remaining bits,
 //! which [`super::fold`] consumes.
 
+use super::Cost;
 use super::onehot::*;
 use crate::hash;
 use crate::label::{LAMBDA, Label, delta_r};
@@ -60,7 +61,17 @@ pub struct ExtractGarbleOutput {
     /// Per sub-chunk: the k−1 scale-join diffs and the width-`l` pin diff.
     pub diffs: Vec<SubChunkDiffs>,
     /// Ledger footprint.
-    pub cost: StepCost,
+    pub cost: Cost,
+}
+
+/// Evaluator-side output of one extract step: the labels [`super::fold`]
+/// consumes.
+#[derive(Debug)]
+pub struct ExtractEvalOutput {
+    /// Labels of the first sub-chunk's binary one-hot (CF Z₂).
+    pub first_bin_hot_labels: Vec<Label>,
+    /// Labels of the fold bits (sub-chunks 1.., LSB-first within each).
+    pub fold_bit_labels: Vec<Label>,
 }
 
 /// The communicated material of one sub-chunk stage.
@@ -142,7 +153,7 @@ pub fn extract_batch_garble(
     let mut first_bin_hot_masks = Vec::new();
     let mut fold_bit_masks = Vec::new();
     let mut diffs = Vec::with_capacity(plans.len());
-    let mut cost = StepCost::default();
+    let mut cost = Cost::default();
     let mut rem_bits = ell;
 
     for (q, p) in plans.iter().enumerate() {
@@ -234,7 +245,7 @@ pub fn extract_batch_eval(
     diffs: &[SubChunkDiffs],
     nonce_bulk: u64,
     nonce_solo: u64,
-) -> (Vec<Label>, Vec<Label>) {
+) -> ExtractEvalOutput {
     assert_sub_widths(sub_widths);
     let ell = chunk_word_labels[0].k();
     assert_eq!(
@@ -363,7 +374,10 @@ pub fn extract_batch_eval(
         }
     }
 
-    (first_bin_hot_labels, fold_bit_labels)
+    ExtractEvalOutput {
+        first_bin_hot_labels,
+        fold_bit_labels,
+    }
 }
 
 /// Bulk-id base of level `m` within a stage (slots of levels 1..m precede it).
@@ -516,7 +530,7 @@ mod tests {
                     })
                     .sum()
             };
-            assert_eq!(g.cost.hash_count_cf, expect_cost);
+            assert_eq!(g.cost.hash_count, expect_cost);
             let _ = (bulk_n, solo_n);
     
             // Random chunk-word values; r = Σ coeff·v mod 2^ell.
@@ -534,7 +548,7 @@ mod tests {
                     .map(|(m, &v)| label::add(m, &label::scalar_mul(v, &dl_ell)))
                     .collect();
     
-                let (fbh, fbits) = extract_batch_eval(
+                let ev = extract_batch_eval(
                     &word_labels,
                     &coeffs,
                     r,
@@ -543,6 +557,7 @@ mod tests {
                     100,
                     200,
                 );
+                let (fbh, fbits) = (&ev.first_bin_hot_labels, &ev.fold_bit_labels);
     
                 // first_bin_hot: label = mask + [p == r mod 2^{w0}]·Δ₂.
                 let w0 = sub_widths[0];

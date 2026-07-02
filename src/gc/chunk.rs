@@ -7,6 +7,7 @@
 //! `word = Σ_p p·A_p`. The pin join lets the evaluator recover the one hot cast
 //! it cannot derive.
 
+use super::Cost;
 use super::onehot::*;
 use crate::hash;
 use crate::label::{LAMBDA, Label, delta_r};
@@ -27,7 +28,7 @@ pub struct ChunkGarbleOutput {
     /// Pin-join diff (width ell).
     pub pin: Wide,
     /// Ledger footprint.
-    pub cost: StepCost,
+    pub cost: Cost,
 }
 
 /// Garbler side: pack `bits` (CF Z₂ masks, LSB-first) into a Z_{2^ell}
@@ -184,9 +185,9 @@ mod tests {
         let g = chunk_batch_garble(&bit_masks, ell, delta, 5_000, 9_000);
         let lim = 1u32 << ell;
         assert!(g.pin.iter().all(|&lane| lane < lim), "pin lane not canonical");
-        assert_eq!(g.cost.join_complexity_cf as u32, nb - 1 + ell);
+        assert_eq!(g.cost.join_complexity as u32, nb - 1 + ell);
         assert_eq!(
-            g.cost.hash_count_cf as u64,
+            g.cost.hash_count as u64,
             (1u64 << nb) - 2 + ell as u64 * (1u64 << nb)
         );
     
