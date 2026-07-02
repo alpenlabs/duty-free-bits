@@ -1,25 +1,26 @@
-//! Step 3 / 4 (computational GC): reduce the extract step's binary one-hot mod
-//! `p_i` (free Z₂ adds), then fold in the remaining sub-chunk bits — one switch
-//! per (bit, slot) — to a length-`p_i` one-hot of `x mod p_i` that [`super::body`]
-//! consumes. Straight-line garble/eval over bare Z₂ labels.
+//! Step 3 of 4 (computational GC): free-reindex the extract step's boolean
+//! one-hot into residue classes mod `p_i` (h[i mod p] = Σ, a free Z₂ recombine),
+//! then one-hot-scale in the remaining sub-chunk bits — one scaling per fold
+//! bit, hashing all `p` slots — to a length-`p_i` one-hot of `x mod p_i` that
+//! [`super::body`] consumes. Straight-line garble/eval over boolean labels.
 //!
 //! The fold is regular — per folded bit `b`, per slot `r`:
 //!
 //! ```text
-//!   h'[r]    = switch(0, h[r])            X_h'[r] = H(X_h[r])   (one CCRH block)
+//!   h'[r]    = scale(h[r])                X_h'[r] = H(X_h[r])   (one CCRH block)
 //!   s        = Σ_r h'[r]                  X_s     = ⊕_r X_h'[r]
-//!   s ▷◁ bit                              diff    = X_s ⊕ X_bit (communicated)
+//!   scale(s, bit)                         diff    = X_s ⊕ X_bit (communicated)
 //!   h_new[r] = h[r] + h'[r] + h'[src]     src     = (r − 2^pos mod p) mod p
 //! ```
 //!
-//! Every wire is CF Z₂, so labels are bare `[u64; 2]` blocks and ring ops are
-//! XOR. The garbler is fully forward. The evaluator knows every control in
-//! cleartext (it knows `r`), so at the single *hot* slot — where the switch is
-//! open — it recovers the pad backward through the join:
+//! Every wire is a boolean label, so labels are bare `[u64; 2]` blocks and ring
+//! ops are XOR. The garbler is fully forward. The evaluator holds `r` in the
+//! clear, so it knows every active position; at the single *hot* slot — where
+//! the scaling is opened — it recovers the pad backward through the scaling:
 //! `L_h'[hot] = L_s ⊕ (⊕_{r≠hot} L_h'[r])` with `L_s = L_bit ⊕ diff` — the
-//! open switch's backward chain, telescoped.
+//! opened scaling's backward chain, telescoped.
 //!
-//! Switch hashes draw fresh bulk-domain CCRH nonces from a caller-supplied
+//! Scaling hashes draw fresh bulk-domain CCRH nonces from a caller-supplied
 //! window of `bits.len()·p` ids (see [`crate::crypto::nonce`]); the garbler and
 //! evaluator use the same window, so pads agree at every non-hot slot.
 
@@ -31,15 +32,16 @@ use crate::label::Label;
 /// Garbler-side output of one fold.
 #[derive(Debug)]
 pub struct FoldGarbleOutput {
-    /// Masks of the final length-`p` OHE (CF Z₂).
+    /// Masks of the final length-`p` one-hot (boolean labels).
     pub h_p_masks: Vec<Label>,
-    /// Join diff per folded bit (`X_s ⊕ X_bit`, CF Z₂).
+    /// The one residue each scaling communicates, per folded bit
+    /// (`X_s ⊕ X_bit`, boolean label).
     pub join_diffs: Vec<Label>,
     /// Footprint for telemetry.
     pub cost: Cost,
 }
 
-/// Packed words of a CF Z₂ label.
+/// Packed words of a boolean label.
 #[inline]
 fn z2_words(l: &Label) -> [u64; 2] {
     debug_assert_eq!(l.modulus(), 2, "fold wires are CF Z_2");
@@ -52,9 +54,9 @@ fn z2_label(w: [u64; 2]) -> Label {
     Label::from_raw_bits(vec![w[0], w[1]], 2)
 }
 
-/// Garbler side: fold the first sub-chunk's binary OHE into a mod-p OHE.
+/// Garbler side: fold the first sub-chunk's boolean one-hot into a mod-`p` one-hot.
 ///
-/// `first_bin_hot_masks` are the masks of the binary OHE of the low
+/// `first_bin_hot_masks` are the masks of the boolean one-hot of the low
 /// `first_width` bits; `bit_masks` the masks of bit positions `first_width..`.
 /// `nonce_base` is the start of a fresh window of `bit_masks.len()·p`
 /// bulk-domain CCRH ids.
@@ -67,7 +69,7 @@ pub fn fold_batch_garble(
 ) -> FoldGarbleOutput {
     let p_usize = p as usize;
 
-    // h init: h[r'] = Σ_{i ≡ r' (mod p)} first_bin_hot[i] — free Z₂ adds.
+    // h init: free reindex into residue classes — h[r'] = Σ_{i ≡ r' (mod p)} first_bin_hot[i].
     let mut h = vec![[0u64; 2]; p_usize];
     for (i, m) in first_bin_hot_masks.iter().enumerate() {
         let w = z2_words(m);
@@ -110,7 +112,7 @@ pub fn fold_batch_garble(
     }
 }
 
-/// Footprint of folding `bits` bit positions mod `p` (per side; each switch
+/// Footprint of folding `bits` bit positions mod `p` (per side; each scaling
 /// is charged once).
 fn fold_cost(p: u64, bits: usize) -> Cost {
     Cost {
@@ -122,9 +124,9 @@ fn fold_cost(p: u64, bits: usize) -> Cost {
 
 /// Evaluator side: the label-side mirror of [`fold_batch_garble`].
 ///
-/// `r` is the cleartext value whose OHE is being folded (the evaluator knows
-/// `x`, hence `r`): bit values and every intermediate hot position derive from
-/// it. Returns the final OHE labels; slot `r mod p` is hot.
+/// `r` is the cleartext value whose one-hot is being folded (the evaluator
+/// holds `x`, hence `r`): bit values and every intermediate active position
+/// derive from it. Returns the final one-hot labels; slot `r mod p` is hot.
 pub fn fold_batch_eval(
     p: u64,
     r: u64,
@@ -154,7 +156,7 @@ pub fn fold_batch_eval(
         let shift = pow2_mod(pos, p) as usize;
         let bit_nonce_base = nonce_base + (b_idx * p_usize) as u64;
 
-        // Non-hot slots: control value is 0, so the pad recomputes exactly.
+        // Non-hot slots are off (share 0), so the pad recomputes exactly.
         let mut s_known = [0u64; 2];
         for (rr, hp) in h_prime.iter_mut().enumerate() {
             if rr == hot {
@@ -164,7 +166,7 @@ pub fn fold_batch_eval(
             s_known[0] ^= hp[0];
             s_known[1] ^= hp[1];
         }
-        // Hot slot, backward through the join: L_s = L_bit ⊕ diff, then
+        // Hot slot, backward through the scaling: L_s = L_bit ⊕ diff, then
         // L_h'[hot] = L_s ⊕ (⊕_{r≠hot} L_h'[r]).
         let bit_words = z2_words(bl);
         let diff_words = z2_words(diff);
@@ -200,7 +202,7 @@ mod tests {
     }
 
     /// labels = masks + value·Δ₂ in: garble + eval a fold and check the final
-    /// OHE satisfies the carry invariant with exactly slot `r mod p` hot.
+    /// one-hot satisfies the carry invariant with exactly slot `r mod p` hot.
     #[test]
     fn test_fold_label_mask_invariant() {
         let mut rng = rand::rng();

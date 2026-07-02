@@ -1,12 +1,12 @@
-//! Step 2 / 4 (computational GC): decompose a ring word into its sub-chunk
-//! bits + a binary one-hot + the peel upcast — the fused `word_to_bin_up`.
+//! Step 2 of 4 (computational GC): decompose a ring word into its sub-chunk
+//! bits + a binary one-hot + the upcast — the fused `word_to_bin_up`.
 //!
-//! Per prime: form `r_i = Σ_c coeff_c·w_c`, split it into ≤8-bit sub-chunks,
-//! and for each run the shared onehot tree + casts. The width-`l` casts do
-//! double duty — their weighted class sums both peel the bits (LSB-first) and
-//! give the upcast `Σ p·A_p` that reconstructs the sub-chunk value for the next
-//! peel. Outputs the first sub-chunk's binary one-hot + the remaining bits,
-//! which [`super::fold`] consumes.
+//! Per prime: free-recombine `r_i = Σ_c coeff_c·w_c`, split it into ≤8-bit
+//! sub-chunks, and decompose each by repeated one-hot scaling + upcast. The
+//! width-`l` upcasts do double duty — their weighted class sums both peel the
+//! bits (LSB-first) and give the upcast `Σ p·A_p` that reconstructs the
+//! sub-chunk value for the next peel. Outputs the first sub-chunk's binary
+//! one-hot + the remaining bits, which [`super::fold`] consumes.
 
 use super::Cost;
 use super::onehot::*;
@@ -28,10 +28,10 @@ pub fn compute_sub_widths(ell: u32, max_width: u32) -> Vec<u32> {
     widths
 }
 
-/// The extract step's lane machinery represents width-`l` wires as u32
-/// lanes, so every sub-chunk width must be in `2..=31`; a width-1 trailing
-/// sub-chunk (`ell ≡ 1 mod 8` under `compute_sub_widths(·, 8)`) is not
-/// supported. Rejected loudly in release builds too.
+/// The extract step's lane machinery represents width-`l` arithmetic labels
+/// as u32 lanes, so every sub-chunk width must be in `2..=31`; a width-1
+/// trailing sub-chunk (`ell ≡ 1 mod 8` under `compute_sub_widths(·, 8)`) is
+/// not supported. Rejected loudly in release builds too.
 fn assert_sub_widths(sub_widths: &[u32]) {
     assert!(
         sub_widths.iter().all(|&w| (2..=31).contains(&w)),
@@ -54,11 +54,12 @@ pub fn extract_nonces(sub_widths: &[u32]) -> (u64, u64) {
 /// Garbler-side output of one extract step.
 #[derive(Debug)]
 pub struct ExtractGarbleOutput {
-    /// Masks of the first sub-chunk's binary one-hot (CF Z₂, 2^{w₀} entries).
+    /// Masks of the first sub-chunk's binary one-hot (boolean labels, 2^{w₀} entries).
     pub first_bin_hot_masks: Vec<Label>,
     /// Masks of the fold bits (sub-chunks 1.., LSB-first within each).
     pub fold_bit_masks: Vec<Label>,
-    /// Per sub-chunk: the k−1 scale-join diffs and the width-`l` pin diff.
+    /// Per sub-chunk: the k−1 growth scalings (`scale`, one per bit) and the
+    /// width-`l` root scaling (`pin`) that delivers the active leaf's upcast.
     pub diffs: Vec<SubChunkDiffs>,
     /// Ledger footprint.
     pub cost: Cost,
@@ -68,18 +69,20 @@ pub struct ExtractGarbleOutput {
 /// consumes.
 #[derive(Debug)]
 pub struct ExtractEvalOutput {
-    /// Labels of the first sub-chunk's binary one-hot (CF Z₂).
+    /// Labels of the first sub-chunk's binary one-hot (boolean labels).
     pub first_bin_hot_labels: Vec<Label>,
     /// Labels of the fold bits (sub-chunks 1.., LSB-first within each).
     pub fold_bit_labels: Vec<Label>,
 }
 
-/// The communicated material of one sub-chunk stage.
+/// The scaling ciphertexts one sub-chunk stage communicates.
 #[derive(Debug)]
 pub struct SubChunkDiffs {
-    /// Scale-join diff per tree level (k−1 of them, Z₂).
+    /// The growth scaling for one tree level — grows the one-hot by one bit
+    /// (k−1 of them, Z₂).
     pub scale: Vec<Z2>,
-    /// Pin-join diff (width `l` = the stage's cast width).
+    /// The root scaling that delivers the active leaf's upcast value (width
+    /// `l` = the stage's upcast width).
     pub pin: Wide,
 }
 
@@ -114,12 +117,13 @@ fn plan_stages(ell: u32, sub_widths: &[u32], bulk_base: u64, solo_base: u64) -> 
     plans
 }
 
-/// Garbler side: `r = Σ_c coeff_c·w_c`, then the fused `word_to_bin_up`
-/// per sub-chunk. X-blind: hashes every tree slot and every cast, including
-/// the (unknown) hot ones.
+/// Garbler side: free-recombine `r = Σ_c coeff_c·w_c`, then the fused
+/// `word_to_bin_up` per sub-chunk. X-blind: hashes every tree slot and every
+/// upcast, including the (unknown) active ones.
 ///
-/// `chunk_word_masks` are CF Z_{2^ell} masks of the chunk words; `nonce_bulk`
-/// / `nonce_solo` are fresh windows sized by [`extract_nonces`].
+/// `chunk_word_masks` are the chunk words' masks — arithmetic labels over
+/// Z_{2^ell}; `nonce_bulk` / `nonce_solo` are fresh windows sized by
+/// [`extract_nonces`].
 pub fn extract_batch_garble(
     chunk_word_masks: &[Label],
     coeffs: &[u64],
@@ -168,11 +172,11 @@ pub fn extract_batch_garble(
         }
         let bit0 = pack_lane_bit(&sub, 0);
 
-        // Doubling tree, level-major over every slot.
+        // Grow the one-hot a bit at a time, level-major over every slot.
         let lvl1 = [[bit0[0] ^ d2[0], bit0[1] ^ d2[1]], bit0];
         let (leaves, ysums) = tree_garble(k, lvl1, p.bulk_base);
 
-        // Width-l casts of every leaf.
+        // Width-l upcasts of every leaf.
         let n = 1usize << k;
         let mut casts = vec![[0u32; LAMBDA]; n];
         for (leaf, cast) in casts.iter_mut().enumerate() {
@@ -187,7 +191,7 @@ pub fn extract_batch_garble(
             bit_masks.push(peel_bit(&sub, &chain[i as usize - 1], i, k));
         }
 
-        // Scale diffs (⊕ y_m ⊕ X_{bit_m}) and the pin diff (root + Δ_l:
+        // Growth scalings (⊕ y_m ⊕ X_{bit_m}) and the root scaling (root + Δ_l:
         // diff = X_root − X_one with X_one = −Δ_l).
         let scale: Vec<Z2> = ysums
             .iter()
@@ -234,9 +238,9 @@ pub fn extract_batch_garble(
 
 /// Evaluator side: the label-side mirror of [`extract_batch_garble`],
 /// following the straight-line `word_to_bin_up` schedule. `r_value` is the
-/// evaluator's cleartext `Σ coeff_c·v_c` (it knows `x`): every hot index and
-/// class residue is index arithmetic; hot slots are solved through the scale
-/// joins, and the hot cast class through the pin join.
+/// evaluator's cleartext `Σ coeff_c·v_c` (it knows `x`): every active index and
+/// class residue is index arithmetic; active slots are solved through the
+/// growth scalings, and the active upcast class through the root scaling.
 pub fn extract_batch_eval(
     chunk_word_labels: &[Label],
     coeffs: &[u64],
@@ -288,11 +292,11 @@ pub fn extract_batch_eval(
         lvl[1][1] = bit0;
         let mut ysum = vec![[0u64; 2]; k as usize];
 
-        // Accumulator bank over solved casts: R_j = Σ (p mod 2^j)·A_p,
+        // Accumulator bank over solved upcasts: R_j = Σ (p mod 2^j)·A_p,
         // T_j = Σ A_p for j = 1..=k (width l).
         let mut acc_r = vec![[0u32; LAMBDA]; k as usize];
         let mut acc_t = vec![[0u32; LAMBDA]; k as usize];
-        // L_root from the pin join: the constant-1 wire's label is 0.
+        // L_root from the root scaling: the constant-1 wire's label is 0.
         let root = dd.pin;
 
         // Scratch for the per-class subtree fold (max class size 2^{k−1}).
@@ -312,10 +316,11 @@ pub fn extract_batch_eval(
             &mut sums,
         );
 
-        // Rounds 1..k−1: residue → bit i → hot solve → expand the new class.
+        // Rounds 1..k−1: residue → bit i → active solve → expand the new class.
         for i in 1..k {
             let qi = s & ((1u64 << i) - 1);
-            // res_i = R_i + q·(L_root − T_i): the hot class enters via the pin.
+            // res_i = R_i + q·(L_root − T_i): the active class enters via the
+            // root scaling.
             let ii = i as usize - 1;
             let mut res = root;
             wide_sub(&mut res, &acc_t[ii]);
@@ -324,7 +329,7 @@ pub fn extract_batch_eval(
             let bit_i = peel_bit(&sub, &res_i, i, k);
             bit_labels.push(bit_i);
 
-            // Hot slot of level i solves through the scale join.
+            // Active slot of level i solves through the growth scaling.
             let d = dd.scale[ii];
             let ys = ysum[i as usize];
             let y_hot = [
@@ -386,11 +391,11 @@ fn nonce_bulk_stage(p: &StagePlan, m: u32) -> u64 {
     p.bulk_base + ((1u64 << m) - 2)
 }
 
-/// Expand the newly-zero slot `z` (level `lz`) to the leaves — every switch
-/// en route is closed — then cast its leaves and fold the class into
-/// accumulator levels lz..=k. This is [`super::chunk::chunk_batch_eval`]'s
-/// per-level one-hot solve, generalized to width-`l` casts and batched over a
-/// whole congruence class.
+/// Expand the newly-zero slot `z` (level `lz`) to the leaves — every one-hot
+/// scaling en route is closed — then upcast its leaves and fold the class —
+/// free recombination, no ciphertexts — into accumulator levels lz..=k. This
+/// is [`super::chunk::chunk_batch_eval`]'s per-level one-hot solve, generalized
+/// to width-`l` upcasts and batched over a whole congruence class.
 ///
 /// The fold is subtree-structured: leaves are `p_c = z + c·2^lz`, so
 /// `p_c mod 2^j = z + (c mod 2^{j−lz})·2^lz`, and the class's contribution to
@@ -511,7 +516,7 @@ mod tests {
     
             let g = extract_batch_garble(&word_masks, &coeffs, &sub_widths, delta, 100, 200);
             // Emitted material must be canonical: every pin lane < 2^l, where
-            // l is the stage's cast width (the remainder width, or k on the
+            // l is the stage's upcast width (the remainder width, or k on the
             // last stage).
             let mut rb = ell;
             for (q, (dd, &k)) in g.diffs.iter().zip(&sub_widths).enumerate() {
@@ -603,7 +608,7 @@ mod micro {
         let ctrl: Z2 = [0x1234_5678_9ABC_DEF0, 0x0FED_CBA9_8765_4321];
         let mut cast = [7u32; LAMBDA];
 
-        // 1. Cast hashing: (256 @ l=22) + (256 @ l=14) + (64 @ l=6).
+        // 1. Upcast hashing: (256 @ l=22) + (256 @ l=14) + (64 @ l=6).
         let t = Instant::now();
         for _ in 0..reps {
             for p in 0..256u64 {
@@ -652,7 +657,7 @@ mod micro {
         }
         let fold_secs = t.elapsed().as_secs_f64();
 
-        // 4. Garbler peel_chain on 256 casts (includes the to_vec copy).
+        // 4. Garbler peel_chain on 256 upcasts (includes the to_vec copy).
         let casts = vec![[5u32; LAMBDA]; 256];
         let t = Instant::now();
         for _ in 0..reps {

@@ -1,30 +1,32 @@
-//! Step 4 / 4 (information-theoretic GC): deliver `a·(x mod p_i) + b` per prime.
+//! Step 4 / 4 (information-theoretic GC): the canonical **one-hot scaling** —
+//! deliver `a·(x mod p_i) + b` per prime.
 //!
-//! Step 3 ([`super::fold`]) handed us a binary one-hot `h_p` of `hot = x mod p_i`:
-//! `p_i` CF Z_2
-//! wires, exactly the one at index `hot` carrying a 1. Hashing wire `i`'s label
-//! gives a fresh one-time pad `pad_i = H(h_p[i]) ∈ Z_{p_i}` — one pad per slot.
+//! Step 3 ([`super::fold`]) handed us a length-`p_i` one-hot `h_p` of
+//! `hot = x mod p_i`: `p_i` boolean labels, exactly the one at the active slot
+//! `hot` sharing a 1. Hashing slot `i`'s label gives a fresh one-time pad
+//! `pad_i = H(h_p[i]) ∈ Z_{p_i}` — one pad per slot.
 //!
-//! **One pad is hidden from the evaluator.** The evaluator knows `x`, hence
-//! `hot`. At every *non-hot* slot the one-hot bit is 0, so its label equals the
-//! garbler's mask and the evaluator recomputes `pad_i` itself. At the *hot* slot
-//! the label differs, so `pad_hot` is the single pad it cannot derive. The `p_i`
-//! pads are therefore an additive sharing the evaluator can open everywhere but
-//! that one slot.
+//! **One pad is hidden from the evaluator.** The evaluator knows `x`, hence the
+//! active slot `hot`. At every *off* slot the one-hot bit is 0, so its label
+//! equals the garbler's mask and the evaluator recomputes `pad_i` itself. At the
+//! *active* slot the label differs, so `pad_hot` is the single pad it cannot
+//! derive. The `p_i` pads are therefore an additive sharing the evaluator can
+//! open everywhere but that one slot.
 //!
-//! **Delivering `a`.** The garbler sends one residue per affine map
+//! **Delivering `a` — the scaling ciphertext.** The garbler sends one residue
+//! per affine map
 //!
 //! ```text
 //!     diff = (Σ_i pad_i) + a            (mod p_i)
 //! ```
 //!
 //! The evaluator subtracts every pad it knows: `pad_hot + a = diff − Σ_{i≠hot} pad_i`.
-//! Now slot `hot` carries `pad_hot + a` and every other slot carries plain
-//! `pad_i` — i.e. the secret `a` sits in slot `hot`, and all other slots are shares of 0.
+//! Now the active slot carries `pad_hot + a` and every off slot carries plain
+//! `pad_i` — i.e. the scalar `a` sits at the active slot, and every off slot shares 0.
 //!
-//! A linear combination weights slot `i` by `i` (and folds in
-//! `b`), turning the `a` in slot `hot` into `a·(x mod p_i) + b`.
-//! `(a, b)` stay hidden information-theoretically: single Z_p residues.
+//! A **free** recombination then weights slot `i` by `i` (and folds in `b`),
+//! turning the `a` at the active slot into `a·(x mod p_i) + b`.
+//! `(a, b)` stay hidden information-theoretically: single `Z_p` residues.
 
 use crate::gc::Cost;
 use crate::hash;
@@ -32,14 +34,14 @@ use crate::label::{LAMBDA, Label};
 
 /// Garbler-side output of one body batch, length `B` (one entry per member).
 ///
-/// The evaluator knows `x` in cleartext (switch-private / data-public), so it
-/// locates every switch's hot position itself; the garbler emits only the join
-/// diffs.
+/// The evaluator holds `x` in the clear, so it knows every active position
+/// itself; the garbler emits only the scaling ciphertexts (`join_diffs`).
 #[derive(Debug)]
 pub struct BodyBatchGarbleOutput {
-    /// Join diff per batch member (NCF Z_p rep).
+    /// `join_diffs` — the one residue each scaling communicates per batch member:
+    /// `Σ pad_i + a` as a `Z_p` share.
     pub join_diffs: Vec<u64>,
-    /// Garbler's output mask per batch member (NCF Z_p rep).
+    /// Garbler's output mask per batch member (`Z_p` share).
     pub result_masks: Vec<u64>,
     /// Garbled-material footprint of this batch, for telemetry.
     pub cost: Cost,
@@ -48,10 +50,10 @@ pub struct BodyBatchGarbleOutput {
 /// Garbler side of one per-prime body batch (see the module docs): forms the
 /// per-slot pads, sends `diff = Σ pad_i + a` per member.
 ///
-/// `h_p_masks` are the carry-in CF Z_2 masks for the length-`p_i` one-hot;
-/// `a_batch` / `b_batch` are the affine coefficients reduced mod `p_i`;
-/// `weights[i] = i mod p_i` is the weight `g`. `group_id_base` offsets
-/// the per-slot CCRH tweak.
+/// `h_p_masks` are the carry-in boolean-label masks for the length-`p_i`
+/// one-hot; `a_batch` / `b_batch` are the affine coefficients reduced mod `p_i`;
+/// `weights[i] = i mod p_i` is the recombination weight `g`. `group_id_base`
+/// offsets the per-slot CCRH tweak.
 pub fn body_batch_garble(
     p_i: u64,
     h_p_masks: &[Label],
@@ -91,9 +93,9 @@ pub fn body_batch_garble(
     }
 }
 
-/// Garbled-material footprint of a `b`-member body batch mod `p_i`: one join diff
-/// of `lg|p_i|` bits per member (communication is unchanged by the pad
-/// layout), and `p_i` switch hashes of `b·pad_bits` bits each (one CCRH
+/// Garbled-material footprint of a `b`-member body batch mod `p_i`: one scaling
+/// residue of `lg|p_i|` bits per member (communication is unchanged by the pad
+/// layout), and `p_i` slot hashes of `b·pad_bits` bits each (one CCRH
 /// block per `λ` bits — see [`pad_bits`] for the alignment trade).
 fn batch_cost(p_i: u64, b: usize) -> Cost {
     let join_bits = b * hash::lg_modulus(p_i);
@@ -107,11 +109,11 @@ fn batch_cost(p_i: u64, b: usize) -> Cost {
 /// Evaluator side of one per-prime body batch: the label-side mirror of
 /// [`body_batch_garble`] (see the module docs).
 ///
-/// `hot = x mod p_i` is supplied in cleartext — the evaluator knows `x`, so the
-/// control is never revealed. It recomputes every pad but `pad_hot`, opens the
-/// hidden one from `diff`, and reads out the result. (`b_batch` is unused beyond
-/// its length — `b`'s label is 0.) Returns the delivered residue per member; the
-/// caller decodes `value = label − mask mod p_i`.
+/// `hot = x mod p_i` is supplied in the clear — the evaluator holds `x`, so it
+/// knows the active position without it ever being revealed. It recomputes every
+/// pad but `pad_hot`, opens the hidden one from `diff`, and reads out the result.
+/// (`b_batch` is unused beyond its length — `b`'s label is 0.) Returns the
+/// delivered residue per member; the caller decodes `value = label − mask mod p_i`.
 pub fn body_batch_eval(
     p_i: u64,
     hot: usize,
@@ -128,7 +130,7 @@ pub fn body_batch_eval(
     assert_eq!(weights.len(), p, "weights length mismatch");
     assert!(hot < p, "hot index out of range");
 
-    // Same pads the garbler formed. At a non-hot slot the one-hot bit is 0, so
+    // Same pads the garbler formed. At an off slot the one-hot bit is 0, so
     // label == mask and the evaluator recomputes pad_i exactly; only pad_hot differs.
     let slot_hash = slot_pads(h_p_labels, group_id_base, b, p_i);
     let g_hot = weights[hot] % p_i;
@@ -162,7 +164,7 @@ fn garble_outputs_from_sums(
     for j in 0..b {
         let pad_sum = pad_sum_raw[j] % p_i;
         let readout = mod_add(readout_raw[j] % p_i, neg_mod(b_batch[j], p_i), p_i);
-        // The one residue sent per map: diff = Σ pad_i + a (mod_sub by −a adds a).
+        // The scaling ciphertext, one residue per map: diff = Σ pad_i + a (mod_sub by −a adds a).
         join_diffs.push(mod_sub(pad_sum, neg_mod(a_batch[j], p_i), p_i));
         result_masks.push(readout);
     }
@@ -201,8 +203,8 @@ fn eval_outputs_from_sums(
 /// the extraction bit-surgery that dominated the body's non-hash time
 /// disappears, and the pad-sampling bias shrinks from `2^⌈lg p⌉ mod p`
 /// (documented on [`hash::lg_modulus`], up to ~20% at p = 409) to
-/// `2^w mod p` (< 0.2%). Join diffs — the actual communication — remain
-/// `lg|p_i|`-bit residues.
+/// `2^w mod p` (< 0.2%). The scaling residues — the actual communication —
+/// remain `lg|p_i|`-bit.
 fn pad_bits(p_i: u64) -> usize {
     hash::lg_modulus(p_i).next_multiple_of(4)
 }
@@ -219,7 +221,7 @@ struct HashSlab {
 /// The pad material `H(h_p[i])` for each one-hot slot, bulk-packed: each slot
 /// holds `b·lg|p_i|` pseudorandom bits, one `lg|p_i|`-bit pad per batch member.
 /// Garbler and evaluator call this identically (on masks / labels); at every
-/// non-hot slot the two agree, which is what lets `pad_i` line up.
+/// off slot the two agree, which is what lets `pad_i` line up.
 fn slot_pads(ohe: &[Label], group_id_base: usize, b: usize, p_i: u64) -> HashSlab {
     let w = pad_bits(p_i);
     let total_bits = b * w;
@@ -242,7 +244,7 @@ fn slot_pads(ohe: &[Label], group_id_base: usize, b: usize, p_i: u64) -> HashSla
 
 /// Accumulate `Σ_i pad_i` and `Σ_i g_i·pad_i` per batch member into
 /// `pad_sum_raw` / `readout_raw`, skipping slot `skip` entirely when given
-/// (eval's hot slot — always a whole-slot skip, never a per-member one).
+/// (eval's active slot — always a whole-slot skip, never a per-member one).
 ///
 /// Delayed reduction: pads are raw `w`-bit slices (< 2^w, see [`pad_bits`])
 /// and weights are < p, so with p²·2^w < 2⁶³ the u64 sums `Σ pad_i`
@@ -457,7 +459,7 @@ fn extract_pad(slab: &[u8], base: usize, member_idx: usize, w: usize) -> u64 {
     (raw >> (bit_off & 7)) & ((1u64 << w) - 1)
 }
 
-// NCF Z_p label algebra. A label is its residue, so the gate operations are
+// `Z_p`-share algebra. A label is its residue, so these operations are
 // plain modular arithmetic on `u64`.
 
 /// Additive inverse mod p — the mask of a public constant c is −c.
@@ -508,7 +510,7 @@ mod tests {
         let b = 4usize;
         let mut rng = rand::rng();
 
-        // Construct h_p as the OHE of value 1 (index 1 hot).
+        // Construct h_p as the one-hot of value 1 (active position = index 1).
         let hot_idx = 1usize;
         let h_p_masks: Vec<Label> = (0..p).map(|_| rand_cf2_label(&mut rng)).collect();
         let h_p_labels: Vec<Label> = (0..p)
@@ -554,9 +556,9 @@ mod tests {
     /// Differential test for the SIMD dispatch: the auto kernel (NEON on
     /// aarch64 wherever the p³ < 2³² gate admits it, scalar everywhere else —
     /// every p below passes the gate) against the always-scalar kernel, end
-    /// to end. Raw accumulator sums, garbler outputs (join diffs + result
+    /// to end. Raw accumulator sums, garbler outputs (scaling residues + result
     /// masks) and eval outputs must be bit-identical, across power-of-two and
-    /// odd moduli, ragged batch sizes, and a sweep of hot positions.
+    /// odd moduli, ragged batch sizes, and a sweep of active positions.
     #[test]
     fn test_body_batch_simd_matches_scalar_differential() {
         let mut rng = rand::rng();

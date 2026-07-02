@@ -1,5 +1,5 @@
 //! Label-aware CCRH: wraps the `Label`-free CCRH core ([`crate::crypto`]) with
-//! the label↔block encoding the protocol's switch pads need.
+//! the label↔block encoding the protocol's one-hot-scaling pads need.
 
 use crate::crypto::{Block, expand};
 use crate::label::Label;
@@ -19,7 +19,7 @@ pub fn lg_modulus(modulus: u64) -> usize {
     }
 }
 
-/// Pack a CF Z_2 control label into a 128-bit block for CCRND's `x` input
+/// Pack a boolean-label control into a 128-bit block for the CCRH's `x` input
 /// (its bit-packed storage is exactly 2 u64 = 16 bytes — a direct copy).
 fn label_to_block(l: &Label) -> Block {
     debug_assert_eq!(l.modulus(), 2, "control must be Z_2");
@@ -31,9 +31,9 @@ fn label_to_block(l: &Label) -> Block {
     bytes
 }
 
-/// CCRH covering a whole switch group.
+/// CCRH covering a whole group of one-hot scalings.
 ///
-/// `total_bits` pseudorandom bits keyed on a CF Z_2 control label, written
+/// `total_bits` pseudorandom bits keyed on a boolean-label control, written
 /// into the prefix of `out` (which must be at least `total_bits.div_ceil(8)`
 /// long; bytes past the prefix are untouched, so callers may pack many groups
 /// into one slab without per-group alloc). Bulk domain: bit 63 of the tweak
@@ -51,9 +51,9 @@ pub fn hash_bulk_into(ctrl_mask: &Label, group_id: usize, total_bits: usize, out
     expand(seed, domain, &mut out[..len]);
 }
 
-/// CCRH for one Z₂-payload switch, allocation-free.
+/// CCRH for one one-hot scaling with a Z₂ payload, allocation-free.
 ///
-/// 128 pseudorandom bits keyed on a packed CF Z₂ control label, in the bulk
+/// 128 pseudorandom bits keyed on a packed boolean-label control, in the bulk
 /// domain, returned as two little-endian words — for the steps whose working
 /// representation is bare label words. `group_id` must be fresh per control
 /// (see [`crate::crypto::nonce`]).

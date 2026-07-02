@@ -1,20 +1,28 @@
 //! Garbled labels.
 //!
-//! A label on a wire in Z_{2^k} holds LAMBDA coordinates of k bits each. The
-//! *wire format* is bit-packed; in memory, Z_2 labels keep that packed form
-//! inline while wider labels store one coordinate per u32 lane (see [`Label`]).
+//! A **label** is one party's share of a wire. A wire value `v` is held as a
+//! sharing of `v·Δ` for the global secret offset `Δ`: `(eval share) −
+//! (garbler share) = v·Δ`. This type is that one share — LAMBDA coordinates of
+//! k bits each over a ring Z_{2^k}. The *wire format* is bit-packed; in memory,
+//! boolean labels (k = 1) keep that packed form inline while wider arithmetic
+//! labels store one coordinate per u32 lane (see [`Label`]).
 
 /// Security parameter: number of coordinates in a label.
 pub const LAMBDA: usize = 128;
 
-/// Words in a bit-packed Z_2 label. Inline (no heap): Z_2 labels are the most
-/// numerous objects, so `Repr::Bits` stores a fixed array.
+/// Words in a bit-packed boolean label. Inline (no heap): boolean labels are the
+/// most numerous objects, so `Repr::Bits` stores a fixed array.
 const BITS_WORDS: usize = LAMBDA.div_ceil(64);
 // The inline representation assumes LAMBDA = 128: exactly 2 words and no
 // partial tail word (so packing/unpacking never masks a final word).
 const _: () = assert!(LAMBDA == 128 && BITS_WORDS == 2);
 
-/// A garbled label: LAMBDA coordinates in Z_{2^k}.
+/// A garbled label: one party's share of a wire, LAMBDA coordinates in Z_{2^k}.
+///
+/// The wire value lives in the *difference* of the two shares, not in either
+/// alone: `(eval share) − (garbler share) = v·Δ`. A **boolean label** (k = 1)
+/// is XOR shares over Z_2 (`v ∈ {0,1}`); an **arithmetic label** (k > 1) is
+/// additive shares over Z_{2^k}.
 ///
 /// The *wire format* (communication, hashing) is always the bit-packed string
 /// where coordinate `i` occupies bits `[i*k .. (i+1)*k)` LSB-first — see
@@ -111,7 +119,8 @@ impl Label {
         }
     }
 
-    /// The u32 lane array of a k > 1 label (in-memory form; panics on Z_2).
+    /// The u32 lane array of an arithmetic (k > 1) label (in-memory form; panics
+    /// on a boolean label).
     pub(crate) fn lanes(&self) -> &[u32] {
         match &self.repr {
             Repr::Lanes(l) => l,
@@ -119,7 +128,7 @@ impl Label {
         }
     }
 
-    /// Build a k > 1 label directly from its lane array.
+    /// Build an arithmetic (k > 1) label directly from its lane array.
     pub(crate) fn from_lanes(lanes: Vec<u32>, modulus: u64) -> Label {
         assert!(
             modulus.is_power_of_two() && modulus > 2 && modulus <= (1u64 << 32),
@@ -136,8 +145,8 @@ impl Label {
         }
     }
 
-    /// Raw bit-packed words of a Z_2 label (the wire format). Z_2 only — wider
-    /// labels store lanes; serialize those with
+    /// Raw bit-packed words of a boolean label (the wire format). Boolean only —
+    /// arithmetic labels store lanes; serialize those with
     /// [`to_packed_words`](Label::to_packed_words).
     pub fn raw_bits(&self) -> &[u64] {
         match &self.repr {
@@ -228,7 +237,7 @@ fn coord_mask(k: u32) -> u64 {
     if k >= 64 { !0u64 } else { (1u64 << k) - 1 }
 }
 
-/// Word-wise XOR of two packed-bit Z_2 labels (Z_2 add/sub).
+/// Word-wise XOR of two packed-bit boolean labels (Z_2 add/sub).
 fn xor_words(a: &[u64; BITS_WORDS], b: &[u64; BITS_WORDS]) -> [u64; BITS_WORDS] {
     let mut out = [0u64; BITS_WORDS];
     for (o, (&x, &y)) in out.iter_mut().zip(a.iter().zip(b)) {
@@ -244,7 +253,7 @@ impl PartialEq for Label {
 }
 impl Eq for Label {}
 
-// ---- Arithmetic (all labels are CF over a power-of-two ring) ----
+// ---- Arithmetic (all labels here are boolean or arithmetic labels over a power-of-two ring) ----
 
 /// Coordinate-wise addition.
 pub fn add(a: &Label, b: &Label) -> Label {
@@ -272,7 +281,7 @@ pub fn add(a: &Label, b: &Label) -> Label {
 /// Scalar multiplication by `s` (in each coordinate's ring).
 ///
 /// Fast paths: `s = 0` → zero label; `s ≡ 1 mod 2^k` → clone (no arithmetic);
-/// Z_2 depends only on `s & 1` (single XOR-of-zero or copy).
+/// a boolean label depends only on `s & 1` (single XOR-of-zero or copy).
 pub fn scalar_mul(s: u64, a: &Label) -> Label {
     let k = a.k();
     // s = 0 collapses to the zero label regardless of k.

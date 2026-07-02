@@ -1,18 +1,21 @@
-//! The `a·x + b` protocol driver: composes the straight-line steps that
-//! evaluate the affine maps over a primorial ring.
+//! The `a·x + b` protocol driver: composes the four straight-line steps —
+//! repeated one-hot scaling + free recombination — that evaluate the affine
+//! maps over a primorial ring.
 //!
 //! Given an n-bit input x and coefficients (a, b) reduced mod each CRT prime,
 //! [`build_s_aff`] computes a·x + b in Z_M (where M = Π p_i) as four
 //! straight-line steps over bare labels — no gate graph, no worklist:
 //!
-//!   1. **Chunk conversion**: partition n bits into ⌈n/lg n⌉ chunks, convert
-//!      each to a word in Z_{2^ℓ} ([`crate::gc::chunk`]).
-//!   2. **Extract**: per prime, form r_i ≡ x (mod p_i) and decompose it into
-//!      sub-chunk bits + a binary one-hot ([`crate::gc::extract`]).
-//!   3. **Fold**: reduce to a length-p_i binary one-hot `h_p` of x mod p_i
+//!   1. **Chunk conversion**: partition n bits into ⌈n/lg n⌉ chunks, grow a
+//!      one-hot over each and upcast it to a word in Z_{2^ℓ}
+//!      ([`crate::gc::chunk`]).
+//!   2. **Extract**: per prime, free-recombine the words into r_i ≡ x (mod
+//!      p_i), then decompose it (one-hot scaling + upcast) into sub-chunk bits
+//!      + a one-hot ([`crate::gc::extract`]).
+//!   3. **Fold**: reduce to a length-p_i one-hot `h_p` of x mod p_i
 //!      ([`crate::gc::fold`]).
-//!   4. **Body**: the information-theoretic GC delivers a·(x mod p_i) + b
-//!      from `h_p` ([`crate::gc::body`]).
+//!   4. **Body**: the information-theoretic GC's one-hot scaling delivers
+//!      a·(x mod p_i) + b from `h_p` ([`crate::gc::body`]).
 
 use crate::crt::{CrtParams, pow2_mod};
 use crate::crypto::nonce;
@@ -26,7 +29,7 @@ use crate::label::{self, LAMBDA, Label};
 use rand::Rng;
 
 /// Maximum sub-chunk width for the sub-chunk extraction optimization.
-/// 2^8 = 256 OHE entries per sub-chunk.
+/// 2^8 = 256 one-hot positions per sub-chunk.
 const MAX_SUB_CHUNK_WIDTH: u32 = 8;
 
 /// S-batch size for the residue body: how many of the `S` affine maps one
@@ -39,7 +42,7 @@ const RESIDUE_BATCH_SIZE: usize = 128;
 /// `2^32` floor keeps the space open for future bulk consumers.
 const BULK_NONCE_FLOOR: u64 = 1 << 32;
 
-/// Sample a uniform CF mask in Z_modulus (modulus must be a power of two).
+/// Sample a uniform mask (a garbler's share) in Z_modulus (modulus must be a power of two).
 fn sample_cf_mask<R: Rng>(rng: &mut R, modulus: u64) -> Label {
     assert!(modulus.is_power_of_two());
     let coords: Vec<u64> = (0..LAMBDA).map(|_| rng.random_range(0..modulus)).collect();
@@ -81,15 +84,15 @@ pub struct Stats {
     pub body_garble_secs: f64,
     /// Body-step eval wall time.
     pub body_eval_secs: f64,
-    /// Garbler-emitted material in bits (the join diffs).
+    /// Garbler-emitted material in bits (the scaling ciphertexts).
     pub program_bits: usize,
-    /// CF join width, in `lg|G|` units (each pays λ bits).
+    /// Scaling width of the boolean-label steps (1–3), in `lg|G|` units (each pays λ bits).
     pub join_complexity_cf: usize,
-    /// NCF join width in bits.
+    /// Scaling width of the `Z_p`-share body (4), in bits.
     pub join_complexity_ncf: usize,
-    /// Ledger CCRH blocks from CF switches.
+    /// Ledger CCRH blocks from the boolean-label steps' scalings.
     pub hash_count_cf: usize,
-    /// Ledger CCRH blocks from NCF switches (bulk-pack rebated).
+    /// Ledger CCRH blocks from the `Z_p`-share body's scalings (bulk-pack rebated).
     pub hash_count_ncf: usize,
     /// Measured garbler CCRH blocks (`count-hashes` feature; else 0).
     pub garble_hash_blocks: u64,
@@ -108,14 +111,14 @@ impl Stats {
         self.chunk_eval_secs + self.extract_eval_secs + self.fold_eval_secs + self.body_eval_secs
     }
 
-    /// Fold a CF step's cost (chunk/extract/fold) into the ledger.
+    /// Fold a boolean-label step's cost (chunk/extract/fold) into the ledger.
     fn add_cf(&mut self, c: crate::gc::Cost) {
         self.program_bits += c.program_bits;
         self.join_complexity_cf += c.join_complexity;
         self.hash_count_cf += c.hash_count;
     }
 
-    /// Fold the NCF body's cost into the ledger.
+    /// Fold the `Z_p`-share body's cost into the ledger.
     fn add_ncf(&mut self, c: crate::gc::Cost) {
         self.program_bits += c.program_bits;
         self.join_complexity_ncf += c.join_complexity;
@@ -126,12 +129,12 @@ impl Stats {
 /// Garble + evaluate the affine maps: chunk conversion → per-prime extract
 /// → fold → body, all straight-line loops over bare labels ([`crate::gc::chunk`],
 /// [`crate::gc::extract`], [`crate::gc::fold`], [`crate::gc::body`]).
-/// No gate graph, no worklist: the evaluator knows `x_bits` (switch-private /
-/// data-public), so every derivation order is closed-form.
+/// No gate graph, no worklist: the evaluator holds `x_bits` in the clear, so it
+/// knows every active position and every derivation order is closed-form.
 ///
-/// One parameter restriction: the extract step represents width-`l` wires as
-/// u32 lanes, so every sub-chunk width must be in `2..=31`; shapes with a
-/// width-1 trailing sub-chunk (`ell ≡ 1 mod 8`, e.g. n = 1 or n = 26..=32
+/// One parameter restriction: the extract step represents width-`l` arithmetic
+/// labels as u32 lanes, so every sub-chunk width must be in `2..=31`; shapes
+/// with a width-1 trailing sub-chunk (`ell ≡ 1 mod 8`, e.g. n = 1 or n = 26..=32
 /// with the 80-prime set) are rejected loudly.
 pub fn build_s_aff<R: rand::Rng>(
     rng: &mut R,
@@ -306,15 +309,16 @@ pub fn build_s_aff<R: rand::Rng>(
 }
 
 /// The complete CCRH nonce-window layout (paper App. A, Def. 4: no two
-/// garbler queries may share a (domain, id)).
+/// garbler queries may share a (domain, id) — a fresh nonce per scaling
+/// ciphertext).
 ///
-/// Solo domain (width-`l` cast pads): chunk-step windows first, then the
-/// per-prime extract windows. Bulk domain (Z₂ tree hashes + the fold/body
-/// steps): the fold/body per-prime windows from [`BULK_NONCE_FLOOR`], then
-/// the chunk tree windows, then the per-prime extract tree windows above
-/// those. This struct is the single source of truth the driver draws its
-/// bases from; `test_nonce_windows_disjoint` pins the partition (a regression
-/// output tests cannot catch — the test explains why).
+/// Solo domain (the width-`l` upcast pads): chunk-step windows first, then the
+/// per-prime extract windows. Bulk domain (the boolean one-hot growing hashes
+/// + the fold/body steps): the fold/body per-prime windows from
+/// [`BULK_NONCE_FLOOR`], then the chunk windows, then the per-prime extract
+/// windows above those. This struct is the single source of truth the driver
+/// draws its bases from; `test_nonce_windows_disjoint` pins the partition (a
+/// regression output tests cannot catch — the test explains why).
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct NonceLayout {
     pub chunk_solo_ids: u64,
@@ -406,7 +410,7 @@ mod nonce_layout_tests {
     /// decode correctly (both parties share the layout), so no output test
     /// can catch a regression — this test is the guard. It pins, per domain,
     /// that every reserved window is pairwise disjoint, that bulk ids
-    /// respect the `[0, 2^32)` switch-group reservation, and that everything
+    /// respect the `[0, 2^32)` reserved floor, and that everything
     /// stays below the bit-63 domain flag.
     #[test]
     fn test_nonce_windows_disjoint() {

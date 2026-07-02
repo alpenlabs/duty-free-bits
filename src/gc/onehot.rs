@@ -1,10 +1,13 @@
-//! The two "moves" the chunk and extract steps are both built from, over bare
-//! label words (Z₂ = `[u64; 2]`, width-`l` = `[u32; λ]` lanes):
+//! The shared machinery steps 1 (chunk) and 2 (extract) build on, over bare
+//! label words (Z₂ = boolean label `[u64; 2]`, width-`l` = arithmetic label
+//! `[u32; λ]` lanes):
 //!
-//! * a **one-hot doubling tree** ([`tree_garble`] on the garbler side; the
-//!   evaluator solves the one open slot per level through a join), and
-//! * **width-`l` casts** of every leaf ([`hash_cast`]) whose weighted sums
-//!   ([`peel_chain`]) give both the extracted bits and the peel upcast.
+//! * **growing a one-hot one bit at a time** ([`tree_garble`] on the garbler
+//!   side, one one-hot scaling per bit; the evaluator resolves the one open
+//!   slot per level through that scaling), and
+//! * **upcasting every leaf** ([`hash_cast`]) whose weighted sums
+//!   ([`peel_chain`]) give both the extracted bits and the root scaling that
+//!   delivers the active leaf's upcast value.
 //!
 //! The garbler hashes EVERY slot (x-blind); the evaluator, knowing `x`, hashes
 //! only closed slots. Lane loops run unmasked mod 2^32 (truncation to Z_{2^l}
@@ -17,10 +20,10 @@ use crate::hash;
 use crate::label::{LAMBDA, Label};
 
 
-/// Packed words of a CF Z₂ label (the bare-word working type).
+/// Packed words of a boolean label (the bare-word working type).
 pub(crate) type Z2 = [u64; 2];
 
-/// One coordinate per u32 lane of a width-`l` CF label (2 ≤ l ≤ 32).
+/// One coordinate per u32 lane of a width-`l` arithmetic label (2 ≤ l ≤ 32).
 pub(crate) type Wide = [u32; LAMBDA];
 
 #[inline]
@@ -50,8 +53,9 @@ pub(crate) fn wide_label(w: &Wide, modulus: u64) -> Label {
 ///
 /// The lane ops run UNMASKED: wrapping u32 arithmetic is a ring homomorphism
 /// onto Z_{2^l} under truncation, so the `& (2^l − 1)` is applied only at the
-/// boundaries that make a wire canonical ([`wide_label`], the pin emission, and
-/// the Z₂ packing of bits below the preserved width) — not on every op.
+/// boundaries that make a wire canonical ([`wide_label`], the active-leaf
+/// upcast emission, and the Z₂ packing of bits below the preserved width) —
+/// not on every op.
 #[inline]
 pub(crate) fn wide_add(dst: &mut Wide, src: &Wide) {
     for (d, s) in dst.iter_mut().zip(src) {
@@ -78,7 +82,7 @@ pub(crate) fn wide_madd(dst: &mut Wide, c: u32, src: &Wide) {
     }
 }
 
-/// Pack bit `bit` of every lane into a Z₂ label's words.
+/// Pack bit `bit` of every lane into a boolean label's words.
 #[inline]
 pub(crate) fn pack_lane_bit(lanes: &Wide, bit: u32) -> Z2 {
     let mut out = [0u64; 2];
@@ -92,9 +96,9 @@ pub(crate) fn pack_lane_bit(lanes: &Wide, bit: u32) -> Z2 {
     out
 }
 
-/// CCRH pad of one width-`l` cast switch, unpacked to lanes: the CF Z_{2^l}
-/// analogue of [`hash::hash_z2`] for wider payloads on bare words. `nonce` is
-/// a solo-domain id (bit 63 clear), globally fresh.
+/// CCRH pad of one width-`l` upcast scaling, unpacked to lanes: the
+/// arithmetic-label Z_{2^l} analogue of [`hash::hash_z2`] for wider payloads on
+/// bare words. `nonce` is a solo-domain id (bit 63 clear), globally fresh.
 pub(crate) fn hash_cast(ctrl: &Z2, nonce: u64, l: u32, out: &mut Wide) {
     debug_assert!(nonce < (1u64 << 63), "solo nonce uses the bulk-domain bit");
     debug_assert!((2..=32).contains(&l));
@@ -189,7 +193,7 @@ fn unpack_even_k_neon(scratch: &[u8], k: usize, dst: &mut Wide) {
     }
 }
 
-/// `bit i` of `sub − res` as a Z₂ label: the peel step
+/// `bit i` of `sub − res` as a boolean label: the free-recombination step
 /// `mod2k(div2k(sub − mod2k(res, k), i), 1)` on lanes. `sub` is width-k
 /// lanes, `res` width-l lanes (l ≥ k).
 #[inline]
@@ -211,7 +215,7 @@ pub(crate) fn peel_bit(sub: &Wide, res: &Wide, i: u32, k: u32) -> Z2 {
     out
 }
 
-/// One tree-plus-casts stage: `n_bits` one-hot bits, casts at width `l`.
+/// One grow-plus-upcast stage: `n_bits` one-hot bits, upcasts at width `l`.
 pub(crate) fn stage_cost(n_bits: u32, l: u32) -> Cost {
     let n = 1usize << n_bits;
     Cost {
@@ -221,19 +225,20 @@ pub(crate) fn stage_cost(n_bits: u32, l: u32) -> Cost {
     }
 }
 
-/// Bulk-domain ids one tree consumes (the garbler hashes every slot of levels
-/// 1..k−1; the evaluator indexes the same window by slot position).
+/// Bulk-domain ids growing one one-hot consumes (the garbler hashes every slot
+/// of levels 1..k−1; the evaluator indexes the same window by slot position).
 #[inline]
 pub(crate) fn tree_ids(k: u32) -> u64 {
     (1u64 << k) - 2
 }
 
-/// Garbler side of one doubling tree: level-major, hashes EVERY slot.
-/// Returns (leaf masks, per-level y-XOR sums `⊕_j y_m[j]` for levels 1..k−1).
+/// Garbler side of growing one one-hot one bit at a time: level-major, hashes
+/// EVERY slot. Returns (leaf masks, per-level y-XOR sums `⊕_j y_m[j]` for
+/// levels 1..k−1).
 ///
 /// `lvl1` is the level-1 pair `[X_{b0} ⊕ Δ₂, X_{b0}]` (the affine base
-/// one-hot). Tree ids are `bulk_base + (2^m − 2) + j` for slot `j` of level
-/// `m` — position-indexed so the evaluator lands on the same pads.
+/// one-hot). The scaling ids are `bulk_base + (2^m − 2) + j` for slot `j` of
+/// level `m` — position-indexed so the evaluator lands on the same pads.
 pub(crate) fn tree_garble(k: u32, lvl1: [Z2; 2], bulk_base: u64) -> (Vec<Z2>, Vec<Z2>) {
     let mut lvl: Vec<Z2> = lvl1.to_vec();
     let mut ysums: Vec<Z2> = Vec::with_capacity(k as usize - 1);
@@ -255,11 +260,11 @@ pub(crate) fn tree_garble(k: u32, lvl1: [Z2; 2], bulk_base: u64) -> (Vec<Z2>, Ve
     (lvl, ysums)
 }
 
-/// Width-`l` residue bank over a full cast array (garbler side, which holds
-/// every cast): halving class sums with the incremental weighted chain
-/// `res_{j+1} = res_j + 2^j·H_j`. Returns `(res_1..=res_k, root)`; `res_k` is
-/// the upcast functional `Σ p·casts[p]`, `root = Σ_p casts[p]`. Consumes the
-/// casts (halved in place).
+/// Width-`l` residue bank over a full array of upcast leaves (garbler side,
+/// which holds every upcast): halving class sums with the incremental weighted
+/// chain `res_{j+1} = res_j + 2^j·H_j`. Returns `(res_1..=res_k, root)`;
+/// `res_k` is the upcast functional `Σ p·upcasts[p]`, `root = Σ_p upcasts[p]`.
+/// Consumes the upcasts (halved in place).
 pub(crate) fn peel_chain(mut acc: Vec<Wide>) -> (Vec<Wide>, Wide) {
     let k = acc.len().trailing_zeros();
     let mut chain: Vec<Wide> = Vec::with_capacity(k as usize);
@@ -297,7 +302,7 @@ mod tests {
     use rand::Rng;
 
     /// The NEON even-k unpacker must agree with the scalar window loop on
-    /// every width it claims (the cast pads flow through this).
+    /// every width it claims (the upcast pads flow through this).
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn test_unpack_even_k_neon_matches_generic() {

@@ -1,13 +1,15 @@
-//! Switch-free garbling of `a·x + b` via bit-decomposition — a standalone,
-//! runtime-optimized baseline for benchmarking against the CRT/switch path.
+//! Garbling of `a·x + b` via bit-decomposition, using no one-hot scaling — a
+//! standalone, runtime-optimized baseline for benchmarking against the CRT
+//! one-hot-scaling path.
 //!
-//! This module deliberately does **not** use the switch system, the CRT, or any
+//! This module deliberately does **not** use one-hot scaling, the CRT, or any
 //! of the engines in [`crate::gc`] / [`crate::gc::body`]. It implements the
 //! naive bit-decomposition construction (the [EL26]/BABE-style projectivization
 //! that the CRT path in [`crate::affine`] replaces) so the two can be compared
 //! on the same `a·x+b` workload: the bit-decomposition path pays far more
 //! *communication* (`Θ(S·n²)`) but is almost pure CCRH, so its *runtime* is the
-//! baseline against which the switch system's extra computation is measured.
+//! baseline against which the one-hot-scaling pipeline's extra computation is
+//! measured.
 //!
 //! # Field operations in the workload
 //!
@@ -642,7 +644,7 @@ mod tests {
         );
     }
 
-    // ---- Measured hash count vs the CRT/switch s-aff path ----
+    // ---- Measured hash count vs the CRT one-hot-scaling s-aff path ----
 
     /// Measures the real garble/eval hash calls at the s-aff workload (S=1536)
     /// and asserts they equal the `4nS / 2nS` closed form.
@@ -670,7 +672,7 @@ mod tests {
 
     /// Measures wall-clock garble/eval runtime at the s-aff workload, the raw
     /// CCRH floor, and overhead above it. Single-threaded, to compare against
-    /// the switch-system s-aff pipeline. Run with:
+    /// the one-hot-scaling s-aff pipeline. Run with:
     /// `cargo test -r bitdecomp::tests::bench_runtime -- --ignored --nocapture`
     #[test]
     #[ignore]

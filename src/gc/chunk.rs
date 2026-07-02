@@ -1,12 +1,14 @@
-//! Step 1 / 4 (computational GC): pack `lg n` input bits into a ring word
-//! `w_c ∈ Z_{2^ℓ}` — the straight-line `bin_to_word`.
+//! Step 1 / 4 (computational GC): pack `lg n` boolean input labels into an
+//! arithmetic label for a ring word `w_c ∈ Z_{2^ℓ}` — the straight-line
+//! `bin_to_word`.
 //!
-//! Inputs: one chunk's input-bit labels (`lg n` of them). Output: the chunk
-//! word `w_c` (its garbled label), which the extract step (`super::extract`)
-//! accumulates into `r_i` per prime. Built on the shared one-hot tree + casts
-//! (the crate-internal onehot machinery): a one-hot over the chunk's bits,
-//! width-ℓ casts of the leaves, and `word = Σ_p p·A_p`. The pin join lets the
-//! evaluator recover the one one-hot cast it cannot derive.
+//! Inputs: one chunk's input-bit boolean labels (`lg n` of them). Output: the
+//! chunk word `w_c` (its arithmetic label), which the extract step
+//! (`super::extract`) free-recombines into `r_i` per prime. Built on the shared
+//! onehot machinery (crate-internal): grow a one-hot over the chunk's bits (one
+//! scaling per bit), upcast the leaves to width ℓ, and free-recombine
+//! `word = Σ_p p·A_p`. The root scaling lets the evaluator recover the one leaf
+//! upcast it cannot derive locally.
 
 use super::Cost;
 use super::onehot::*;
@@ -22,19 +24,21 @@ pub fn chunk_nonces(n_bits: u32) -> (u64, u64) {
 /// Garbler-side output of one chunk-conversion step.
 #[derive(Debug)]
 pub struct ChunkGarbleOutput {
-    /// Mask of the chunk word (CF Z_{2^ell}).
+    /// Garbler's mask of the chunk word (arithmetic label over Z_{2^ell}).
     pub word_mask: Label,
-    /// Scale-join diff per tree level (lg n − 1 of them, Z₂).
+    /// The per-bit scalings: one Z₂ residue per tree level, each growing the
+    /// one-hot by one bit (lg n − 1 of them).
     pub scale: Vec<Z2>,
-    /// Pin-join diff (width ell).
+    /// The root scaling: the width-ell residue delivering the active leaf's
+    /// upcast (via the root sum).
     pub pin: Wide,
     /// Ledger footprint.
     pub cost: Cost,
 }
 
-/// Garbler side: pack `bits` (CF Z₂ masks, LSB-first) into a Z_{2^ell}
-/// word — the straight-line `bin_to_word` (one-hot tree over the input bits,
-/// width-ell casts, `Σ p·A_p`).
+/// Garbler side: pack `bit_masks` (boolean-label masks, LSB-first) into a
+/// Z_{2^ell} arithmetic label — the straight-line `bin_to_word` (grow a one-hot
+/// over the input bits, upcast the leaves to width ell, `Σ p·A_p`).
 pub fn chunk_batch_garble(
     bit_masks: &[Label],
     ell: u32,
@@ -65,9 +69,9 @@ pub fn chunk_batch_garble(
     let (chain, root) = peel_chain(casts);
     let word_mask = chain[nb as usize - 1]; // Σ p·A_p
 
-    // Scale diffs (y_m ⊕ X_{bit_m}) let the evaluator solve each level's open
-    // slot; the pin diff (root + Δ_ℓ = X_root − X_one, X_one = −Δ_ℓ) solves the
-    // one open root cast.
+    // Per-bit scaling residues (y_m ⊕ X_{bit_m}) let the evaluator open each
+    // level's active slot; the root scaling residue (root + Δ_ℓ = X_root − X_one,
+    // X_one = −Δ_ℓ) delivers the one active leaf upcast it cannot derive.
     let scale: Vec<Z2> = ysums
         .iter()
         .zip(bit_masks.iter().skip(1))
@@ -108,9 +112,10 @@ pub fn chunk_batch_eval(
         "chunk step requires nb <= ell and 2 <= ell <= 31 (got nb={nb}, ell={ell})"
     );
 
-    // Tree: expand every level; the hot slot solves through the scale join.
-    // (This is the one-hot solve in its simplest form; the extract step's
-    // `expand_and_fold_class` is the same move generalized to width-`l` casts.)
+    // Grow the one-hot one bit per level; the active slot opens through that
+    // bit's scaling. (This is the one-hot solve in its simplest form; the
+    // extract step's `expand_and_fold_class` is the same move generalized to
+    // width-`l` upcasts.)
     let b0 = z2_of(&bit_labels[0]);
     let mut lvl: Vec<Z2> = vec![b0, b0];
     for m in 1..nb {
@@ -137,8 +142,9 @@ pub fn chunk_batch_eval(
         lvl = next;
     }
 
-    // Casts of the non-hot leaves; the hot cast solves through the pin join,
-    // and the word label is Σ p·A_p with the hot term substituted.
+    // Upcast the non-active leaves; the active leaf's upcast opens through the
+    // root scaling, and the word label is Σ p·A_p with the active term
+    // substituted.
     let hot = (value & ((1u64 << nb) - 1)) as usize;
     let mut word = [0u32; LAMBDA];
     let mut t_sum = [0u32; LAMBDA];
@@ -151,7 +157,7 @@ pub fn chunk_batch_eval(
         wide_madd(&mut word, slot as u32, &cast);
         wide_add(&mut t_sum, &cast);
     }
-    let mut hot_cast = *g_pin; // L_root = pin diff (constant-1 label is 0)
+    let mut hot_cast = *g_pin; // L_root = root scaling residue (constant-1 label is 0)
     wide_sub(&mut hot_cast, &t_sum);
     wide_madd(&mut word, hot as u32, &hot_cast);
 
