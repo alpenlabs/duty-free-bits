@@ -164,16 +164,16 @@ pub fn extract_batch_garble(
         // Width-l casts of every leaf.
         let n = 1usize << k;
         let mut casts = vec![[0u32; LAMBDA]; n];
-        for (pp, cast) in casts.iter_mut().enumerate() {
-            hash_cast(&leaves[pp], p.solo_base + pp as u64, l, cast);
+        for (leaf, cast) in casts.iter_mut().enumerate() {
+            hash_cast(&leaves[leaf], p.solo_base + leaf as u64, l, cast);
         }
 
         // Residue bank + root; bits i = 1..k−1 peel from res_i.
-        let (res_chain, root) = residues_all(casts);
+        let (chain, root) = peel_chain(casts);
         let mut bit_masks: Vec<Z2> = Vec::with_capacity(k as usize);
         bit_masks.push(bit0);
         for i in 1..k {
-            bit_masks.push(peel_bit(&sub, &res_chain[i as usize - 1], i, k));
+            bit_masks.push(peel_bit(&sub, &chain[i as usize - 1], i, k));
         }
 
         // Scale diffs (⊕ y_m ⊕ X_{bit_m}) and the pin diff (root + Δ_l:
@@ -197,11 +197,11 @@ pub fn extract_batch_garble(
             fold_bit_masks.extend(bit_masks.iter().map(|&w| z2_label(w)));
         }
 
-        // Peel: rem = (rem − up) >> k; up = res_k (the level-k functional).
+        // Peel: rem = (rem − upcast) >> k; upcast = res_k (the level-k functional).
         if !p.last {
-            let up = &res_chain[k as usize - 1];
+            let upcast = &chain[k as usize - 1];
             let mut d = rem;
-            wide_sub(&mut d, up);
+            wide_sub(&mut d, upcast);
             for lane in d.iter_mut() {
                 *lane = (*lane & mask_rem) >> k;
             }
@@ -308,9 +308,9 @@ pub fn extract_batch_eval(
             let ii = i as usize - 1;
             let mut res = root;
             wide_sub(&mut res, &acc_t[ii]);
-            let mut res_full = acc_r[ii];
-            wide_madd(&mut res_full, qi as u32, &res);
-            let bit_i = peel_bit(&sub, &res_full, i, k);
+            let mut res_i = acc_r[ii];
+            wide_madd(&mut res_i, qi as u32, &res);
+            let bit_i = peel_bit(&sub, &res_i, i, k);
             bit_labels.push(bit_i);
 
             // Hot slot of level i solves through the scale join.
@@ -345,15 +345,15 @@ pub fn extract_batch_eval(
             fold_bit_labels.extend(bit_labels.iter().map(|&w| z2_label(w)));
         }
 
-        // Peel: up = R_k + s·(L_root − T_k), rem = (rem − up) >> k.
+        // Peel: upcast = R_k + s·(L_root − T_k), rem = (rem − upcast) >> k.
         if !p.last {
             let ki = k as usize - 1;
-            let mut up = acc_r[ki];
+            let mut upcast = acc_r[ki];
             let mut hot_part = root;
             wide_sub(&mut hot_part, &acc_t[ki]);
-            wide_madd(&mut up, s as u32, &hot_part);
+            wide_madd(&mut upcast, s as u32, &hot_part);
             let mut d = rem;
-            wide_sub(&mut d, &up);
+            wide_sub(&mut d, &upcast);
             for lane in d.iter_mut() {
                 *lane = (*lane & mask_rem) >> k;
             }
@@ -380,7 +380,7 @@ fn nonce_bulk_stage(p: &StagePlan, m: u32) -> u64 {
 /// `p_c mod 2^j = z + (c mod 2^{j−lz})·2^lz`, and the class's contribution to
 /// `R_j` collapses to `z·T + 2^lz·W_{j−lz}` with `T = Σ_c A_c` and
 /// `W_t = Σ_c (c mod 2^t)·A_c` — the W chain comes from the same
-/// halving-plus-H recurrence as [`residues_all`], costing O(2^{k−lz}) lane
+/// halving-plus-H recurrence as [`peel_chain`], costing O(2^{k−lz}) lane
 /// ops per class instead of O((k−lz)·2^{k−lz}) per-leaf folds.
 #[allow(clippy::too_many_arguments)]
 fn expand_and_fold_class(
@@ -410,9 +410,9 @@ fn expand_and_fold_class(
     let tmax = (k - lz) as usize;
     sums.clear();
     for c in 0..(1u64 << tmax) {
-        let pp = z + (c << lz);
+        let leaf = z + (c << lz);
         let mut cast = [0u32; LAMBDA];
-        hash_cast(&lvl[k as usize][pp as usize], p.solo_base + pp, l, &mut cast);
+        hash_cast(&lvl[k as usize][leaf as usize], p.solo_base + leaf, l, &mut cast);
         sums.push(cast);
     }
     // Halve to the class total, gathering the high-half sums H_t.
@@ -622,10 +622,10 @@ mod micro {
                 for i in 0..stage_k {
                     let lz = i + 1;
                     for c in 0..(1u64 << (stage_k - lz)) {
-                        let pp = c << lz;
+                        let leaf = c << lz;
                         for j in lz..=stage_k {
                             let ji = j as usize - 1;
-                            wide_madd(&mut acc_r[ji], (pp & ((1u64 << j) - 1)) as u32, &cast);
+                            wide_madd(&mut acc_r[ji], (leaf & ((1u64 << j) - 1)) as u32, &cast);
                             wide_add(&mut acc_t[ji], &cast);
                         }
                     }
@@ -635,12 +635,12 @@ mod micro {
         }
         let fold_secs = t.elapsed().as_secs_f64();
 
-        // 4. Garbler residues_all on 256 casts (includes the to_vec copy).
+        // 4. Garbler peel_chain on 256 casts (includes the to_vec copy).
         let casts = vec![[5u32; LAMBDA]; 256];
         let t = Instant::now();
         for _ in 0..reps {
             for _ in 0..3 {
-                std::hint::black_box(residues_all(casts.clone()));
+                std::hint::black_box(peel_chain(casts.clone()));
             }
         }
         let resid_secs = t.elapsed().as_secs_f64();

@@ -59,31 +59,31 @@ pub struct BodyBatchGarbleOutput {
 ///
 /// `h_p_masks` are the carry-in CF Z_2 masks for the length-`p_i` one-hot;
 /// `a_batch` / `b_batch` are the affine coefficients reduced mod `p_i`;
-/// `truth_table[i] = i mod p_i` is the weight `g`. `group_id_base` offsets
+/// `weights[i] = i mod p_i` is the weight `g`. `group_id_base` offsets
 /// the per-slot CCRH tweak.
 pub fn body_batch_garble(
     p_i: u64,
     h_p_masks: &[Label],
     a_batch: &[u64],
     b_batch: &[u64],
-    truth_table: &[u64],
+    weights: &[u64],
     group_id_base: usize,
 ) -> BodyBatchGarbleOutput {
     let p = p_i as usize;
     let b = a_batch.len();
     assert_eq!(h_p_masks.len(), p, "h_p_masks length mismatch");
     assert_eq!(b_batch.len(), b, "a_batch and b_batch length mismatch");
-    assert_eq!(truth_table.len(), p, "truth_table length mismatch");
+    assert_eq!(weights.len(), p, "weights length mismatch");
 
     // pad_i = H(h_p[i]) for each one-hot slot, bulk-packed across the b members.
-    let slot_hash = switch_hashes(h_p_masks, group_id_base, b, p_i);
+    let slot_hash = slot_pads(h_p_masks, group_id_base, b, p_i);
 
     // Σ pad_i and Σ g_i·pad_i per member, delayed reduction (see accumulate_pads).
     let mut pad_sum_raw = vec![0u64; b]; // Σ_i pad_i (unreduced)
     let mut readout_raw = vec![0u64; b]; // Σ_i g_i·pad_i (unreduced)
     accumulate_pads(
         &slot_hash,
-        truth_table,
+        weights,
         None,
         p_i,
         &mut pad_sum_raw,
@@ -127,27 +127,27 @@ pub fn body_batch_eval(
     h_p_labels: &[Label],
     join_diffs: &[u64],
     b_batch: &[u64],
-    truth_table: &[u64],
+    weights: &[u64],
     group_id_base: usize,
 ) -> Vec<u64> {
     let p = p_i as usize;
     let b = join_diffs.len();
     assert_eq!(h_p_labels.len(), p, "h_p_labels length mismatch");
     assert_eq!(b_batch.len(), b, "b_batch length mismatch");
-    assert_eq!(truth_table.len(), p, "truth_table length mismatch");
+    assert_eq!(weights.len(), p, "weights length mismatch");
     assert!(hot < p, "hot index out of range");
 
     // Same pads the garbler formed. At a non-hot slot the one-hot bit is 0, so
     // label == mask and the evaluator recomputes pad_i exactly; only pad_hot differs.
-    let slot_hash = switch_hashes(h_p_labels, group_id_base, b, p_i);
-    let g_hot = truth_table[hot] % p_i;
+    let slot_hash = slot_pads(h_p_labels, group_id_base, b, p_i);
+    let g_hot = weights[hot] % p_i;
 
     // Σ pads over every slot but `hot`, delayed reduction (see accumulate_pads).
     let mut pad_sum_raw = vec![0u64; b]; // Σ_{i≠hot} pad_i  (every pad we can recompute)
     let mut readout_raw = vec![0u64; b]; // Σ_{i≠hot} g(i)·pad_i
     accumulate_pads(
         &slot_hash,
-        truth_table,
+        weights,
         Some(hot),
         p_i,
         &mut pad_sum_raw,
@@ -229,7 +229,7 @@ struct HashSlab {
 /// holds `b·lg|p_i|` pseudorandom bits, one `lg|p_i|`-bit pad per batch member.
 /// Garbler and evaluator call this identically (on masks / labels); at every
 /// non-hot slot the two agree, which is what lets `pad_i` line up.
-fn switch_hashes(ohe: &[Label], group_id_base: usize, b: usize, p_i: u64) -> HashSlab {
+fn slot_pads(ohe: &[Label], group_id_base: usize, b: usize, p_i: u64) -> HashSlab {
     let w = pad_bits(p_i);
     let total_bits = b * w;
     let exact_len = total_bits.div_ceil(8);
@@ -265,7 +265,7 @@ fn switch_hashes(ohe: &[Label], group_id_base: usize, b: usize, p_i: u64) -> Has
 /// summation order is immaterial.
 fn accumulate_pads(
     slab: &HashSlab,
-    truth_table: &[u64],
+    weights: &[u64],
     skip: Option<usize>,
     p_i: u64,
     pad_sum_raw: &mut [u64],
@@ -285,11 +285,11 @@ fn accumulate_pads(
         // one u64 load. p ≥ 2 keeps the slab's exact region non-empty.
         let p128 = p_i as u128;
         if p_i >= 2 && p128 * p128 * (1u128 << w) < (1u128 << 32) {
-            accumulate_pads_neon(slab, truth_table, skip, p_i, pad_sum_raw, readout_raw);
+            accumulate_pads_neon(slab, weights, skip, p_i, pad_sum_raw, readout_raw);
             return;
         }
     }
-    accumulate_pads_scalar(slab, truth_table, skip, p_i, 0, pad_sum_raw, readout_raw);
+    accumulate_pads_scalar(slab, weights, skip, p_i, 0, pad_sum_raw, readout_raw);
 }
 
 /// Portable pad accumulation: slot-major walk, one [`extract_pad`] per
@@ -297,7 +297,7 @@ fn accumulate_pads(
 /// for the ragged tail after its 4-member groups.
 fn accumulate_pads_scalar(
     slab: &HashSlab,
-    truth_table: &[u64],
+    weights: &[u64],
     skip: Option<usize>,
     p_i: u64,
     j_lo: usize,
@@ -305,7 +305,7 @@ fn accumulate_pads_scalar(
     readout_raw: &mut [u64],
 ) {
     let w = pad_bits(p_i);
-    for (i, &t) in truth_table.iter().enumerate() {
+    for (i, &t) in weights.iter().enumerate() {
         if Some(i) == skip {
             continue;
         }
@@ -343,7 +343,7 @@ fn accumulate_pads_scalar(
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 fn accumulate_pads_neon(
     slab: &HashSlab,
-    truth_table: &[u64],
+    weights: &[u64],
     skip: Option<usize>,
     p_i: u64,
     pad_sum_raw: &mut [u64],
@@ -354,9 +354,9 @@ fn accumulate_pads_neon(
     let b = pad_sum_raw.len();
     let w = pad_bits(p_i);
     debug_assert!((4..=12).contains(&w), "NEON gate admits 2 ≤ p ≤ 1023");
-    // Per-slot weights g = truth_table[i] mod p, hoisted out of the
+    // Per-slot weights g = weights[i] mod p, hoisted out of the
     // member-major walk (g < p ≤ 1023 fits u32 by the gate).
-    let weights: Vec<u32> = truth_table.iter().map(|&t| (t % p_i) as u32).collect();
+    let weights32: Vec<u32> = weights.iter().map(|&t| (t % p_i) as u32).collect();
     let full = b & !3; // members [0, full) in groups of 4; tail goes scalar.
 
     // SAFETY: NEON intrinsics — the cfg above pins target_arch + feature. The
@@ -410,7 +410,7 @@ fn accumulate_pads_neon(
             let mut ro_a = vdupq_n_u32(0);
             let mut ps_b = vdupq_n_u32(0);
             let mut ro_b = vdupq_n_u32(0);
-            for (i, &g) in weights.iter().enumerate() {
+            for (i, &g) in weights32.iter().enumerate() {
                 if Some(i) == skip {
                     continue;
                 }
@@ -432,7 +432,7 @@ fn accumulate_pads_neon(
             let (off_a, sh01_a, sh23_a) = group_consts(j0);
             let mut ps = vdupq_n_u32(0);
             let mut ro = vdupq_n_u32(0);
-            for (i, &g) in weights.iter().enumerate() {
+            for (i, &g) in weights32.iter().enumerate() {
                 if Some(i) == skip {
                     continue;
                 }
@@ -447,7 +447,7 @@ fn accumulate_pads_neon(
     }
     // Ragged tail (b mod 4 members): scalar kernel, identical pads.
     if full < b {
-        accumulate_pads_scalar(slab, truth_table, skip, p_i, full, pad_sum_raw, readout_raw);
+        accumulate_pads_scalar(slab, weights, skip, p_i, full, pad_sum_raw, readout_raw);
     }
 }
 
@@ -589,7 +589,7 @@ mod tests {
                 // Garbler: full kernel (auto dispatch) vs the forced-scalar
                 // reference rebuilt from the same deterministic slab.
                 let g_out = body_batch_garble(p_i, &h_p_masks, &a_batch, &b_batch, &truth, gid);
-                let slab = switch_hashes(&h_p_masks, gid, b, p_i);
+                let slab = slot_pads(&h_p_masks, gid, b, p_i);
                 let (mut ps_auto, mut ro_auto) = (vec![0u64; b], vec![0u64; b]);
                 accumulate_pads(&slab, &truth, None, p_i, &mut ps_auto, &mut ro_auto);
                 let (mut ps_ref, mut ro_ref) = (vec![0u64; b], vec![0u64; b]);
@@ -631,7 +631,7 @@ mod tests {
                         &truth,
                         gid,
                     );
-                    let slab_l = switch_hashes(&h_p_labels, gid, b, p_i);
+                    let slab_l = slot_pads(&h_p_labels, gid, b, p_i);
                     let (mut ps_e, mut ro_e) = (vec![0u64; b], vec![0u64; b]);
                     accumulate_pads_scalar(
                         &slab_l,

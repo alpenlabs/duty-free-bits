@@ -139,17 +139,17 @@ pub fn build_s_aff<R: rand::Rng>(
     let mut stats = Stats::default();
 
     // ---- Nonce windows (paper App. A, Def. 4) ----
-    let nw = NonceLayout::new(params, s_dim, &sub_widths);
-    let chunk_solo_ids = nw.chunk_solo_ids;
-    let chunk_bulk_ids = nw.chunk_bulk_ids;
-    let ex_solo_ids = nw.ex_solo_ids;
-    let ex_bulk_ids = nw.ex_bulk_ids;
-    let solo_chunk_base = nw.solo_chunk_base;
-    let solo_extract_base = nw.solo_extract_base;
-    let num_batches = nw.num_batches;
-    let prime_nonce_bases = nw.prime_nonce_bases.clone();
-    let bulk_chunk_base = nw.bulk_chunk_base;
-    let bulk_extract_base = nw.bulk_extract_base;
+    let nonce_layout = NonceLayout::new(params, s_dim, &sub_widths);
+    let chunk_solo_ids = nonce_layout.chunk_solo_ids;
+    let chunk_bulk_ids = nonce_layout.chunk_bulk_ids;
+    let ex_solo_ids = nonce_layout.ex_solo_ids;
+    let ex_bulk_ids = nonce_layout.ex_bulk_ids;
+    let solo_chunk_base = nonce_layout.solo_chunk_base;
+    let solo_extract_base = nonce_layout.solo_extract_base;
+    let num_batches = nonce_layout.num_batches;
+    let prime_nonce_bases = nonce_layout.prime_nonce_bases.clone();
+    let bulk_chunk_base = nonce_layout.bulk_chunk_base;
+    let bulk_extract_base = nonce_layout.bulk_extract_base;
 
     // ---- Input bits: masks sampled, labels = mask + bit·Δ₂. ----
     let bit_masks: Vec<Label> = (0..n).map(|_| sample_cf_mask(rng, 2)).collect();
@@ -238,7 +238,7 @@ pub fn build_s_aff<R: rand::Rng>(
 
         let eb0 = crate::crypto::hash_blocks();
         let t = std::time::Instant::now();
-        let (fbh_labels, fold_bit_labels) = extract_batch_eval(
+        let (first_bin_hot_labels, fold_bit_labels) = extract_batch_eval(
             &chunk_word_labels,
             &coeffs,
             r_value,
@@ -273,7 +273,7 @@ pub fn build_s_aff<R: rand::Rng>(
         let h_p_labels = fold_batch_eval(
             p_i,
             r_value,
-            &fbh_labels,
+            &first_bin_hot_labels,
             &fold_bit_labels,
             &fold_g.join_diffs,
             first_width,
@@ -287,7 +287,7 @@ pub fn build_s_aff<R: rand::Rng>(
         let h_p_masks = fold_g.h_p_masks;
 
         // ---- Body batches. ----
-        let identity_table: Vec<u64> = (0..p_i).collect();
+        let weights: Vec<u64> = (0..p_i).collect();
         let mut prime_outputs: Vec<u64> = Vec::with_capacity(s_dim);
         let mut start = 0usize;
         while start < s_dim {
@@ -304,7 +304,7 @@ pub fn build_s_aff<R: rand::Rng>(
                 &h_p_masks,
                 &a_batch,
                 &b_batch,
-                &identity_table,
+                &weights,
                 nonce_base,
             );
             stats.body_garble_secs += t.elapsed().as_secs_f64();
@@ -318,7 +318,7 @@ pub fn build_s_aff<R: rand::Rng>(
                 &h_p_labels,
                 &g_out.join_diffs,
                 &b_batch,
-                &identity_table,
+                &weights,
                 nonce_base,
             );
             stats.body_eval_secs += t.elapsed().as_secs_f64();
@@ -459,9 +459,9 @@ mod nonce_layout_tests {
             if sub_widths.iter().any(|&w| w < 2) {
                 continue; // width-1 shapes are rejected
             }
-            let nw = NonceLayout::new(&params, s_dim, &sub_widths);
+            let nonce_layout = NonceLayout::new(&params, s_dim, &sub_widths);
             for bulk in [false, true] {
-                let mut ws: Vec<(u64, u64)> = nw
+                let mut ws: Vec<(u64, u64)> = nonce_layout
                     .windows()
                     .iter()
                     .filter(|w| w.0 == bulk && w.2 > 0)

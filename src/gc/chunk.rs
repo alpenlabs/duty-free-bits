@@ -57,11 +57,11 @@ pub fn chunk_batch_garble(
 
     let n = 1usize << nb;
     let mut casts = vec![[0u32; LAMBDA]; n];
-    for (pp, cast) in casts.iter_mut().enumerate() {
-        hash_cast(&leaves[pp], nonce_solo + pp as u64, ell, cast);
+    for (leaf, cast) in casts.iter_mut().enumerate() {
+        hash_cast(&leaves[leaf], nonce_solo + leaf as u64, ell, cast);
     }
-    let (res_chain, root) = residues_all(casts);
-    let word_mask = res_chain[nb as usize - 1]; // Σ p·A_p
+    let (chain, root) = peel_chain(casts);
+    let word_mask = chain[nb as usize - 1]; // Σ p·A_p
 
     let scale: Vec<Z2> = ysums
         .iter()
@@ -136,12 +136,12 @@ pub fn chunk_batch_eval(
     let mut word = [0u32; LAMBDA];
     let mut t_sum = [0u32; LAMBDA];
     let mut cast = [0u32; LAMBDA];
-    for (pp, leaf) in lvl.iter().enumerate() {
-        if pp == hot {
+    for (slot, leaf) in lvl.iter().enumerate() {
+        if slot == hot {
             continue;
         }
-        hash_cast(leaf, nonce_solo + pp as u64, ell, &mut cast);
-        wide_madd(&mut word, pp as u32, &cast);
+        hash_cast(leaf, nonce_solo + slot as u64, ell, &mut cast);
+        wide_madd(&mut word, slot as u32, &cast);
         wide_add(&mut t_sum, &cast);
     }
     let mut hot_cast = *g_pin; // L_root = pin diff (constant-1 label is 0)

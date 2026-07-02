@@ -4,7 +4,7 @@
 //! * a **one-hot doubling tree** ([`tree_garble`] on the garbler side; the
 //!   evaluator solves the one open slot per level through a join), and
 //! * **width-`l` casts** of every leaf ([`hash_cast`]) whose weighted sums
-//!   ([`residues_all`]) give both the extracted bits and the peel upcast.
+//!   ([`peel_chain`]) give both the extracted bits and the peel upcast.
 //!
 //! The garbler hashes EVERY slot (x-blind); the evaluator, knowing `x`, hashes
 //! only closed slots. Lane loops run unmasked mod 2^32 (truncation to Z_{2^l}
@@ -281,7 +281,7 @@ pub(crate) fn tree_garble(k: u32, lvl1: [Z2; 2], bulk_base: u64) -> (Vec<Z2>, Ve
 /// `res_{j+1} = res_j + 2^j·H_j`. Returns `(res_1..=res_k, root)`; `res_k` is
 /// the upcast functional `Σ p·casts[p]`, `root = Σ_p casts[p]`. Consumes the
 /// casts (halved in place).
-pub(crate) fn residues_all(mut acc: Vec<Wide>) -> (Vec<Wide>, Wide) {
+pub(crate) fn peel_chain(mut acc: Vec<Wide>) -> (Vec<Wide>, Wide) {
     let k = acc.len().trailing_zeros();
     let mut res_chain: Vec<Wide> = Vec::with_capacity(k as usize);
     // H_j for j = k−1 down to 1, gathered during halving.
