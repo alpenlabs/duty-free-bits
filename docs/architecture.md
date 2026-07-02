@@ -165,8 +165,8 @@ split: in-System switch-group ids own `[0, 2^32)`, the kernels draw above
 ## 6. Performance
 
 On an Apple M1 P-core (single-threaded, `cargo test --release`), the reference
-workload streams in **~0.07–0.08 s**: ≈25–30 ms garbler + ≈45 ms evaluator,
-**~1.20 G instructions / ~0.24 G cycles**. The full `x + y` application is two
+workload streams in **~0.057–0.06 s**: ≈21 ms garbler + ≈31 ms evaluator,
+**~1.03 G instructions / ~0.23 G cycles**. The full `x + y` application is two
 such runs.
 
 > Measure with hardware counters, not wall time — the M1 throttles under
@@ -174,6 +174,9 @@ such runs.
 > `N=256 S=1536 /usr/bin/time -l <test-binary> test_s_aff_scaling --ignored`.
 
 ### Where the time goes (per party)
+
+Shares profiled before the fused `word_to_bin_up` extract landed (which cut
+extract hashes ~29 % and total gates ~21 %), so treat them as approximate:
 
 | component | share | note |
 | --- | --- | --- |
@@ -190,10 +193,14 @@ About **56 % of the cycles are irreducible protocol arithmetic** — hashing, th
 IT-GC multiply-accumulates, the λ-lane ring ops, and pad unpacking. A
 hash-only floor estimate undercounts the real compute by ~2–3×, because the
 body alone does one MAC per (slot, member) pair (~20 M per party) that the hash
-count never sees. The only structurally-addressable remainder is the fused
-evaluator's value-discovery (replacing the fixpoint with straight-line code
-would require hand-deriving `word_to_hot`'s circular bootstrap per shape);
-everything else needs protocol changes or cross-prime parallelism.
+count never sees. The hand-derived straight-line form of `word_to_hot`'s
+circular bootstrap now exists as `word_to_bin_up` (its width-`l` casts serve
+as bit-extraction accumulators *and* the peel upcast, fusing out the
+arithmetic-one-hot layer); the extract System still resolves it through the
+worklist, so the remaining structurally-addressable item is running that
+schedule as a straight-line kernel (the `fold.rs` pattern) to eliminate the
+fused evaluator's value-discovery fixpoint. Everything else needs protocol
+changes or cross-prime parallelism.
 
 ---
 
@@ -205,8 +212,9 @@ fast paths). The fast paths are pinned two ways:
 * **Differential** — `test_arena_matches_label_path` (in `comp_gc::arena`)
   asserts the compiled garbler and the fused evaluator agree bit-for-bit with
   the worklist garbler and the journal evaluator on the real header circuit
-  (the circular `word_to_hot`, `Mul(0)` seeding, switches, joins, Z₂ and lane
-  wires) across primes, inputs, and deltas. The NEON kernels have their own
+  (the fused `word_to_bin_up` with its circular class-tree bootstrap, `Mul(0)`
+  seeding, switches, joins, Z₂ and lane wires) across primes, inputs, and
+  deltas. The NEON kernels have their own
   scalar-vs-SIMD differentials (`test_body_batch_simd_matches_scalar_*`,
   `test_unpack_even_k_neon_matches_generic`), and the CCRH has golden vectors
   plus a portable-vs-NEON equality test.
@@ -217,7 +225,9 @@ fast paths). The fast paths are pinned two ways:
   edge parameter regimes.
 * **Cost parity** — `test_fold_kernel_cost_matches_system_fold` pins the fold
   kernel's communication + hash ledger to `System::cost` of the equivalent
-  circuit.
+  circuit; `test_word_to_bin_up_cost` and `test_sub_chunk_extract_cost` pin
+  the extract circuit to its closed-form ledger
+  (`(2^k − 2) + l·2^k` hashes, `k + l − 1` join bits per sub-chunk).
 
 Ignored (manual) benchmarks: `bench_stream_loop`, `bench_primitives`,
 `bench_header_decomposition`, and the CCRH `bench_ccrnd_single_vs_interleaved`.

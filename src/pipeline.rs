@@ -171,6 +171,13 @@ pub struct Pipeline {
     sys_pool: Option<System>,
     /// Pooled cleartext-value buffer for the fused evaluator.
     fused_vals: Vec<u64>,
+    /// Pooled fused-evaluator worklist, reset and reused each phase.
+    eval_worklist: crate::exec::Worklist,
+    /// CCRH blocks the garbler / evaluator emitted (only nonzero under the
+    /// `count-hashes` feature; for per-party hash accounting in benchmarks).
+    pub garble_hash_blocks: u64,
+    /// See [`garble_hash_blocks`](Pipeline::garble_hash_blocks).
+    pub eval_hash_blocks: u64,
     /// Next fresh solo-domain CCRH nonce. Each phase reserves
     /// `num_gates` ids so no two switch hashes anywhere in the pipeline share
     /// a nonce (paper App. A, Def. 4 demands globally fresh nonces).
@@ -211,6 +218,9 @@ impl Pipeline {
             eval_arena: LabelArena::default(),
             sys_pool: None,
             fused_vals: Vec::new(),
+            eval_worklist: crate::exec::Worklist::new(0, 0),
+            garble_hash_blocks: 0,
+            eval_hash_blocks: 0,
             solo_nonce_next: 0,
         }
     }
@@ -344,6 +354,7 @@ impl Pipeline {
             .iter()
             .map(|&id| self.carry(id).mask.clone())
             .collect();
+        let gb0 = crate::crypto::hash_blocks();
         let t_garble = std::time::Instant::now();
         let program = self.garble_phase(
             &sys,
@@ -355,12 +366,14 @@ impl Pipeline {
         );
         let garble_secs = t_garble.elapsed().as_secs_f64();
         self.garble_secs += garble_secs;
+        self.garble_hash_blocks += crate::crypto::hash_blocks() - gb0;
 
         // Evaluate (see the module-level "execution paths" overview).
         let input_labels: Vec<Label> = inputs
             .iter()
             .map(|&id| self.carry(id).label.clone())
             .collect();
+        let eb0 = crate::crypto::hash_blocks();
         let (exec_secs, label_eval_secs, output_labels, output_values) = self.eval_phase(
             &sys,
             shape_key,
@@ -372,6 +385,7 @@ impl Pipeline {
             nonce_base,
         );
         self.eval_secs += exec_secs + label_eval_secs;
+        self.eval_hash_blocks += crate::crypto::hash_blocks() - eb0;
 
         // Output masks live in the program in declaration order.
         let output_masks: Vec<Label> = program.output_masks().to_vec();
@@ -579,6 +593,7 @@ impl Pipeline {
                     program,
                     output_wires,
                     nonce_base,
+                    &mut self.eval_worklist,
                 );
                 (0.0, t_eval.elapsed().as_secs_f64(), labels, values)
             }

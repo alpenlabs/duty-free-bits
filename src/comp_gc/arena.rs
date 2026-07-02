@@ -134,6 +134,35 @@ pub(crate) struct LabelArena {
     scratch: Vec<u8>,
 }
 
+/// Disjoint mutable+immutable views into the lane arena, skipping the runtime
+/// distinctness check. SAFETY: every caller derives an *undefined* destination
+/// wire from *defined* operands, so `d` is always distinct from `a`/`b` (see the
+/// "destination never aliases an operand" note above); `a == b` is permitted and
+/// aliases read-only. Indices are valid slots, hence in bounds. The debug-assert
+/// re-establishes both in debug builds.
+#[inline]
+fn lanes_mut2(
+    lanes: &mut [[u32; LAMBDA]],
+    d: usize,
+    a: usize,
+) -> (&mut [u32; LAMBDA], &[u32; LAMBDA]) {
+    debug_assert!(d != a && d < lanes.len() && a < lanes.len());
+    let p = lanes.as_mut_ptr();
+    unsafe { (&mut *p.add(d), &*p.add(a)) }
+}
+
+#[inline]
+fn lanes_mut3(
+    lanes: &mut [[u32; LAMBDA]],
+    d: usize,
+    a: usize,
+    b: usize,
+) -> (&mut [u32; LAMBDA], &[u32; LAMBDA], &[u32; LAMBDA]) {
+    debug_assert!(d != a && d != b && d < lanes.len() && a < lanes.len() && b < lanes.len());
+    let p = lanes.as_mut_ptr();
+    unsafe { (&mut *p.add(d), &*p.add(a), &*p.add(b)) }
+}
+
 impl LabelArena {
     /// Grow storage (and the hash scratch) to at least the given counts.
     fn ensure(&mut self, z2_count: usize, lanes_count: usize) {
@@ -192,10 +221,7 @@ impl LabelArena {
         debug_assert!(a.k() == k && b.k() == k);
         let mask = lane_mask(k);
         if a.index() == b.index() {
-            let [d, av] = self
-                .lanes
-                .get_disjoint_mut([dst.index(), a.index()])
-                .expect("arena dst must differ from operands");
+            let (d, av) = lanes_mut2(&mut self.lanes, dst.index(), a.index());
             if sub {
                 d.fill(0); // a - a = 0
             } else {
@@ -205,10 +231,7 @@ impl LabelArena {
             }
             return;
         }
-        let [d, av, bv] = self
-            .lanes
-            .get_disjoint_mut([dst.index(), a.index(), b.index()])
-            .expect("arena dst must differ from operands");
+        let (d, av, bv) = lanes_mut3(&mut self.lanes, dst.index(), a.index(), b.index());
         if sub {
             for i in 0..LAMBDA {
                 d[i] = av[i].wrapping_sub(bv[i]) & mask;
@@ -227,10 +250,7 @@ impl LabelArena {
         let k = dst.k();
         let mask = lane_mask(k);
         let s32 = (s & mask as u64) as u32;
-        let [d, av] = self
-            .lanes
-            .get_disjoint_mut([dst.index(), a.index()])
-            .expect("arena slots must be distinct");
+        let (d, av) = lanes_mut2(&mut self.lanes, dst.index(), a.index());
         for i in 0..LAMBDA {
             d[i] = s32.wrapping_mul(av[i]) & mask;
         }
@@ -250,10 +270,7 @@ impl LabelArena {
             self.z2[dst.index()] = self.z2[a.index()];
         } else {
             debug_assert_eq!(dst.k(), a.k());
-            let [d, av] = self
-                .lanes
-                .get_disjoint_mut([dst.index(), a.index()])
-                .expect("arena slots must be distinct");
+            let (d, av) = lanes_mut2(&mut self.lanes, dst.index(), a.index());
             d.copy_from_slice(av);
         }
     }
@@ -276,10 +293,7 @@ impl LabelArena {
             self.z2[dst.index()] = out;
         } else {
             let mask = lane_mask(dst.k());
-            let [d, av] = self
-                .lanes
-                .get_disjoint_mut([dst.index(), a.index()])
-                .expect("arena slots must be distinct");
+            let (d, av) = lanes_mut2(&mut self.lanes, dst.index(), a.index());
             for i in 0..LAMBDA {
                 d[i] = (av[i] >> shift) & mask;
             }
@@ -345,10 +359,7 @@ impl LabelArena {
             d[1] ^= av[1];
         } else {
             let mask = lane_mask(dst.k());
-            let [d, av] = self
-                .lanes
-                .get_disjoint_mut([dst.index(), a.index()])
-                .expect("arena slots must be distinct");
+            let (d, av) = lanes_mut2(&mut self.lanes, dst.index(), a.index());
             if sub {
                 // dst = a - H (H currently in d)
                 for i in 0..LAMBDA {
@@ -372,10 +383,7 @@ impl LabelArena {
         } else {
             let mask = lane_mask(dst.k());
             let dv = c.lanes();
-            let [d, av] = self
-                .lanes
-                .get_disjoint_mut([dst.index(), a.index()])
-                .expect("arena slots must be distinct");
+            let (d, av) = lanes_mut2(&mut self.lanes, dst.index(), a.index());
             if sub {
                 for i in 0..LAMBDA {
                     d[i] = av[i].wrapping_sub(dv[i]) & mask;
@@ -849,10 +857,7 @@ pub(crate) fn garble_compiled(
             OP_ADD_L | OP_SUB_L => {
                 let mask = lane_mask(ins.k as u32);
                 if a == b {
-                    let [dv, av] = arena
-                        .lanes
-                        .get_disjoint_mut([d, a])
-                        .expect("compiled dst must differ from operands");
+                    let (dv, av) = lanes_mut2(&mut arena.lanes, d, a);
                     if ins.op == OP_SUB_L {
                         dv.fill(0);
                     } else {
@@ -862,10 +867,7 @@ pub(crate) fn garble_compiled(
                     }
                     continue;
                 }
-                let [dv, av, bv] = arena
-                    .lanes
-                    .get_disjoint_mut([d, a, b])
-                    .expect("compiled dst must differ from operands");
+                let (dv, av, bv) = lanes_mut3(&mut arena.lanes, d, a, b);
                 if ins.op == OP_SUB_L {
                     for i in 0..LAMBDA {
                         dv[i] = av[i].wrapping_sub(bv[i]) & mask;
@@ -882,10 +884,7 @@ pub(crate) fn garble_compiled(
                     panic!("compiled Mul at gid {} is not a Mul gate", ins.gid)
                 };
                 let s = (scalar & mask as u64) as u32;
-                let [dv, av] = arena
-                    .lanes
-                    .get_disjoint_mut([d, a])
-                    .expect("compiled slots are distinct");
+                let (dv, av) = lanes_mut2(&mut arena.lanes, d, a);
                 for i in 0..LAMBDA {
                     dv[i] = s.wrapping_mul(av[i]) & mask;
                 }
@@ -900,10 +899,7 @@ pub(crate) fn garble_compiled(
             OP_ZERO_L => arena.lanes[d].fill(0),
             OP_COPY_Z2 => arena.z2[d] = arena.z2[a],
             OP_COPY_L => {
-                let [dv, av] = arena
-                    .lanes
-                    .get_disjoint_mut([d, a])
-                    .expect("compiled slots are distinct");
+                let (dv, av) = lanes_mut2(&mut arena.lanes, d, a);
                 dv.copy_from_slice(av);
             }
             OP_PACKBIT => {
@@ -922,10 +918,7 @@ pub(crate) fn garble_compiled(
             OP_SHIFTMASK_L => {
                 let shift = ins.b;
                 let mask = lane_mask(ins.k as u32);
-                let [dv, av] = arena
-                    .lanes
-                    .get_disjoint_mut([d, a])
-                    .expect("compiled slots are distinct");
+                let (dv, av) = lanes_mut2(&mut arena.lanes, d, a);
                 for i in 0..LAMBDA {
                     dv[i] = (av[i] >> shift) & mask;
                 }
@@ -942,10 +935,7 @@ pub(crate) fn garble_compiled(
                 let dst = Slot::lanes(d, ins.k as u32);
                 arena.hash_solo_into(dst, Slot::z2(b), nonce_base + ins.gid as u64);
                 let mask = lane_mask(ins.k as u32);
-                let [dv, av] = arena
-                    .lanes
-                    .get_disjoint_mut([d, a])
-                    .expect("compiled slots are distinct");
+                let (dv, av) = lanes_mut2(&mut arena.lanes, d, a);
                 if ins.op == OP_HASH_SUB_L {
                     for i in 0..LAMBDA {
                         dv[i] = av[i].wrapping_sub(dv[i]) & mask;
@@ -996,6 +986,7 @@ pub(crate) fn fused_eval_arena(
     program: &Program,
     output_wires: &[Wire],
     nonce_base: u64,
+    wl: &mut Worklist,
 ) -> (Vec<Label>, Vec<u64>) {
     assert_eq!(input_wires.len(), input_labels.len());
     assert_eq!(input_wires.len(), input_values.len());
@@ -1003,7 +994,7 @@ pub(crate) fn fused_eval_arena(
     vals.clear();
     vals.resize(system.num_wires(), 0);
 
-    let mut wl = Worklist::new(system.num_wires(), system.num_gates());
+    wl.reset(system.num_wires(), system.num_gates());
 
     // Constants: label 0, value c.
     for (wid, v) in system.values.iter().enumerate() {
@@ -1029,7 +1020,7 @@ pub(crate) fn fused_eval_arena(
 
     while let Some(gid) = wl.pop_live() {
         if fused_fire(
-            system, layout, arena, vals, &mut wl, gid, nonce_base, program,
+            system, layout, arena, vals, wl, gid, nonce_base, program, subs,
         ) {
             wl.mark_done(gid);
         }
@@ -1070,6 +1061,7 @@ fn fused_fire(
     gid: usize,
     nonce_base: u64,
     program: &Program,
+    subs: &crate::system::SubscriptionCsr,
 ) -> bool {
     // One fused write: value + label + bookkeeping + wakeups.
     macro_rules! set {
@@ -1079,7 +1071,7 @@ fn fused_fire(
             vals[w.wid] = $v;
             $label;
             wl.mark_known(w.wid);
-            wl.wake_subscribers(system.subscriptions().of(w.wid), gid);
+            wl.wake_subscribers(subs.of(w.wid), gid);
         }};
     }
     let known = |wl: &Worklist, w: Wire| wl.wire_known(w.wid);
@@ -1276,8 +1268,9 @@ mod tests {
     /// The production execution paths — compiled garbling and fused
     /// value+label evaluation — must agree bit-for-bit with the `Label`-path
     /// engines (worklist [`garble`], journal [`replay_with_labels`]) on the
-    /// real header circuitry (circular word_to_hot, Mul(0) seeding, switches,
-    /// joins, Z₂ and lanes wires), across primes, inputs and deltas.
+    /// real header circuitry (the fused word_to_bin_up class-tree bootstrap,
+    /// Mul(0) seeding, switches, joins, Z₂ and lane wires), across primes,
+    /// inputs and deltas.
     #[test]
     fn test_arena_matches_label_path() {
         let mut rng = rand::rng();
@@ -1354,6 +1347,7 @@ mod tests {
                     nonce_base,
                 );
                 let mut vals = Vec::new();
+                let mut wl = Worklist::new(sys.num_wires(), sys.num_gates());
                 let (via_fused, fused_values) = fused_eval_arena(
                     &sys,
                     &layout,
@@ -1365,6 +1359,7 @@ mod tests {
                     &program_ref,
                     &h_p,
                     nonce_base,
+                    &mut wl,
                 );
                 assert_eq!(
                     via_replay, via_fused,

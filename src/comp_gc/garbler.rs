@@ -5,7 +5,9 @@
 //!
 //! * `Add`/`Sub`: bidirectional — any two of (in0, in1, out) determine the third.
 //! * `Mul(s, x)`: the output mask is `s · X_x`. When `s = 0` this is `0`
-//!   regardless of `X_x`, so the gate can fire without its input being masked (required to break circularity in the last iteration of `word_to_hot_with_bits`)
+//!   regardless of `X_x`, so the gate can fire without its input being masked
+//!   (`arith_ohe_to_word`'s index-0 term; historically what broke the circular
+//!   `word_to_hot` bootstrap that `word_to_bin_up` replaced)
 //! * `Mod2k` / `Div2k`: forward only (non-invertible at the mask level).
 //! * `Switch`: bidirectional (ctrl+data → out, ctrl+out → data) using
 //!   `Y = H(X_ctrl, gid) + X_data`. Garbler does not branch on ctrl value —
@@ -239,9 +241,11 @@ fn garble_impl(
 
     // Worklist seed: subscribers of every seeded wire, plus all `Mul(0, _)`
     // gates — the one gate shape that fires with no masked input (its output
-    // mask is `0` unconditionally; that's what lets the phantom `bs[i]` wires
-    // in `word_to_hot_with_bits` get their first mask). Every other gate needs
-    // at least one known wire, so it is reachable through `try_set` cascades.
+    // mask is `0` unconditionally, so it need not wait for its input; in
+    // `word_to_bin_up` every mask also reaches it forward, making this eager
+    // seeding a fast-path rather than a correctness requirement). Every other
+    // gate needs at least one known wire, so it is reachable through `try_set`
+    // cascades.
     let mut bulk_cache: BulkCache = vec![None; system.num_switch_groups()];
     let subs = system.subscriptions();
     for (wid, m) in masks.iter().enumerate() {
@@ -479,9 +483,9 @@ mod tests {
         }
     }
 
-    /// The real header shape: `bin_to_word` → `sub_chunk_extract` (circular
-    /// `word_to_hot`, `Mul(0)` seeding, backward propagation) →
-    /// `fold_to_mod_ohe` (switch + join heavy).
+    /// The real header shape: `bin_to_word` → `sub_chunk_extract` (the fused
+    /// `word_to_bin_up` with its class-tree bootstrap and open-switch
+    /// back-solve) → `fold_to_mod_ohe` (switch + join heavy).
     fn build_bits_header(ell: u32, p: u64) -> (System, Vec<Wire>, Vec<Wire>) {
         let sub_widths = compute_sub_widths(ell, 4); // two sub-chunks: forces a peel
         let mut sys = System::new();

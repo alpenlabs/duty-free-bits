@@ -18,6 +18,9 @@ keywords = ["garbled-circuits", "mpc", "switch-system", "bitvm"]
 # priority dance).
 
 [features]
+# Enable a process-global CCRH (AES-block) counter for per-party hash accounting
+# in benchmarks. OFF by default — zero overhead on the hot path when disabled.
+count-hashes = []
 
 [dependencies]
 mimalloc = { version = "0.1", default-features = false }

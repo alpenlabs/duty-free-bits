@@ -16,6 +16,7 @@
 //! * [`system`] + [`comp_gc`] — the computational Yao GC engine (Phase 1: `bin(x)` → hot(CRT(x))).
 //! * [`it_gc`] — the information-theoretic GC (Phase 3: hot(CRT(x)) → `a·x+b`).
 //! * [`affine`] — composes the two via the streaming [`pipeline`].
+//! * [`bitdecomp`] — standalone switch-free `a·x+b` baseline for hash-count comparison.
 
 use mimalloc::MiMalloc;
 
@@ -25,6 +26,8 @@ static GLOBAL: MiMalloc = MiMalloc;
 pub mod crypto;
 
 pub mod affine;
+
+pub mod bitdecomp;
 
 pub mod comp_gc;
 

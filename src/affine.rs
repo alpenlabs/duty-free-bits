@@ -247,9 +247,11 @@ pub fn build_s_aff_streaming(
             .iter()
             .map(|&id| pipeline.carry(id).mask.clone())
             .collect();
+        let fold_gb0 = crate::crypto::hash_blocks();
         let t_fold_garble = std::time::Instant::now();
         let fold_g = fold_batch_garble(p_i, &fbh_masks, &bit_masks, first_width, fold_nonce_base);
         let fold_garble_secs = t_fold_garble.elapsed().as_secs_f64();
+        pipeline.garble_hash_blocks += crate::crypto::hash_blocks() - fold_gb0;
 
         let fbh_labels: Vec<_> = fbh_ids
             .iter()
@@ -259,6 +261,7 @@ pub fn build_s_aff_streaming(
             .iter()
             .map(|&id| pipeline.carry(id).label.clone())
             .collect();
+        let fold_eb0 = crate::crypto::hash_blocks();
         let t_fold_eval = std::time::Instant::now();
         let h_p_labels = fold_batch_eval(
             p_i,
@@ -270,6 +273,7 @@ pub fn build_s_aff_streaming(
             fold_nonce_base,
         );
         let fold_eval_secs = t_fold_eval.elapsed().as_secs_f64();
+        pipeline.eval_hash_blocks += crate::crypto::hash_blocks() - fold_eb0;
         pipeline.record_fold_batch(fold_garble_secs, fold_eval_secs, fold_g.cost);
         let h_p_masks = fold_g.h_p_masks;
 
@@ -291,6 +295,7 @@ pub fn build_s_aff_streaming(
             let nonce_base = prime_nonce_bases[i] as usize + batch_idx * p_i as usize;
 
             // Garbler kernel: emits join diffs, output masks, and the batch cost.
+            let body_gb0 = crate::crypto::hash_blocks();
             let t_garble = std::time::Instant::now();
             let g_out = body_batch_garble(
                 p_i,
@@ -301,8 +306,10 @@ pub fn build_s_aff_streaming(
                 nonce_base,
             );
             let garble_secs = t_garble.elapsed().as_secs_f64();
+            pipeline.garble_hash_blocks += crate::crypto::hash_blocks() - body_gb0;
             // Evaluator kernel: consumes the garbler's join diffs, using the same
             // nonce base. `hot_i` comes from cleartext `x_bits`; no reveal.
+            let body_eb0 = crate::crypto::hash_blocks();
             let t_eval = std::time::Instant::now();
             let result_labels = body_batch_eval(
                 p_i,
@@ -314,6 +321,7 @@ pub fn build_s_aff_streaming(
                 nonce_base,
             );
             let eval_secs = t_eval.elapsed().as_secs_f64();
+            pipeline.eval_hash_blocks += crate::crypto::hash_blocks() - body_eb0;
 
             // Decode: value_j = (label_j − mask_j) mod p_i.
             for (label, mask) in result_labels.iter().zip(g_out.result_masks.iter()) {

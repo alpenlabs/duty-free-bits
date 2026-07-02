@@ -29,6 +29,32 @@ use portable as backend;
 /// A 128-bit CCRH block.
 pub type Block = [u8; 16];
 
+/// Process-global CCRH block counter (only compiled under `count-hashes`).
+#[cfg(feature = "count-hashes")]
+static HASH_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// CCRH blocks (16-byte AES outputs) emitted so far. Returns 0 unless built
+/// with the `count-hashes` feature — used for per-party hash accounting in
+/// benchmarks (snapshot the delta around a garble or eval region).
+#[inline]
+pub fn hash_blocks() -> u64 {
+    #[cfg(feature = "count-hashes")]
+    {
+        HASH_BLOCKS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(feature = "count-hashes"))]
+    {
+        0
+    }
+}
+
+/// Reset the CCRH block counter (no-op without `count-hashes`).
+#[inline]
+pub fn reset_hash_blocks() {
+    #[cfg(feature = "count-hashes")]
+    HASH_BLOCKS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Fixed AES-128 key (public permutation key for the CCRH). Bytes from the
 /// fractional part of the golden ratio — a "nothing-up-my-sleeve" constant.
 const CCRH_KEY: [u8; 16] = [
@@ -82,6 +108,12 @@ pub fn expand(seed: Block, nonce: u64, output: &mut [u8]) {
         written += take;
         counter += 1;
     }
+
+    #[cfg(feature = "count-hashes")]
+    HASH_BLOCKS.fetch_add(
+        output.len().div_ceil(16) as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// One CCRND block for each of 4 independent `(seed, nonce)` pairs (counter 0).
@@ -101,6 +133,9 @@ pub fn expand4(seeds: &[Block; 4], nonces: &[u64; 4], outs: &mut [Block; 4]) {
     for i in 0..4 {
         outs[i] = backend::ccrnd(seeds[i], tweaks[i], keys, CCRH_PUBLIC_S);
     }
+
+    #[cfg(feature = "count-hashes")]
+    HASH_BLOCKS.fetch_add(4, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(test)]

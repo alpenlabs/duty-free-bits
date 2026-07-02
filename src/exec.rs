@@ -38,6 +38,18 @@ impl Worklist {
         }
     }
 
+    /// Clear and resize for reuse across phases (pooling: avoids re-allocating
+    /// the bitsets and regrowing the queue every phase). Zeros all state.
+    pub(crate) fn reset(&mut self, num_wires: usize, num_gates: usize) {
+        self.known.clear();
+        self.known.resize(num_wires.div_ceil(64), 0);
+        self.done.clear();
+        self.done.resize(num_gates.div_ceil(64), 0);
+        self.queued.clear();
+        self.queued.resize(num_gates.div_ceil(64), 0);
+        self.queue.clear();
+    }
+
     #[inline]
     pub(crate) fn wire_known(&self, wid: usize) -> bool {
         (self.known[wid >> 6] >> (wid & 63)) & 1 != 0

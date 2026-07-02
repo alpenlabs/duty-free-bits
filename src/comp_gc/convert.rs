@@ -3,9 +3,10 @@
 //! IT-GC body consumes.
 //!
 //! The pipeline composes these: `bin_to_word` packs bits into a ring word,
-//! `word_to_hot_with_bits` expands a word to its one-hot, `sub_chunk_extract`
-//! splits a wide word into narrower sub-chunks, and `fold_to_mod_ohe` reduces a
-//! one-hot modulo a prime. All build on the primitives in [`super::ohe`].
+//! `word_to_bin_up` decomposes a word into bits + binary one-hot + upcast,
+//! `sub_chunk_extract` splits a wide word into narrower sub-chunks, and
+//! `fold_to_mod_ohe` reduces a one-hot modulo a prime. All build on the
+//! primitives in [`super::ohe`].
 
 use super::ohe::{ohe, ohe_scale};
 use crate::crt::pow2_mod;
@@ -26,46 +27,83 @@ pub fn arith_ohe_to_word(sys: &mut System, h: &[Wire]) -> Wire {
     out
 }
 
-/// Convert a k-bit word x ∈ Z_{2^k} to a 2^k arithmetic one-hot encoding, also
-/// returning the binary wires (bits of x). We get the bits for free in the
-/// original construction.
+/// Fused word → bits + binary one-hot + width-`l` upcast: the straight-line
+/// `word_to_hot` (the hand-derived form of the circular Hea24 §4.3 bootstrap).
 ///
-/// The circular construction from Hea24, Section 4.3.
-/// Output: 2^k wires in Z_{2^k} where entry x = 1, all others = 0.
-/// Join width: 2k-1 bits.
-pub fn word_to_hot_with_bits(sys: &mut System, x: Wire) -> (Vec<Wire>, Vec<Wire>) {
+/// Given x ∈ Z_{2^k} and `l ≥ k`, produces:
+///
+///   * the k bits of x, LSB first;
+///   * the 2^k-entry binary one-hot of x (the [`ohe`] doubling-tree leaves);
+///   * iff `upcast`, an arithmetic wire holding x in Z_{2^l}.
+///
+/// One width-`l` cast per one-hot entry serves simultaneously as the
+/// bit-extraction accumulator bank and the upcast: a halving tree of
+/// congruence-class sums `S_i[q] = Σ_{p ≡ q (2^i)} A[p]` carries the single
+/// width-`l` pin join `Σ_p A[p] = 1` at its root, level i's weighted sum
+/// encodes `x mod 2^i` (peeling bit i with free ops), and `Σ_p p·A[p]` is the
+/// upcast. The hot entry's cast switch is open; the evaluator back-solves it
+/// through the pin join and the class tree, exactly the mechanism the
+/// worklist engines already resolve.
+///
+/// Cost: `(2^k − 2) + l·2^k` CF hashes and `k + l − 1` join bits — versus
+/// `(2^k − 2) + k·2^k` + a separate width-`l` peel (`l·2^k` hashes,
+/// `(2k − 1) + l` join bits total) for the unfused word-to-hot: the k·2^k
+/// arithmetic-one-hot layer is fused away.
+pub fn word_to_bin_up(
+    sys: &mut System,
+    x: Wire,
+    l: u32,
+    upcast: bool,
+) -> (Vec<Wire>, Vec<Wire>, Option<Wire>) {
     let m = sys.modulus(x);
     assert!(m.is_power_of_two());
     let k = m.ilog2();
+    // Upper bound: the CF label machinery caps ring width at 32 bits
+    // (`delta_r` caching, arena lane slots).
+    assert!(
+        k >= 1 && l >= k && l <= 32,
+        "word_to_bin_up requires 1 <= k <= l <= 32"
+    );
+    let ml = 1u64 << l;
 
-    let mut bs = Vec::with_capacity(k as usize);
-    for _ in 0..k {
-        bs.push(sys.alloc_wire(2));
-    }
+    // Bit wires drive the one-hot tree. Bit 0 is native; bits 1..k are solved
+    // through the class tree below (`same_wire` closes the circular schedule).
+    let bs: Vec<Wire> = (0..k).map(|_| sys.alloc_wire(2)).collect();
+    let b0 = sys.mod2k(x, 1);
+    sys.same_wire(bs[0], b0);
 
     let bin_hot = ohe(sys, &bs);
 
-    let z = sys.constant(0, m);
-    let mut hot = Vec::with_capacity(1usize << k);
-    for &bh in &bin_hot {
-        hot.push(sys.switch(z, bh));
-    }
+    // Width-l casts of every one-hot entry (the hot one included — its open
+    // switch is back-solved through the pin join).
+    let z = sys.constant(0, ml);
+    let casts: Vec<Wire> = bin_hot.iter().map(|&bh| sys.switch(z, bh)).collect();
 
-    let mut acc = hot.clone();
-    for i in 1..((k + 1) as usize) {
+    let up = upcast.then(|| arith_ohe_to_word(sys, &casts));
+
+    // Halving tree of class sums; level i's weighted sum peels bit i.
+    let mut acc = casts;
+    for i in (1..k).rev() {
         let mid = acc.len() / 2;
         acc = sys.add_vec(&acc[..mid], &acc[mid..]);
 
-        let word = arith_ohe_to_word(sys, &acc);
-        let diff = sys.sub(x, word);
-        let rem = sys.div2k(diff, k - i as u32);
-        let mod_rem = sys.mod2k(rem, 1);
-        sys.same_wire(bs[k as usize - i], mod_rem);
+        let res = arith_ohe_to_word(sys, &acc); // encodes x mod 2^i, width l
+        let res_k = sys.mod2k(res, k);
+        let diff = sys.sub(x, res_k); // ≡ 0 (mod 2^i)
+        let rem = sys.div2k(diff, i);
+        let bit_i = sys.mod2k(rem, 1);
+        sys.same_wire(bs[i as usize], bit_i);
     }
 
-    let one = sys.constant(1, m);
-    sys.join(acc[0], one);
-    (hot, bs)
+    // Root: Σ_p A[p] ⋈ 1 — the single width-l pin join. The halving loop
+    // always exits with exactly the two level-1 class sums (k = 1 skips it
+    // with the two casts themselves).
+    assert_eq!(acc.len(), 2);
+    let root = sys.add(acc[0], acc[1]);
+    let one = sys.constant(1, ml);
+    sys.join(root, one);
+
+    (bs, bin_hot, up)
 }
 
 /// Convert binary wires (n bits) to an arithmetic word in Z_{2^k}.
@@ -134,7 +172,10 @@ pub fn compute_sub_widths(ell: u32, max_width: u32) -> Vec<u32> {
 /// Decomposes r ∈ Z_{2^ℓ} into sub-chunks of the given widths, extracting
 /// the bit decomposition and the first sub-chunk's binary OHE.
 ///
-/// Total OHE size is Σ 2^{ℓ_q} instead of 2^ℓ
+/// Total OHE size is Σ 2^{ℓ_q} instead of 2^ℓ. Each sub-chunk runs the fused
+/// [`word_to_bin_up`] with the upcast at the remainder's width, so the peel
+/// consumes the gadget's upcast directly — no separate arithmetic one-hot or
+/// `ohe_scale` layer.
 pub fn sub_chunk_extract(sys: &mut System, r: Wire, sub_widths: &[u32]) -> SubChunkExtraction {
     let m = sys.modulus(r);
     assert!(m.is_power_of_two());
@@ -146,28 +187,25 @@ pub fn sub_chunk_extract(sys: &mut System, r: Wire, sub_widths: &[u32]) -> SubCh
     let mut first_bin_hot = vec![];
 
     for (q, &width) in sub_widths.iter().enumerate() {
-        let rem_mod = sys.modulus(remainder);
+        let rem_bits = sys.bitlen(remainder);
+        let last = q == sub_widths.len() - 1;
 
         // Extract sub-chunk: r^(q) = remainder mod 2^width
         let sub = sys.mod2k(remainder, width);
 
-        // Decompose sub-chunk via word_to_hot
-        let (arith_hot, sub_bits) = word_to_hot_with_bits(sys, sub);
-
-        // Binary OHE from arithmetic OHE (mod 2 of each entry)
-        let bin_hot: Vec<Wire> = arith_hot.iter().map(|&h| sys.mod2k(h, 1)).collect();
+        // Fused decomposition: bits + binary OHE + (unless last) the sub-chunk
+        // value upcast to the remainder's width, ready for the peel.
+        let l = if last { width } else { rem_bits };
+        let (sub_bits, bin_hot, up) = word_to_bin_up(sys, sub, l, !last);
 
         if q == 0 {
-            first_bin_hot.clone_from(&bin_hot);
+            first_bin_hot = bin_hot;
         }
 
         bits.push(sub_bits);
 
         // Peel: remainder = (remainder - sub_word) / 2^width
-        if q < sub_widths.len() - 1 {
-            let one_big = sys.constant(1, rem_mod);
-            let big_ohe = ohe_scale(sys, &bin_hot, one_big);
-            let sub_word = arith_ohe_to_word(sys, &big_ohe);
+        if let Some(sub_word) = up {
             let diff = sys.sub(remainder, sub_word);
             remainder = sys.div2k(diff, width);
         }
@@ -298,6 +336,103 @@ mod tests {
 
             assert_eq!(exec.get(out), Val::new(input, 8), "bin_to_word({input})");
         }
+    }
+
+    // ==================== word_to_bin_up ====================
+
+    #[test]
+    fn test_word_to_bin_up_exhaustive() {
+        // All x at the production points (8,22), (8,14), (6,6) plus edges
+        // (k=1, l=k, l>k). Checks bits (LSB first), the full binary OHE
+        // (hot entry included), and the upcast value/width.
+        for (k, l) in [
+            (1u32, 1u32),
+            (1, 9),
+            (3, 3),
+            (4, 8),
+            (6, 6),
+            (8, 14),
+            (8, 22),
+        ] {
+            let n = 1u64 << k;
+            for x_val in 0..n {
+                let mut sys = System::new();
+                let x = sys.input(n);
+                let (bits, bin_hot, up) = word_to_bin_up(&mut sys, x, l, true);
+
+                let mut exec = Exec::new(&sys);
+                exec.set(x, Val::new(x_val, n));
+                exec.run();
+
+                assert_eq!(bits.len(), k as usize);
+                for (i, &b) in bits.iter().enumerate() {
+                    assert_eq!(
+                        exec.get(b),
+                        Val::new((x_val >> i) & 1, 2),
+                        "bit {i} for k={k} l={l} x={x_val}"
+                    );
+                }
+                assert_eq!(bin_hot.len(), n as usize);
+                for (p, &w) in bin_hot.iter().enumerate() {
+                    assert_eq!(
+                        exec.get(w),
+                        Val::new((p as u64 == x_val) as u64, 2),
+                        "bin_hot[{p}] for k={k} l={l} x={x_val}"
+                    );
+                }
+                assert_eq!(
+                    exec.get(up.unwrap()),
+                    Val::new(x_val, 1u64 << l),
+                    "upcast for k={k} l={l} x={x_val}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_word_to_bin_up_cost() {
+        // The verified ledger: (2^k − 2) + l·2^k CF hashes, k + l − 1 join
+        // bits, nothing NCF.
+        for (k, l) in [(4u32, 8u32), (6, 6), (8, 14), (8, 22)] {
+            let n = 1u64 << k;
+            let mut sys = System::new();
+            let x = sys.input(n);
+            let _ = word_to_bin_up(&mut sys, x, l, true);
+            let c = sys.cost();
+            assert_eq!(
+                c.hash_count_cf as u64,
+                (n - 2) + l as u64 * n,
+                "hashes for k={k} l={l}"
+            );
+            assert_eq!(c.join_complexity_cf as u32, k + l - 1, "joins for k={k} l={l}");
+            assert_eq!(c.hash_count_ncf, 0);
+            assert_eq!(c.join_complexity_ncf, 0);
+
+            // upcast=false (the last-chunk configuration): no wire returned,
+            // ledger identical — the upcast is free Mul/Add gates only.
+            let mut sys = System::new();
+            let x = sys.input(n);
+            let (_, _, up) = word_to_bin_up(&mut sys, x, l, false);
+            assert!(up.is_none());
+            let c2 = sys.cost();
+            assert_eq!(c2.hash_count_cf, c.hash_count_cf);
+            assert_eq!(c2.join_complexity_cf, c.join_complexity_cf);
+        }
+    }
+
+    #[test]
+    fn test_sub_chunk_extract_cost() {
+        // Production shape ell=22, widths [8,8,6]: per-chunk (2^k − 2) + l·2^k
+        // = 5886 + 3838 + 446 = 10170 CF hashes and (k + l − 1) = 29 + 21 + 11
+        // = 61 join bits per extract (was 14266 / 77 with the unfused path).
+        let mut sys = System::new();
+        let r = sys.input_bits(22);
+        let _ = sub_chunk_extract(&mut sys, r, &[8, 8, 6]);
+        let c = sys.cost();
+        assert_eq!(c.hash_count_cf, 10170);
+        assert_eq!(c.join_complexity_cf, 61);
+        assert_eq!(c.hash_count_ncf, 0);
+        assert_eq!(c.join_complexity_ncf, 0);
     }
 
     // ==================== compute_sub_widths ====================
