@@ -1149,8 +1149,10 @@ impl rand::RngCore for BenchRng {
 /// reported. Both EXCLUDE a,b sampling (done once before timing) and any
 /// correctness/decode step (correctness is covered by
 /// `bitdecomp::tests::test_garble_eval_matches_plaintext` and the assert in
-/// `test_s_aff_scaling`). Input-label provisioning (bit-decomp `encode`, switch
-/// `seed_input_cf_value`) is outside the timed region for both.
+/// `test_s_aff_scaling`). Input-label provisioning is outside the timed
+/// region for both (bit-decomp `encode`; the switch driver samples input
+/// masks outside its per-stage timers). The switch side runs the kernel
+/// production path ([`crate::affine::build_s_aff_kernels`]).
 ///
 /// Run:
 ///   cargo test -r --lib bench_axb_comparison -- --ignored --nocapture
@@ -1242,26 +1244,23 @@ fn bench_axb_comparison() {
     let mut sw_t = Vec::with_capacity(iters);
     let (mut sw_cf, mut sw_ncf, mut sw_comm_bits) = (0usize, 0usize, 0usize);
     for it in 0..warmup + iters {
-        // Input seeding is evaluator-side label provisioning — outside the timed
-        // region, matching bit-decomp's encode().
         let x_bits: Vec<u64> = (0..n as usize).map(|_| rng.random_range(0..2u64)).collect();
-        let mut pipeline = Pipeline::new(&mut rng);
-        let bit_ids: Vec<_> = x_bits
-            .iter()
-            .map(|&bb| pipeline.seed_input_cf_value(&mut rng, 2, bb))
-            .collect();
-
+        // The kernel driver samples input masks internally but outside its
+        // per-stage timers, so garble/eval exclude label provisioning —
+        // matching bit-decomp's untimed encode().
         let t = Instant::now();
-        let _ = build_s_aff_streaming(&mut pipeline, &bit_ids, &x_bits, &params, &a_res, &b_res);
-        let stream = t.elapsed().as_secs_f64();
+        let (out, stats) =
+            crate::affine::build_s_aff_kernels(&mut rng, &x_bits, &params, &a_res, &b_res);
+        let full = t.elapsed().as_secs_f64();
+        black_box(&out);
         if it >= warmup {
-            sw_g.push(pipeline.garble_secs);
-            sw_e.push(pipeline.eval_secs);
-            sw_t.push(stream);
-            sw_cf = pipeline.hash_count_cf;
-            sw_ncf = pipeline.hash_count_ncf;
+            sw_g.push(stats.garble_secs());
+            sw_e.push(stats.eval_secs());
+            sw_t.push(full);
+            sw_cf = stats.hash_count_cf;
+            sw_ncf = stats.hash_count_ncf;
             sw_comm_bits =
-                crate::label::LAMBDA * pipeline.join_complexity_cf + pipeline.join_complexity_ncf;
+                crate::label::LAMBDA * stats.join_complexity_cf + stats.join_complexity_ncf;
         }
     }
     let (swg_min, swg_med) = stats(sw_g);
@@ -1292,7 +1291,7 @@ fn bench_axb_comparison() {
         (swg_med + swe_med) / (bdg_med + bde_med)
     );
     eprintln!(
-        "\nswitch full stream incl. circuit build: {:.2} [{:.2}] ms  (build+garble+eval+other)",
+        "\nswitch full run incl. input seeding: {:.2} [{:.2}] ms  (seed+garble+eval+other)",
         swt_med, swt_min
     );
     eprintln!("\nhashes (CCRH 16-byte blocks, per party):");
@@ -1416,19 +1415,16 @@ fn bench_axb_network() {
     let (mut sw_comm_bits, mut sw_cf, mut sw_ncf) = (0usize, 0usize, 0usize);
     for it in 0..warmup + iters {
         let x_bits: Vec<u64> = (0..n as usize).map(|_| rng.random_range(0..2u64)).collect();
-        let mut pipeline = Pipeline::new(&mut rng);
-        let bit_ids: Vec<_> = x_bits
-            .iter()
-            .map(|&bb| pipeline.seed_input_cf_value(&mut rng, 2, bb))
-            .collect();
-        let _ = build_s_aff_streaming(&mut pipeline, &bit_ids, &x_bits, &params, &a_res, &b_res);
+        let (out, stats) =
+            crate::affine::build_s_aff_kernels(&mut rng, &x_bits, &params, &a_res, &b_res);
+        black_box(&out);
         if it >= warmup {
-            swg.push(pipeline.garble_secs);
-            swe.push(pipeline.eval_secs);
+            swg.push(stats.garble_secs());
+            swe.push(stats.eval_secs());
             sw_comm_bits =
-                crate::label::LAMBDA * pipeline.join_complexity_cf + pipeline.join_complexity_ncf;
-            sw_cf = pipeline.hash_count_cf;
-            sw_ncf = pipeline.hash_count_ncf;
+                crate::label::LAMBDA * stats.join_complexity_cf + stats.join_complexity_ncf;
+            sw_cf = stats.hash_count_cf;
+            sw_ncf = stats.hash_count_ncf;
         }
     }
     let (sw_g, sw_e) = (med(swg), med(swe));
@@ -1546,17 +1542,13 @@ fn bench_axb_hashcounts() {
         .map(|&pi| b_vals.iter().map(|&b| b % pi).collect())
         .collect();
     let x_bits: Vec<u64> = (0..n as usize).map(|_| rng.random_range(0..2u64)).collect();
-    let mut pipeline = Pipeline::new(&mut rng);
-    let bit_ids: Vec<_> = x_bits
-        .iter()
-        .map(|&bb| pipeline.seed_input_cf_value(&mut rng, 2, bb))
-        .collect();
     reset_hash_blocks();
-    let _ = build_s_aff_streaming(&mut pipeline, &bit_ids, &x_bits, &params, &a_res, &b_res);
+    let (_, stats) =
+        crate::affine::build_s_aff_kernels(&mut rng, &x_bits, &params, &a_res, &b_res);
     let sw_total = hash_blocks();
-    let sw_g = pipeline.garble_hash_blocks;
-    let sw_e = pipeline.eval_hash_blocks;
-    let sw_ledger = (pipeline.hash_count_cf + pipeline.hash_count_ncf) as u64;
+    let sw_g = stats.garble_hash_blocks;
+    let sw_e = stats.eval_hash_blocks;
+    let sw_ledger = (stats.hash_count_cf + stats.hash_count_ncf) as u64;
 
     // Cross-checks: measured == ground truth.
     assert_eq!(bd_g as usize, led.garble_calls, "bit-decomp garbler vs HashLedger");
@@ -1584,8 +1576,8 @@ fn bench_axb_hashcounts() {
         "switch                 : garbler {:.2}M / evaluator {:.2}M  (analytical circuit ledger cf {} + ncf {} = {})",
         mm(sw_g),
         mm(sw_e),
-        pipeline.hash_count_cf,
-        pipeline.hash_count_ncf,
+        stats.hash_count_cf,
+        stats.hash_count_ncf,
         sw_ledger
     );
     eprintln!(
