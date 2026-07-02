@@ -70,7 +70,11 @@ impl CrtParams {
         let max_word = (1u64 << chunk_size) - 1;
         let max_sum = (num_chunks as u128) * (p_max as u128) * (max_word as u128);
         let ell = max_sum.ilog2() + 1;
-        assert!(ell < 64, "working modulus 2^{} exceeds u64", ell);
+        assert!(
+            ell <= 32,
+            "working modulus 2^{} exceeds the CF label machinery's 32-bit ring cap",
+            ell
+        );
 
         CrtParams {
             n,

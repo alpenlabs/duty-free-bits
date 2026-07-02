@@ -383,7 +383,9 @@ pub struct KernelStats {
     pub body_garble_secs: f64,
     /// Body-kernel eval wall time.
     pub body_eval_secs: f64,
-    /// Garbler-emitted material in bits.
+    /// Garbler-emitted material in bits. Per-driver emitted material — NOT
+    /// comparable to `Pipeline::total_program_bits`, which additionally
+    /// counts System-phase program overhead.
     pub program_bits: usize,
     /// CF join width, in `lg|G|` units (each pays λ bits).
     pub join_complexity_cf: usize,
@@ -422,7 +424,7 @@ impl KernelStats {
 /// [`build_s_aff_streaming`]; the two are differentially tested to produce
 /// identical decoded outputs. One parameter restriction: the extract kernels
 /// require every sub-chunk width in `2..=31`, so shapes with a width-1
-/// trailing sub-chunk (`ell ≡ 1 mod 8`, e.g. n = 26..=32 with the 80-prime
+/// trailing sub-chunk (`ell ≡ 1 mod 8`, e.g. n = 1 or n = 26..=32 with the 80-prime
 /// set) are rejected loudly — use the reference path for those.
 pub fn build_s_aff_kernels<R: rand::Rng>(
     rng: &mut R,
@@ -450,42 +452,23 @@ pub fn build_s_aff_kernels<R: rand::Rng>(
     let num_chunks = params.num_chunks;
     let sub_widths = compute_sub_widths(ell, MAX_SUB_CHUNK_WIDTH);
     let first_width = sub_widths[0];
-    let fold_bits: u32 = sub_widths[1..].iter().sum();
 
     let delta: u128 = rng.random::<u128>() | 1;
     let d2 = Label::Cf(label::delta_r(delta, 2));
     let mut stats = KernelStats::default();
 
     // ---- Nonce windows (paper App. A, Def. 4) ----
-    // Solo domain (width-l casts): chunk kernels first, then extracts.
-    let (chunk_bulk_ids, chunk_solo_ids) = chunk_kernel_nonces(chunk_size as u32);
-    let (ex_bulk_ids, ex_solo_ids) = extract_kernel_nonces(&sub_widths);
-    let solo_chunk_base = 0u64;
-    let solo_extract_base = solo_chunk_base + num_chunks as u64 * chunk_solo_ids;
-    // Bulk domain: fold + body windows exactly as the streaming path lays
-    // them out, then the tree windows above them.
-    let num_batches = s_dim.div_ceil(RESIDUE_BATCH_SIZE);
-    let prime_window_sizes: Vec<u64> = params
-        .primes
-        .iter()
-        .map(|&p| (num_batches as u64 + fold_bits as u64) * p)
-        .collect();
-    let prime_nonce_bases = nonce::windows(KERNEL_NONCE_FLOOR, &prime_window_sizes);
-    let bulk_tree_base = prime_nonce_bases
-        .last()
-        .zip(prime_window_sizes.last())
-        .map(|(&b, &s)| b + s)
-        .unwrap_or(KERNEL_NONCE_FLOOR);
-    let bulk_chunk_base = bulk_tree_base;
-    let bulk_extract_base = bulk_chunk_base + num_chunks as u64 * chunk_bulk_ids;
-    assert!(
-        bulk_extract_base + params.num_primes as u64 * ex_bulk_ids < (1u64 << 63),
-        "kernel CCRH nonce space exhausted"
-    );
-    assert!(
-        solo_extract_base + params.num_primes as u64 * ex_solo_ids < (1u64 << 63),
-        "kernel solo-domain nonce space exhausted"
-    );
+    let nw = KernelNonceLayout::new(params, s_dim, &sub_widths);
+    let chunk_solo_ids = nw.chunk_solo_ids;
+    let chunk_bulk_ids = nw.chunk_bulk_ids;
+    let ex_solo_ids = nw.ex_solo_ids;
+    let ex_bulk_ids = nw.ex_bulk_ids;
+    let solo_chunk_base = nw.solo_chunk_base;
+    let solo_extract_base = nw.solo_extract_base;
+    let num_batches = nw.num_batches;
+    let prime_nonce_bases = nw.prime_nonce_bases.clone();
+    let bulk_chunk_base = nw.bulk_chunk_base;
+    let bulk_extract_base = nw.bulk_extract_base;
 
     // ---- Input bits: masks sampled, labels = mask + bit·Δ₂. ----
     let bit_masks: Vec<Label> = (0..n).map(|_| sample_cf_mask(rng, 2)).collect();
@@ -673,4 +656,157 @@ pub fn build_s_aff_kernels<R: rand::Rng>(
     }
 
     (all_outputs, stats)
+}
+
+/// The kernel path's complete CCRH nonce-window layout (paper App. A,
+/// Def. 4: no two garbler queries may share a (domain, id)).
+///
+/// Solo domain (width-`l` cast pads): chunk-kernel windows first, then the
+/// per-prime extract windows. Bulk domain (Z₂ tree hashes + the fold/body
+/// kernels): the fold/body per-prime windows exactly as the streaming path
+/// lays them out from [`KERNEL_NONCE_FLOOR`], then the chunk tree windows,
+/// then the per-prime extract tree windows above those. This struct is the
+/// single source of truth the driver draws its bases from, and
+/// `test_kernel_nonce_windows_disjoint` pins the partition — nonce-collision
+/// regressions are invisible to output/differential tests (both parties
+/// share the layout, so colliding windows still decode correctly).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct KernelNonceLayout {
+    pub chunk_solo_ids: u64,
+    pub chunk_bulk_ids: u64,
+    pub ex_solo_ids: u64,
+    pub ex_bulk_ids: u64,
+    pub solo_chunk_base: u64,
+    pub solo_extract_base: u64,
+    pub num_batches: usize,
+    pub prime_nonce_bases: Vec<u64>,
+    pub prime_window_sizes: Vec<u64>,
+    pub bulk_chunk_base: u64,
+    pub bulk_extract_base: u64,
+    num_chunks: usize,
+    num_primes: usize,
+}
+
+impl KernelNonceLayout {
+    pub(crate) fn new(params: &CrtParams, s_dim: usize, sub_widths: &[u32]) -> Self {
+        let fold_bits: u32 = sub_widths[1..].iter().sum();
+        let (chunk_bulk_ids, chunk_solo_ids) = chunk_kernel_nonces(params.chunk_size);
+        let (ex_bulk_ids, ex_solo_ids) = extract_kernel_nonces(sub_widths);
+        let solo_chunk_base = 0u64;
+        let solo_extract_base = solo_chunk_base + params.num_chunks as u64 * chunk_solo_ids;
+        let num_batches = s_dim.div_ceil(RESIDUE_BATCH_SIZE);
+        let prime_window_sizes: Vec<u64> = params
+            .primes
+            .iter()
+            .map(|&p| (num_batches as u64 + fold_bits as u64) * p)
+            .collect();
+        let prime_nonce_bases = nonce::windows(KERNEL_NONCE_FLOOR, &prime_window_sizes);
+        let bulk_tree_base = prime_nonce_bases
+            .last()
+            .zip(prime_window_sizes.last())
+            .map(|(&b, &s)| b + s)
+            .unwrap_or(KERNEL_NONCE_FLOOR);
+        let bulk_chunk_base = bulk_tree_base;
+        let bulk_extract_base = bulk_chunk_base + params.num_chunks as u64 * chunk_bulk_ids;
+        assert!(
+            bulk_extract_base + params.num_primes as u64 * ex_bulk_ids < (1u64 << 63),
+            "kernel CCRH nonce space exhausted"
+        );
+        assert!(
+            solo_extract_base + params.num_primes as u64 * ex_solo_ids < (1u64 << 63),
+            "kernel solo-domain nonce space exhausted"
+        );
+        KernelNonceLayout {
+            chunk_solo_ids,
+            chunk_bulk_ids,
+            ex_solo_ids,
+            ex_bulk_ids,
+            solo_chunk_base,
+            solo_extract_base,
+            num_batches,
+            prime_nonce_bases,
+            prime_window_sizes,
+            bulk_chunk_base,
+            bulk_extract_base,
+            num_chunks: params.num_chunks,
+            num_primes: params.num_primes,
+        }
+    }
+
+    /// Every reserved window as `(is_bulk, base, len)` — the disjointness test
+    /// walks this enumeration, so it covers exactly what the driver uses.
+    /// The per-prime fold/body reservation is treated as one window (its
+    /// internal body-batch/fold split shares the streaming layout).
+    #[cfg(test)]
+    pub(crate) fn windows(&self) -> Vec<(bool, u64, u64)> {
+        let mut w = Vec::new();
+        for c in 0..self.num_chunks as u64 {
+            w.push((false, self.solo_chunk_base + c * self.chunk_solo_ids, self.chunk_solo_ids));
+            w.push((true, self.bulk_chunk_base + c * self.chunk_bulk_ids, self.chunk_bulk_ids));
+        }
+        for i in 0..self.num_primes {
+            w.push((false, self.solo_extract_base + i as u64 * self.ex_solo_ids, self.ex_solo_ids));
+            w.push((true, self.bulk_extract_base + i as u64 * self.ex_bulk_ids, self.ex_bulk_ids));
+            w.push((true, self.prime_nonce_bases[i], self.prime_window_sizes[i]));
+        }
+        w
+    }
+}
+
+#[cfg(test)]
+mod nonce_layout_tests {
+    use super::*;
+
+    /// Def-4 freshness rests on this partition: colliding windows would still
+    /// decode correctly (both parties share the layout), so no output test
+    /// can catch a regression — this test is the guard. It pins, per domain,
+    /// that every reserved window is pairwise disjoint, that kernel bulk ids
+    /// respect the `[0, 2^32)` switch-group reservation, and that everything
+    /// stays below the bit-63 domain flag.
+    #[test]
+    fn test_kernel_nonce_windows_disjoint() {
+        use crate::crt::bigint::FIRST_80_PRIMES;
+        for (primes, n, s_dim) in [
+            (&FIRST_80_PRIMES[..], 256u32, 1536usize),
+            (&FIRST_80_PRIMES[..], 64, 257),
+            (&FIRST_80_PRIMES[..], 33, 1),
+            (&[2u64][..], 8, 129),
+            (&[2u64, 3, 409][..], 16, 128),
+            (&[409u64][..], 12, 5),
+        ] {
+            let params = CrtParams::from_primes(primes, n);
+            let sub_widths = compute_sub_widths(params.ell, MAX_SUB_CHUNK_WIDTH);
+            if sub_widths.iter().any(|&w| w < 2) {
+                continue; // width-1 shapes are kernel-rejected
+            }
+            let nw = KernelNonceLayout::new(&params, s_dim, &sub_widths);
+            for bulk in [false, true] {
+                let mut ws: Vec<(u64, u64)> = nw
+                    .windows()
+                    .iter()
+                    .filter(|w| w.0 == bulk && w.2 > 0)
+                    .map(|w| (w.1, w.2))
+                    .collect();
+                ws.sort_unstable();
+                for pair in ws.windows(2) {
+                    assert!(
+                        pair[0].0 + pair[0].1 <= pair[1].0,
+                        "overlapping {} windows {:?} / {:?} (primes={:?} n={n} s={s_dim})",
+                        if bulk { "bulk" } else { "solo" },
+                        pair[0],
+                        pair[1],
+                        primes
+                    );
+                }
+                let (last_base, last_len) = *ws.last().unwrap();
+                assert!(last_base + last_len < (1u64 << 63), "domain-flag overflow");
+                if bulk {
+                    assert!(
+                        ws[0].0 >= KERNEL_NONCE_FLOOR,
+                        "kernel bulk ids must stay above the switch-group reservation"
+                    );
+                }
+            }
+        }
+    }
 }

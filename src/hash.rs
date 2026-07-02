@@ -267,16 +267,18 @@ mod tests {
 
     #[test]
     fn test_solo_bulk_no_collision() {
-        // Solo with gid g and bulk with group_id g should not collide
-        // (the high bit in `domain` distinguishes them).
+        // Solo with gid g and bulk with group_id g must not collide (the
+        // high bit in `domain` distinguishes them). Compare 32 bits so the
+        // false-failure probability is ~2^-32 (an 8-bit compare flaked at
+        // ~0.4% per run).
         let s = rand_ctrl();
-        let solo = hash_solo(&s, 7, false, 256);
-        let bulk = hash_bulk(&s, 7, 8);
+        let solo = hash_solo(&s, 7, false, 1 << 32);
+        let bulk = hash_bulk(&s, 7, 32);
         let solo_rep = match solo {
             Label::Ncf(n) => n.rep,
             _ => panic!(),
         };
-        let bulk_rep = bulk[0] as u64;
+        let bulk_rep = u32::from_le_bytes(bulk[..4].try_into().unwrap()) as u64;
         assert_ne!(solo_rep, bulk_rep);
     }
 

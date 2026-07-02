@@ -72,8 +72,10 @@ fn wide_label(w: &Wide, modulus: u64) -> Label {
 ///
 /// The lane ops run UNMASKED: wrapping u32 arithmetic is a ring homomorphism
 /// onto Z_{2^l} under truncation, so the `& (2^l − 1)` happens once at the
-/// boundaries ([`wide_label`], diff emission, the peel shifts, [`peel_bit`])
-/// instead of on every op.
+/// boundaries that make wire objects canonical ([`wide_label`], the pin
+/// emission, and the Z₂ packing of bits below the preserved width — the peel
+/// shifts and [`peel_bit`] masks are defensive, not load-bearing) instead of
+/// on every op.
 #[inline]
 fn wide_add(dst: &mut Wide, src: &Wide) {
     for (d, s) in dst.iter_mut().zip(src) {
@@ -364,6 +366,13 @@ pub fn extract_batch_garble(
 ) -> ExtractGarbleOutput {
     assert_sub_widths(sub_widths);
     let ell = chunk_word_masks[0].as_cf().k();
+    assert_eq!(
+        sub_widths.iter().sum::<u32>(),
+        ell,
+        "sub-chunk widths must sum to the chunk-word width (the System \
+         reference asserts this too)"
+    );
+    debug_assert!(chunk_word_masks.iter().all(|m| m.as_cf().k() == ell));
     let mask_ell = ((1u64 << ell) - 1) as u32;
     let d2 = {
         let d = delta_r(delta, 2);
@@ -476,6 +485,13 @@ pub fn extract_batch_eval(
 ) -> (Vec<Label>, Vec<Label>) {
     assert_sub_widths(sub_widths);
     let ell = chunk_word_labels[0].as_cf().k();
+    assert_eq!(
+        sub_widths.iter().sum::<u32>(),
+        ell,
+        "sub-chunk widths must sum to the chunk-word width"
+    );
+    assert_eq!(diffs.len(), sub_widths.len(), "one SubChunkDiffs per sub-chunk");
+    debug_assert!(chunk_word_labels.iter().all(|m| m.as_cf().k() == ell));
     let mask_ell = ((1u64 << ell) - 1) as u32;
 
     let mut rem = [0u32; LAMBDA];
@@ -704,6 +720,10 @@ pub fn chunk_batch_garble(
     nonce_solo: u64,
 ) -> ChunkGarbleOutput {
     let nb = bit_masks.len() as u32;
+    assert!(
+        (2..=31).contains(&ell) && ell >= nb,
+        "chunk kernel requires 2 <= nb <= ell <= 31 (got nb={nb}, ell={ell})"
+    );
     let mask_l = ((1u64 << ell) - 1) as u32;
     let d2 = {
         let d = delta_r(delta, 2);
@@ -757,6 +777,10 @@ pub fn chunk_batch_eval(
     nonce_solo: u64,
 ) -> Label {
     let nb = bit_labels.len() as u32;
+    assert!(
+        (2..=31).contains(&ell) && ell >= nb,
+        "chunk kernel requires 2 <= nb <= ell <= 31 (got nb={nb}, ell={ell})"
+    );
 
     // Tree: expand every level; the hot slot solves through the scale join.
     let b0 = z2_of(&bit_labels[0]);
@@ -844,6 +868,8 @@ mod tests {
 
         let bit_masks: Vec<Label> = (0..nb).map(|_| rand_z2(&mut rng)).collect();
         let g = chunk_batch_garble(&bit_masks, ell, delta, 5_000, 9_000);
+        let lim = 1u32 << ell;
+        assert!(g.pin.iter().all(|&lane| lane < lim), "pin lane not canonical");
         assert_eq!(g.cost.join_complexity_cf as u32, nb - 1 + ell);
         assert_eq!(
             g.cost.hash_count_cf as u64,
@@ -897,6 +923,11 @@ mod tests {
             let (bulk_n, solo_n) = extract_kernel_nonces(&sub_widths);
 
             let g = extract_batch_garble(&word_masks, &coeffs, &sub_widths, delta, 100, 200);
+            // Emitted material must be canonical: every pin lane < 2^l.
+            for dd in &g.diffs {
+                let lim = 1u32 << dd.l;
+                assert!(dd.pin.iter().all(|&lane| lane < lim), "pin lane not canonical");
+            }
             let expect_cost: usize = {
                 let mut rb = ell;
                 sub_widths
