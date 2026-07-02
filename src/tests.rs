@@ -1154,6 +1154,14 @@ impl rand::RngCore for BenchRng {
 /// masks outside its per-stage timers). The switch side runs the kernel
 /// production path ([`crate::affine::build_s_aff_kernels`]).
 ///
+/// Workload boundary: the garbler STARTS from (a, b) over the field and the
+/// evaluator ENDS with a·x+b over the field — so the switch garble column
+/// includes CRT-encoding a, b into per-prime residues, and the switch eval
+/// column includes the Garner reconstruction of every component. (Garner
+/// setup is per-prime-set precompute, outside; statistical smudging of b is
+/// parameter preparation per the `build_s_aff_streaming` docs and excluded —
+/// it would add ~25-90 ms at S=76,800 depending on the μ-PRG.)
+///
 /// Run:
 ///   cargo test -r --lib bench_axb_comparison -- --ignored --nocapture
 /// Override via env: `N=256 S=1536 ITERS=30 WARMUP=5 cargo test -r ...`
@@ -1228,39 +1236,61 @@ fn bench_axb_comparison() {
     let params = CrtParams::from_primes(&FIRST_80_PRIMES, n);
     let a_vals: Vec<u64> = (0..s).map(|_| rng.random_range(0..1u64 << 48)).collect();
     let b_vals: Vec<u64> = (0..s).map(|_| rng.random_range(0..1u64 << 48)).collect();
-    let a_res: Vec<Vec<u64>> = params
-        .primes
-        .iter()
-        .map(|&pi| a_vals.iter().map(|&a| a % pi).collect())
-        .collect();
-    let b_res: Vec<Vec<u64>> = params
-        .primes
-        .iter()
-        .map(|&pi| b_vals.iter().map(|&b| b % pi).collect())
-        .collect();
+    let decoder = GarnerDecoder::new(&params.primes); // per-prime-set precompute
 
     let mut sw_g = Vec::with_capacity(iters);
     let mut sw_e = Vec::with_capacity(iters);
     let mut sw_t = Vec::with_capacity(iters);
     let (mut sw_cf, mut sw_ncf, mut sw_comm_bits) = (0usize, 0usize, 0usize);
+    let (mut sw_enc_ms, mut sw_dec_ms) = (0.0f64, 0.0f64);
     for it in 0..warmup + iters {
         let x_bits: Vec<u64> = (0..n as usize).map(|_| rng.random_range(0..2u64)).collect();
+
+        // Garbler-side CRT encode: (a, b) over the field -> per-prime residues.
+        let t = Instant::now();
+        let a_res: Vec<Vec<u64>> = params
+            .primes
+            .iter()
+            .map(|&pi| a_vals.iter().map(|&a| a % pi).collect())
+            .collect();
+        let b_res: Vec<Vec<u64>> = params
+            .primes
+            .iter()
+            .map(|&pi| b_vals.iter().map(|&b| b % pi).collect())
+            .collect();
+        let t_enc = t.elapsed().as_secs_f64();
+
         // The kernel driver samples input masks internally but outside its
         // per-stage timers, so garble/eval exclude label provisioning —
         // matching bit-decomp's untimed encode().
         let t = Instant::now();
         let (out, stats) =
             crate::affine::build_s_aff_kernels(&mut rng, &x_bits, &params, &a_res, &b_res);
-        let full = t.elapsed().as_secs_f64();
+        let core = t.elapsed().as_secs_f64();
         black_box(&out);
+
+        // Evaluator-side CRT decode: Garner-reconstruct every component to
+        // its field value.
+        let t = Instant::now();
+        let mut residues = vec![0u64; params.primes.len()];
+        for j in 0..s {
+            for (i, prime_outs) in out.iter().enumerate() {
+                residues[i] = prime_outs[j];
+            }
+            black_box(decoder.reconstruct(&residues));
+        }
+        let t_dec = t.elapsed().as_secs_f64();
+
         if it >= warmup {
-            sw_g.push(stats.garble_secs());
-            sw_e.push(stats.eval_secs());
-            sw_t.push(full);
+            sw_g.push(stats.garble_secs() + t_enc);
+            sw_e.push(stats.eval_secs() + t_dec);
+            sw_t.push(t_enc + core + t_dec);
             sw_cf = stats.hash_count_cf;
             sw_ncf = stats.hash_count_ncf;
             sw_comm_bits =
                 crate::label::LAMBDA * stats.join_complexity_cf + stats.join_complexity_ncf;
+            sw_enc_ms = t_enc * 1e3;
+            sw_dec_ms = t_dec * 1e3;
         }
     }
     let (swg_min, swg_med) = stats(sw_g);
@@ -1272,7 +1302,8 @@ fn bench_axb_comparison() {
     let mb = |bits: usize| bits as f64 / 8.0 / 1e6;
     let m = |x: usize| x as f64 / 1e6;
     eprintln!("\n========== a·x + b benchmark  (N={n}, S={s}, single-thread, release) ==========");
-    eprintln!("iters={iters}, warmup={warmup}; values are MEDIAN [MIN] ms; excludes a,b sampling & decode/verify\n");
+    eprintln!("iters={iters}, warmup={warmup}; values are MEDIAN [MIN] ms; switch garble incl. CRT-encode of a,b,");
+    eprintln!("switch eval incl. Garner reconstruction to field values; excludes a,b sampling & verify\n");
     eprintln!("{:<22}{:>17}{:>17}{:>17}", "approach", "garble", "eval", "garble+eval");
     eprintln!("{:-<73}", "");
     eprintln!(
@@ -1291,8 +1322,12 @@ fn bench_axb_comparison() {
         (swg_med + swe_med) / (bdg_med + bde_med)
     );
     eprintln!(
-        "\nswitch full run incl. input seeding: {:.2} [{:.2}] ms  (seed+garble+eval+other)",
+        "\nswitch full run: {:.2} [{:.2}] ms  (encode+seed+garble+eval+decode+other)",
         swt_med, swt_min
+    );
+    eprintln!(
+        "switch CRT split: encode a,b {:.1} ms (in garble col) | Garner reconstruct {:.1} ms (in eval col)",
+        sw_enc_ms, sw_dec_ms
     );
     eprintln!("\nhashes (CCRH 16-byte blocks, per party):");
     eprintln!(
@@ -1400,27 +1435,41 @@ fn bench_axb_network() {
     let params = CrtParams::from_primes(&FIRST_80_PRIMES, n);
     let a_vals: Vec<u64> = (0..s).map(|_| rng.random_range(0..1u64 << 48)).collect();
     let b_vals: Vec<u64> = (0..s).map(|_| rng.random_range(0..1u64 << 48)).collect();
-    let a_res: Vec<Vec<u64>> = params
-        .primes
-        .iter()
-        .map(|&pi| a_vals.iter().map(|&a| a % pi).collect())
-        .collect();
-    let b_res: Vec<Vec<u64>> = params
-        .primes
-        .iter()
-        .map(|&pi| b_vals.iter().map(|&b| b % pi).collect())
-        .collect();
+    let decoder = GarnerDecoder::new(&params.primes); // per-prime-set precompute
     let mut swg = Vec::with_capacity(iters);
     let mut swe = Vec::with_capacity(iters);
     let (mut sw_comm_bits, mut sw_cf, mut sw_ncf) = (0usize, 0usize, 0usize);
     for it in 0..warmup + iters {
         let x_bits: Vec<u64> = (0..n as usize).map(|_| rng.random_range(0..2u64)).collect();
+        // Garbler starts from (a, b) over the field: CRT encode is garble-side.
+        let t = Instant::now();
+        let a_res: Vec<Vec<u64>> = params
+            .primes
+            .iter()
+            .map(|&pi| a_vals.iter().map(|&a| a % pi).collect())
+            .collect();
+        let b_res: Vec<Vec<u64>> = params
+            .primes
+            .iter()
+            .map(|&pi| b_vals.iter().map(|&b| b % pi).collect())
+            .collect();
+        let t_enc = t.elapsed().as_secs_f64();
         let (out, stats) =
             crate::affine::build_s_aff_kernels(&mut rng, &x_bits, &params, &a_res, &b_res);
         black_box(&out);
+        // Evaluator ends with a·x+b over the field: Garner decode is eval-side.
+        let t = Instant::now();
+        let mut residues = vec![0u64; params.primes.len()];
+        for j in 0..s {
+            for (i, prime_outs) in out.iter().enumerate() {
+                residues[i] = prime_outs[j];
+            }
+            black_box(decoder.reconstruct(&residues));
+        }
+        let t_dec = t.elapsed().as_secs_f64();
         if it >= warmup {
-            swg.push(stats.garble_secs());
-            swe.push(stats.eval_secs());
+            swg.push(stats.garble_secs() + t_enc);
+            swe.push(stats.eval_secs() + t_dec);
             sw_comm_bits =
                 crate::label::LAMBDA * stats.join_complexity_cf + stats.join_complexity_ncf;
             sw_cf = stats.hash_count_cf;
