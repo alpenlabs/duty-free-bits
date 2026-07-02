@@ -1,7 +1,5 @@
-//! Kernel-path chunk conversion and sub-chunk extraction: the straight-line
-//! garble/eval of [`bin_to_word`](super::convert::bin_to_word) and
-//! [`sub_chunk_extract`](super::convert::sub_chunk_extract), bypassing the
-//! `System` (the [`super::fold`] pattern, extended to width-`l` wires).
+//! Chunk conversion and sub-chunk extraction: straight-line garble/eval over
+//! bare labels (the [`super::fold`] pattern, extended to width-`l` wires).
 //!
 //! Both kernels are built from the same two moves:
 //!
@@ -116,9 +114,9 @@ fn pack_lane_bit(lanes: &Wide, bit: u32) -> Z2 {
     out
 }
 
-/// CCRH pad of one width-`l` cast switch, unpacked to lanes: the kernel twin
-/// of [`hash::hash_solo`] for CF Z_{2^l} payloads on bare words. `nonce` is a
-/// solo-domain id (bit 63 clear), globally fresh.
+/// CCRH pad of one width-`l` cast switch, unpacked to lanes: the CF Z_{2^l}
+/// analogue of [`hash::hash_z2`] for wider payloads on bare words. `nonce` is
+/// a solo-domain id (bit 63 clear), globally fresh.
 fn hash_cast(ctrl: &Z2, nonce: u64, l: u32, out: &mut Wide) {
     debug_assert!(nonce < (1u64 << 63), "solo nonce uses the bulk-domain bit");
     debug_assert!((2..=32).contains(&l));
@@ -130,11 +128,101 @@ fn hash_cast(ctrl: &Z2, nonce: u64, l: u32, out: &mut Wide) {
     let mut buf = [0u8; 512 + 16];
     expand(seed, nonce, &mut buf[..words * 8]);
     #[cfg(target_arch = "aarch64")]
-    if super::arena::neon_unpack_ok(l as usize) {
-        super::arena::unpack_even_k_neon(&buf, l as usize, out);
+    if neon_unpack_ok(l as usize) {
+        unpack_even_k_neon(&buf, l as usize, out);
         return;
     }
-    super::arena::unpack_generic(&buf[..words * 8], l as usize, out);
+    unpack_generic(&buf[..words * 8], l as usize, out);
+}
+
+#[inline]
+fn lane_mask(k: u32) -> u32 {
+    if k >= 32 { u32::MAX } else { (1u32 << k) - 1 }
+}
+
+/// Scalar unpack of LAMBDA packed `k`-bit coordinates from little-endian
+/// bytes into u32 lanes (branchless two-word windows; cf. label.rs).
+fn unpack_generic(bytes: &[u8], k: usize, dst: &mut Wide) {
+    let mut padded = [0u64; LAMBDA * 32 / 64 + 1];
+    for (w, slot) in padded.iter_mut().enumerate().take(bytes.len() / 8) {
+        *slot = u64::from_le_bytes(bytes[w * 8..(w + 1) * 8].try_into().unwrap());
+    }
+    let mask = lane_mask(k as u32) as u64;
+    for (i, lane) in dst.iter_mut().enumerate() {
+        let bit = i * k;
+        let window = (padded[bit >> 6] as u128) | ((padded[(bit >> 6) + 1] as u128) << 64);
+        *lane = ((window >> (bit & 63)) as u64 & mask) as u32;
+    }
+}
+
+/// True iff [`unpack_even_k_neon`] handles width `k`: even (group bases stay
+/// byte-aligned) and every lane's `shift + k` fits the 32-bit gather window
+/// (this excludes exactly k = 30, whose lane-1 shift of 6 overflows it).
+#[cfg(target_arch = "aarch64")]
+fn neon_unpack_ok(k: usize) -> bool {
+    if !k.is_multiple_of(2) || !(2..=32).contains(&k) {
+        return false;
+    }
+    (0..4).all(|j| ((j * k) & 7) + k <= 32)
+}
+
+/// NEON unpack for even `k` (2 ≤ k ≤ 32): per 4-lane group, one unaligned
+/// 16-byte load at the group's (byte-aligned) base, a TBL byte-gather of each
+/// lane's 4-byte window, per-lane right shifts and a mask.
+///
+/// Even k makes every group base byte-aligned (`4k ≡ 0 (mod 8)`), so the
+/// gather indices and shifts are group-invariant. `scratch` must be at least
+/// `(124·k)/8 + 16` bytes (the 512-byte hash scratch always is for k ≤ 32);
+/// lane 3's window ends at byte 3k/8 + 4 ≤ 16 within each load.
+#[cfg(target_arch = "aarch64")]
+fn unpack_even_k_neon(scratch: &[u8], k: usize, dst: &mut Wide) {
+    use std::arch::aarch64::*;
+    debug_assert!(neon_unpack_ok(k));
+    assert!(
+        scratch.len() >= (124 * k) / 8 + 16,
+        "unpack scratch too short"
+    );
+
+    // Lane j of a group reads bytes (j·k)/8 .. +4, then shifts by (j·k) % 8.
+    let mut idx = [0u8; 16];
+    let mut shifts = [0i32; 4];
+    for j in 0..4 {
+        let bit = j * k;
+        for b in 0..4 {
+            idx[j * 4 + b] = ((bit >> 3) + b) as u8;
+        }
+        shifts[j] = -((bit & 7) as i32);
+    }
+    // SAFETY: NEON is part of the crate's aarch64 baseline (the CCRH core
+    // already requires it). All loads are in-bounds: group g loads 16 bytes
+    // at (g·4·k)/8 with g ≤ 31, bounded by the assert above.
+    unsafe {
+        let idx_v = vld1q_u8(idx.as_ptr());
+        let shift_v = vld1q_s32(shifts.as_ptr());
+        let mask_v = vdupq_n_u32(lane_mask(k as u32));
+        for g in 0..(LAMBDA / 4) {
+            let base = (g * 4 * k) >> 3;
+            let window = vld1q_u8(scratch.as_ptr().add(base));
+            let gathered = vreinterpretq_u32_u8(vqtbl1q_u8(window, idx_v));
+            let aligned = vshlq_u32(gathered, shift_v);
+            let lanes = vandq_u32(aligned, mask_v);
+            vst1q_u32(dst.as_mut_ptr().add(g * 4), lanes);
+        }
+    }
+}
+
+/// Sub-chunk widths for decomposing an `ell`-bit value, each at most
+/// `max_width` bits (greedy: `ell = 22, max = 8 → [8, 8, 6]`).
+pub fn compute_sub_widths(ell: u32, max_width: u32) -> Vec<u32> {
+    assert!(ell > 0 && max_width > 0);
+    let mut widths = vec![];
+    let mut remaining = ell;
+    while remaining > 0 {
+        let w = remaining.min(max_width);
+        widths.push(w);
+        remaining -= w;
+    }
+    widths
 }
 
 /// `bit i` of `sub − res` as a Z₂ label: the peel step
@@ -835,6 +923,35 @@ mod tests {
     use super::*;
     use crate::label::{self, LAMBDA};
     use rand::Rng;
+
+    /// The NEON even-k unpacker must agree with the scalar window loop on
+    /// every width it claims (the cast pads flow through this).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_unpack_even_k_neon_matches_generic() {
+        let mut rng = rand::rng();
+        let mut scratch = vec![0u8; 512];
+        for round in 0..8 {
+            rng.fill(&mut scratch[..]);
+            for k in (2..=32).step_by(2).filter(|&k| neon_unpack_ok(k)) {
+                let bytes = (LAMBDA * k).div_ceil(64) * 8;
+                let mut want = [0u32; LAMBDA];
+                unpack_generic(&scratch[..bytes], k, &mut want);
+                let mut got = [0u32; LAMBDA];
+                unpack_even_k_neon(&scratch, k, &mut got);
+                assert_eq!(want, got, "k={k}, round={round}");
+            }
+            assert!(!neon_unpack_ok(30) && !neon_unpack_ok(7));
+        }
+    }
+
+    #[test]
+    fn test_compute_sub_widths() {
+        assert_eq!(compute_sub_widths(22, 8), vec![8, 8, 6]);
+        assert_eq!(compute_sub_widths(16, 8), vec![8, 8]);
+        assert_eq!(compute_sub_widths(3, 8), vec![3]);
+        assert_eq!(compute_sub_widths(4, 1), vec![1, 1, 1, 1]);
+    }
 
     fn rand_z2(rng: &mut impl Rng) -> Label {
         let coords: Vec<u64> = (0..LAMBDA).map(|_| rng.random_range(0..2u64)).collect();
