@@ -1143,6 +1143,63 @@ impl rand::RngCore for BenchRng {
     }
 }
 
+/// BN254 base-field modulus q, little-endian limbs (mirror of the private
+/// `bitdecomp::P`); the switch side's smudge/decode arithmetic needs it.
+const BN254_Q: [u64; 4] = [
+    0x3c208c16d87cfd47,
+    0x97816a916871ca8d,
+    0xb85045b68181585d,
+    0x30644e72e131a029,
+];
+
+/// q mod p via limb-wise Horner (per-prime-set precompute).
+fn bn254_q_mod(p: u64) -> u64 {
+    let mut acc: u128 = 0;
+    for &limb in BN254_Q.iter().rev() {
+        acc = ((acc << 64) | limb as u128) % p as u128;
+    }
+    acc as u64
+}
+
+/// Reduce a Garner-reconstructed integer to the field: limb-wise Horner with
+/// 64 doublings per limb (`Fp` deliberately has no general multiply; a
+/// production decoder would Barrett-reduce, so this is the conservative,
+/// switch-side-pessimistic form).
+fn u576_mod_q(v: &U576) -> crate::bitdecomp::Fp {
+    use crate::bitdecomp::Fp;
+    let top = v.0.iter().rposition(|&l| l != 0).unwrap_or(0);
+    let mut acc = Fp::zero();
+    for &limb in v.0[..=top].iter().rev() {
+        for _ in 0..64 {
+            acc = acc.double();
+        }
+        acc = acc.add(Fp::from_u64(limb));
+    }
+    acc
+}
+
+#[test]
+fn test_u576_mod_q_helper() {
+    use crate::bitdecomp::Fp;
+    // Small values are fixed points.
+    assert_eq!(u576_mod_q(&U576::from_u64(12345)), Fp::from_u64(12345));
+    // q itself reduces to zero; q + 7 to 7 (low limb addition cannot carry).
+    let mut q = [0u64; 9];
+    q[..4].copy_from_slice(&BN254_Q);
+    assert_eq!(u576_mod_q(&U576(q)), Fp::zero());
+    let mut q7 = q;
+    q7[0] += 7;
+    assert_eq!(u576_mod_q(&U576(q7)), Fp::from_u64(7));
+    // 2^256 mod q cross-checked against the same Horner done limb-free.
+    let mut two256 = [0u64; 9];
+    two256[4] = 1;
+    let mut acc = Fp::from_u64(1);
+    for _ in 0..256 {
+        acc = acc.double();
+    }
+    assert_eq!(u576_mod_q(&U576(two256)), acc);
+}
+
 /// Final head-to-head benchmark: switch system (CRT) vs the bit-decomposition
 /// baseline ([`crate::bitdecomp`]) on the SAME `a·x+b` workload, on identical
 /// footing — single-threaded, release, warmup + ITERS iterations, MEDIAN [MIN]
@@ -1154,13 +1211,16 @@ impl rand::RngCore for BenchRng {
 /// masks outside its per-stage timers). The switch side runs the kernel
 /// production path ([`crate::affine::build_s_aff_kernels`]).
 ///
-/// Workload boundary: the garbler STARTS from (a, b) over the field and the
-/// evaluator ENDS with a·x+b over the field — so the switch garble column
-/// includes CRT-encoding a, b into per-prime residues, and the switch eval
-/// column includes the Garner reconstruction of every component. (Garner
-/// setup is per-prime-set precompute, outside; statistical smudging of b is
-/// parameter preparation per the `build_s_aff_streaming` docs and excluded —
-/// it would add ~25-90 ms at S=76,800 depending on the μ-PRG.)
+/// Workload boundary: available are field elements (a, b) and input labels;
+/// required output is a·x+b as field elements. The switch garble column
+/// therefore includes statistical smudging (fresh 64-bit μ per component,
+/// b\' = b + μ·q with residues derived directly as (b + μ·q) mod p — the big
+/// integer is never materialized) plus CRT-encoding a, b\' into per-prime
+/// residues; the switch eval column includes Garner reconstruction AND the
+/// reduction mod q to the field element (double-based Horner — conservative;
+/// a Barrett reduction would shrink it). Garner setup and q mod p tables are
+/// per-prime-set precompute, outside, like bit-decomp\'s compile-time
+/// constants.
 ///
 /// Run:
 ///   cargo test -r --lib bench_axb_comparison -- --ignored --nocapture
@@ -1237,6 +1297,7 @@ fn bench_axb_comparison() {
     let a_vals: Vec<u64> = (0..s).map(|_| rng.random_range(0..1u64 << 48)).collect();
     let b_vals: Vec<u64> = (0..s).map(|_| rng.random_range(0..1u64 << 48)).collect();
     let decoder = GarnerDecoder::new(&params.primes); // per-prime-set precompute
+    let q_mod_p: Vec<u64> = params.primes.iter().map(|&p| bn254_q_mod(p)).collect();
 
     let mut sw_g = Vec::with_capacity(iters);
     let mut sw_e = Vec::with_capacity(iters);
@@ -1246,8 +1307,10 @@ fn bench_axb_comparison() {
     for it in 0..warmup + iters {
         let x_bits: Vec<u64> = (0..n as usize).map(|_| rng.random_range(0..2u64)).collect();
 
-        // Garbler-side CRT encode: (a, b) over the field -> per-prime residues.
+        // Garbler-side smudge + CRT encode: fresh μ per component,
+        // b\' = b + μ·q, residues of a and b\' derived directly mod each prime.
         let t = Instant::now();
+        let mus: Vec<u64> = (0..s).map(|_| rng.random()).collect();
         let a_res: Vec<Vec<u64>> = params
             .primes
             .iter()
@@ -1256,7 +1319,15 @@ fn bench_axb_comparison() {
         let b_res: Vec<Vec<u64>> = params
             .primes
             .iter()
-            .map(|&pi| b_vals.iter().map(|&b| b % pi).collect())
+            .enumerate()
+            .map(|(pi_idx, &pi)| {
+                let qp = q_mod_p[pi_idx];
+                b_vals
+                    .iter()
+                    .zip(&mus)
+                    .map(|(&b, &mu)| (b % pi + (mu % pi) * qp) % pi)
+                    .collect()
+            })
             .collect();
         let t_enc = t.elapsed().as_secs_f64();
 
@@ -1269,15 +1340,16 @@ fn bench_axb_comparison() {
         let core = t.elapsed().as_secs_f64();
         black_box(&out);
 
-        // Evaluator-side CRT decode: Garner-reconstruct every component to
-        // its field value.
+        // Evaluator-side CRT decode: Garner-reconstruct the (smudged)
+        // integer, then reduce mod q to the field element.
         let t = Instant::now();
         let mut residues = vec![0u64; params.primes.len()];
         for j in 0..s {
             for (i, prime_outs) in out.iter().enumerate() {
                 residues[i] = prime_outs[j];
             }
-            black_box(decoder.reconstruct(&residues));
+            let v = decoder.reconstruct(&residues);
+            black_box(u576_mod_q(&v));
         }
         let t_dec = t.elapsed().as_secs_f64();
 
@@ -1302,8 +1374,8 @@ fn bench_axb_comparison() {
     let mb = |bits: usize| bits as f64 / 8.0 / 1e6;
     let m = |x: usize| x as f64 / 1e6;
     eprintln!("\n========== a·x + b benchmark  (N={n}, S={s}, single-thread, release) ==========");
-    eprintln!("iters={iters}, warmup={warmup}; values are MEDIAN [MIN] ms; switch garble incl. CRT-encode of a,b,");
-    eprintln!("switch eval incl. Garner reconstruction to field values; excludes a,b sampling & verify\n");
+    eprintln!("iters={iters}, warmup={warmup}; values are MEDIAN [MIN] ms; switch garble incl. smudge (64-bit mu)");
+    eprintln!("+ CRT-encode of a,b; switch eval incl. Garner + mod-q to field elements; excludes a,b sampling & verify\n");
     eprintln!("{:<22}{:>17}{:>17}{:>17}", "approach", "garble", "eval", "garble+eval");
     eprintln!("{:-<73}", "");
     eprintln!(
@@ -1326,7 +1398,7 @@ fn bench_axb_comparison() {
         swt_med, swt_min
     );
     eprintln!(
-        "switch CRT split: encode a,b {:.1} ms (in garble col) | Garner reconstruct {:.1} ms (in eval col)",
+        "switch CRT split: smudge+encode a,b {:.1} ms (in garble col) | Garner + mod-q {:.1} ms (in eval col)",
         sw_enc_ms, sw_dec_ms
     );
     eprintln!("\nhashes (CCRH 16-byte blocks, per party):");
@@ -1436,13 +1508,16 @@ fn bench_axb_network() {
     let a_vals: Vec<u64> = (0..s).map(|_| rng.random_range(0..1u64 << 48)).collect();
     let b_vals: Vec<u64> = (0..s).map(|_| rng.random_range(0..1u64 << 48)).collect();
     let decoder = GarnerDecoder::new(&params.primes); // per-prime-set precompute
+    let q_mod_p: Vec<u64> = params.primes.iter().map(|&p| bn254_q_mod(p)).collect();
     let mut swg = Vec::with_capacity(iters);
     let mut swe = Vec::with_capacity(iters);
     let (mut sw_comm_bits, mut sw_cf, mut sw_ncf) = (0usize, 0usize, 0usize);
     for it in 0..warmup + iters {
         let x_bits: Vec<u64> = (0..n as usize).map(|_| rng.random_range(0..2u64)).collect();
-        // Garbler starts from (a, b) over the field: CRT encode is garble-side.
+        // Garbler starts from (a, b) over the field: smudge + CRT encode
+        // are garble-side.
         let t = Instant::now();
+        let mus: Vec<u64> = (0..s).map(|_| rng.random()).collect();
         let a_res: Vec<Vec<u64>> = params
             .primes
             .iter()
@@ -1451,20 +1526,29 @@ fn bench_axb_network() {
         let b_res: Vec<Vec<u64>> = params
             .primes
             .iter()
-            .map(|&pi| b_vals.iter().map(|&b| b % pi).collect())
+            .enumerate()
+            .map(|(pi_idx, &pi)| {
+                let qp = q_mod_p[pi_idx];
+                b_vals
+                    .iter()
+                    .zip(&mus)
+                    .map(|(&b, &mu)| (b % pi + (mu % pi) * qp) % pi)
+                    .collect()
+            })
             .collect();
         let t_enc = t.elapsed().as_secs_f64();
         let (out, stats) =
             crate::affine::build_s_aff_kernels(&mut rng, &x_bits, &params, &a_res, &b_res);
         black_box(&out);
-        // Evaluator ends with a·x+b over the field: Garner decode is eval-side.
+        // Evaluator ends with a·x+b over the field: Garner + mod-q is eval-side.
         let t = Instant::now();
         let mut residues = vec![0u64; params.primes.len()];
         for j in 0..s {
             for (i, prime_outs) in out.iter().enumerate() {
                 residues[i] = prime_outs[j];
             }
-            black_box(decoder.reconstruct(&residues));
+            let v = decoder.reconstruct(&residues);
+            black_box(u576_mod_q(&v));
         }
         let t_dec = t.elapsed().as_secs_f64();
         if it >= warmup {
