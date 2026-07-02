@@ -26,7 +26,7 @@ fn rng() -> impl Rng {
 
 /// Assert the streaming pipeline computes `a_j·x + b_j (mod p_i)` for every prime
 /// and component, against a direct known-answer oracle (the streaming pipeline is
-/// the production path; this needs no reference implementation).
+/// the reference implementation the kernel path is tested against).
 fn assert_s_aff_streaming_correct(
     params: &CrtParams,
     a_vals: &[u64],
@@ -945,7 +945,7 @@ fn bench_primitives() {
 #[test]
 #[ignore]
 fn bench_stream_loop() {
-    // Repeats the production stream so a sampling profiler has a long window.
+    // Repeats the reference-path stream so a sampling profiler has a long window.
     // Run: N=256 S=1536 REPS=30 cargo test --release bench_stream_loop -- --ignored --nocapture
     let n: u32 = std::env::var("N")
         .unwrap_or_else(|_| "256".into())
@@ -1597,8 +1597,8 @@ fn bench_axb_hashcounts() {
 // ==================== the kernel-only path ====================
 
 /// Kernel-path analogue of [`assert_s_aff_streaming_correct`]: known-answer
-/// check plus a differential against the System-phase path on the SAME
-/// (a, b, x) inputs.
+/// check against the direct oracle (the System-path differential lives in
+/// `test_s_aff_kernels_matches_streaming`).
 fn assert_s_aff_kernels_correct(
     params: &CrtParams,
     a_vals: &[u64],
@@ -1678,8 +1678,7 @@ fn test_s_aff_kernels_matches_streaming() {
         .collect();
 
     for _ in 0..3 {
-        let x: u64 = rng.random();
-        let input_bits: Vec<u64> = (0..n).map(|j| ((x >> (j % 64)) >> 0) & 1).collect();
+        let input_bits: Vec<u64> = (0..n).map(|_| rng.random_range(0..2u64)).collect();
 
         let (kernel_out, stats) = crate::affine::build_s_aff_kernels(
             &mut rng,
@@ -1704,11 +1703,18 @@ fn test_s_aff_kernels_matches_streaming() {
         );
 
         assert_eq!(kernel_out, stream_out, "kernel vs streaming outputs differ");
-        // Ledger parity: identical circuits, identical cost accounting.
+        // Ledger parity: the two paths build cost-identical circuit
+        // equivalents (labels, masks, and nonce layouts differ by
+        // construction — only decoded outputs and the ledger must agree).
         assert_eq!(stats.hash_count_cf, pipeline.hash_count_cf);
         assert_eq!(stats.hash_count_ncf, pipeline.hash_count_ncf);
         assert_eq!(stats.join_complexity_cf, pipeline.join_complexity_cf);
         assert_eq!(stats.join_complexity_ncf, pipeline.join_complexity_ncf);
+        // Both garblers hash every switch (x-blind), so the measured
+        // per-party block counts agree exactly too (kernel G == streaming G
+        // == cf + ncf ledger) — but the `count-hashes` counter is
+        // process-global and races with parallel tests, so that equality is
+        // only checked in the single-run benches, not asserted here.
     }
 }
 
@@ -1786,4 +1792,28 @@ fn bench_kernel_loop() {
         1e3 * per_rep,
         100.0 * (agg.garble_secs() + agg.eval_secs()) / r / per_rep,
     );
+}
+
+#[test]
+fn test_s_aff_kernels_edge_regimes() {
+    // Kernel-path twin of test_streaming_edge_regimes, minus the width-1
+    // trailing sub-chunk (ell ≡ 1 mod 8), which the kernel path rejects by
+    // design (covered by test_extract_kernel_rejects_width1; use the
+    // reference path for those shapes).
+    let mut rng = rng();
+
+    // p > 2^first_width and p = 2 alone, one odd prime, short padded chunk.
+    for primes in [&[2u64][..], &[409][..], &[2, 3, 5, 7, 401, 409][..]] {
+        let params = CrtParams::from_primes(primes, 16);
+        let a = vec![rng.random_range(0..1u64 << 30)];
+        let b = vec![rng.random_range(0..1u64 << 30)];
+        let x = rng.random_range(0..1u64 << 16);
+        assert_s_aff_kernels_correct(&params, &a, &b, x, &mut rng);
+    }
+    // Single sub-chunk (ell <= 8): tiny prime set keeps the sum small.
+    let params = CrtParams::from_primes(&[3u64, 5], 4);
+    assert!(params.ell <= 8, "want a single-sub-chunk regime");
+    for x in 0..16u64 {
+        assert_s_aff_kernels_correct(&params, &[7], &[11], x, &mut rng);
+    }
 }

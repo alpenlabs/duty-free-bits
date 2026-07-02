@@ -202,6 +202,19 @@ pub fn chunk_kernel_nonces(n_bits: u32) -> (u64, u64) {
     (tree_ids(n_bits), 1u64 << n_bits)
 }
 
+/// The extract kernels' lane machinery represents width-`l` wires as u32
+/// lanes, so every sub-chunk width must be in `2..=31`; a width-1 trailing
+/// sub-chunk (`ell ≡ 1 mod 8` under `compute_sub_widths(·, 8)`) is NOT
+/// supported here — the `System` reference path handles it. Rejected loudly
+/// in release builds too.
+fn assert_sub_widths(sub_widths: &[u32]) {
+    assert!(
+        sub_widths.iter().all(|&w| (2..=31).contains(&w)),
+        "extract kernel requires sub-chunk widths in 2..=31 (got {sub_widths:?}); \
+         width-1 trailing sub-chunks are only supported on the System reference path"
+    );
+}
+
 /// (bulk ids, solo ids) consumed by one extract kernel.
 pub fn extract_kernel_nonces(sub_widths: &[u32]) -> (u64, u64) {
     let mut bulk = 0;
@@ -349,6 +362,7 @@ pub fn extract_batch_garble(
     nonce_bulk: u64,
     nonce_solo: u64,
 ) -> ExtractGarbleOutput {
+    assert_sub_widths(sub_widths);
     let ell = chunk_word_masks[0].as_cf().k();
     let mask_ell = ((1u64 << ell) - 1) as u32;
     let d2 = {
@@ -460,6 +474,7 @@ pub fn extract_batch_eval(
     nonce_bulk: u64,
     nonce_solo: u64,
 ) -> (Vec<Label>, Vec<Label>) {
+    assert_sub_widths(sub_widths);
     let ell = chunk_word_labels[0].as_cf().k();
     let mask_ell = ((1u64 << ell) - 1) as u32;
 
@@ -809,13 +824,21 @@ mod tests {
         Label::Cf(CfLabel::from_coords(&coords, modulus))
     }
 
-    /// Chunk kernel: word label = word mask + v·Δ for every value.
+    /// Chunk kernel: word label = word mask + v·Δ for every value, at the
+    /// production shape (nb = 8, ell = 22) and a small one.
+    #[test]
+    fn test_chunk_kernel_label_mask_invariant_production() {
+        chunk_invariant_shape(8, 22);
+    }
+
     #[test]
     fn test_chunk_kernel_label_mask_invariant() {
+        chunk_invariant_shape(4, 12);
+    }
+
+    fn chunk_invariant_shape(nb: u32, ell: u32) {
         let mut rng = rand::rng();
         let delta: u128 = rng.random::<u128>() | 1;
-        let ell = 12u32;
-        let nb = 4u32;
         let d2 = Label::Cf(delta_r(delta, 2));
         let dl = Label::Cf(delta_r(delta, 1u64 << ell));
 
@@ -841,8 +864,19 @@ mod tests {
                 .collect();
             let w = chunk_batch_eval(&bit_labels, v, ell, &g.scale, &g.pin, 5_000, 9_000);
             let expect = label::add(&g.word_mask, &label::scalar_mul(v, &dl));
-            assert_eq!(w, expect, "chunk word label ≠ mask + v·Δ for v={v}");
+            assert_eq!(w, expect, "chunk word label ≠ mask + v·Δ for v={v} nb={nb} ell={ell}");
         }
+    }
+
+    /// The extract kernels reject width-1 sub-chunks loudly (the reference
+    /// path handles them; the kernel lane machinery requires widths ≥ 2).
+    #[test]
+    #[should_panic(expected = "sub-chunk widths in 2..=31")]
+    fn test_extract_kernel_rejects_width1() {
+        let mut rng = rand::rng();
+        let delta: u128 = rng.random::<u128>() | 1;
+        let masks = vec![rand_wide(&mut rng, 1 << 9)];
+        let _ = extract_batch_garble(&masks, &[1], &[8, 1], delta, 0, 0);
     }
 
     /// Extract kernel: OHE labels + fold-bit labels satisfy the carry
@@ -944,7 +978,6 @@ mod micro {
         let reps = 80 * 30; // 80 primes × 30 reps, i.e. "per bench_kernel_loop run"
         let ctrl: Z2 = [0x1234_5678_9ABC_DEF0, 0x0FED_CBA9_8765_4321];
         let mut cast = [7u32; LAMBDA];
-        let mask22 = (1u32 << 22) - 1;
 
         // 1. Cast hashing: (256 @ l=22) + (256 @ l=14) + (64 @ l=6).
         let t = Instant::now();

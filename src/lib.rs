@@ -15,7 +15,8 @@
 //! * [`hash`] — the label-aware CCRH built atop `crypto`.
 //! * [`system`] + [`comp_gc`] — the computational Yao GC engine (Phase 1: `bin(x)` → hot(CRT(x))).
 //! * [`it_gc`] — the information-theoretic GC (Phase 3: hot(CRT(x)) → `a·x+b`).
-//! * [`affine`] — composes the two via the streaming [`pipeline`].
+//! * [`affine`] — composes the kernels into the production driver
+//!   (`build_s_aff_kernels`) and the streaming [`pipeline`] reference path.
 //! * [`bitdecomp`] — standalone switch-free `a·x+b` baseline for hash-count comparison.
 
 use mimalloc::MiMalloc;

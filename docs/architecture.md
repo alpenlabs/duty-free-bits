@@ -96,9 +96,9 @@ the evaluator derive values and labels together in one pass.
   `replay_with_labels` walks that journal to derive labels. Used for unkeyed
   (and the rare NCF) phases.
 
-In the reference workload every keyed phase is all-CF, so production garbling is
-`garble_recorded` (first of each shape) + `garble_compiled` (the rest), and
-production evaluation is `fused_eval_arena` — except the single `p_i = 2`
+In the reference workload every keyed phase is all-CF, so reference-path
+garbling is `garble_recorded` (first of each shape) + `garble_compiled` (the
+rest), and its evaluation is `fused_eval_arena` — except the single `p_i = 2`
 extract phase, which is unkeyed and uses `garble` + `Exec`/`replay_with_labels`
 (keying a one-off phase would only add record + compile overhead).
 
@@ -178,8 +178,9 @@ such runs.
 Per-stage split of the kernel path (ms/rep, garble + eval): body ≈ 19 (at its
 MAC floor: one multiply-accumulate per (slot, member), ~46 M per rep across
 both parties), extract ≈ 9.5, fold ≈ 2, chunk ≈ 1.5. The extract/chunk/fold
-kernels sit near their AES-block + lane-op floors (a width-22 cast measures
-~45 ns against a ~30 ns AES floor); the remaining headroom is protocol-level
+kernels sit near their AES-block + lane-op floors (a cast measures ~46 ns
+averaged over the production widths, against a ~29 ns AES floor at the same
+mix); the remaining headroom is protocol-level
 (fewer MACs/hashes) or cross-prime parallelism, not execution machinery.
 
 > Measure with hardware counters, not wall time — the M1 throttles under
@@ -268,7 +269,7 @@ per-stage split), `bench_stream_loop` (reference path), `bench_extract_micro`
    (and schedule recording) and the journal evaluator.
 6. [`comp_gc/extract.rs`](../src/comp_gc/extract.rs),
    [`comp_gc/fold.rs`](../src/comp_gc/fold.rs),
-   [`it_gc.rs`](../src/it_gc.rs) — the two straight-line kernels.
+   [`it_gc.rs`](../src/it_gc.rs) — the four straight-line kernels.
 7. [`comp_gc/arena.rs`](../src/comp_gc/arena.rs) — flat storage, the compiled
    garbler, the fused evaluator.
 8. [`pipeline.rs`](../src/pipeline.rs) — phase orchestration and the

@@ -44,7 +44,8 @@ const MAX_SUB_CHUNK_WIDTH: u32 = 8;
 /// per-phase peak wires low.
 const RESIDUE_BATCH_SIZE: usize = 128;
 
-/// First bulk-domain CCRH id available to the kernels (body + fold).
+/// First bulk-domain CCRH id available to the kernels (body + fold; the
+/// chunk/extract tree hashes allocate above their windows).
 ///
 /// `[0, 2^32)` is reserved for in-System NCF switch-group indices
 /// ([`crate::system::System::register_ncf_switch_group`]), which share the
@@ -417,9 +418,12 @@ impl KernelStats {
 /// knows `x_bits` (switch-private / data-public), so every derivation order is
 /// closed-form.
 ///
-/// Semantics, inputs, and the smudging caveat are exactly those of
+/// Semantics, inputs, and the smudging caveat are those of
 /// [`build_s_aff_streaming`]; the two are differentially tested to produce
-/// identical decoded outputs.
+/// identical decoded outputs. One parameter restriction: the extract kernels
+/// require every sub-chunk width in `2..=31`, so shapes with a width-1
+/// trailing sub-chunk (`ell ≡ 1 mod 8`, e.g. n = 26..=32 with the 80-prime
+/// set) are rejected loudly — use the reference path for those.
 pub fn build_s_aff_kernels<R: rand::Rng>(
     rng: &mut R,
     x_bits: &[u64],
@@ -435,6 +439,10 @@ pub fn build_s_aff_kernels<R: rand::Rng>(
     assert_eq!(a_residues.len(), params.num_primes);
     assert_eq!(b_residues.len(), params.num_primes);
     let s_dim = a_residues[0].len();
+    for i in 0..params.num_primes {
+        assert_eq!(a_residues[i].len(), s_dim);
+        assert_eq!(b_residues[i].len(), s_dim);
+    }
 
     let ell = params.ell;
     let chunk_size = params.chunk_size as usize;
@@ -473,6 +481,10 @@ pub fn build_s_aff_kernels<R: rand::Rng>(
     assert!(
         bulk_extract_base + params.num_primes as u64 * ex_bulk_ids < (1u64 << 63),
         "kernel CCRH nonce space exhausted"
+    );
+    assert!(
+        solo_extract_base + params.num_primes as u64 * ex_solo_ids < (1u64 << 63),
+        "kernel solo-domain nonce space exhausted"
     );
 
     // ---- Input bits: masks sampled, labels = mask + bit·Δ₂. ----

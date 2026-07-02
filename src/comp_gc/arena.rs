@@ -1265,7 +1265,7 @@ mod tests {
         }
     }
 
-    /// The production execution paths — compiled garbling and fused
+    /// The reference-path fast engines — compiled garbling and fused
     /// value+label evaluation — must agree bit-for-bit with the `Label`-path
     /// engines (worklist [`garble`], journal [`replay_with_labels`]) on the
     /// real header circuitry (the fused word_to_bin_up class-tree bootstrap,
