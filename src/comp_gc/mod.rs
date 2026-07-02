@@ -13,6 +13,7 @@
 pub(crate) mod arena;
 pub mod convert;
 pub mod evaluator;
+pub mod extract;
 pub mod fold;
 pub mod garbler;
 pub mod ohe;

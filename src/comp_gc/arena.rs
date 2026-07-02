@@ -424,7 +424,7 @@ fn lane_mask(k: u32) -> u32 {
 
 /// Scalar unpack of LAMBDA packed `k`-bit coordinates from little-endian
 /// bytes into u32 lanes (branchless two-word windows; cf. label.rs).
-fn unpack_generic(bytes: &[u8], k: usize, dst: &mut [u32; LAMBDA]) {
+pub(crate) fn unpack_generic(bytes: &[u8], k: usize, dst: &mut [u32; LAMBDA]) {
     let mut padded = [0u64; LAMBDA * 32 / 64 + 1];
     for (w, slot) in padded.iter_mut().enumerate().take(bytes.len() / 8) {
         *slot = u64::from_le_bytes(bytes[w * 8..(w + 1) * 8].try_into().unwrap());
@@ -441,7 +441,7 @@ fn unpack_generic(bytes: &[u8], k: usize, dst: &mut [u32; LAMBDA]) {
 /// byte-aligned) and every lane's `shift + k` fits the 32-bit gather window
 /// (this excludes exactly k = 30, whose lane-1 shift of 6 overflows it).
 #[cfg(target_arch = "aarch64")]
-fn neon_unpack_ok(k: usize) -> bool {
+pub(crate) fn neon_unpack_ok(k: usize) -> bool {
     if !k.is_multiple_of(2) || !(2..=32).contains(&k) {
         return false;
     }
@@ -457,7 +457,7 @@ fn neon_unpack_ok(k: usize) -> bool {
 /// `(124·k)/8 + 16` bytes (the 512-byte hash scratch always is for k ≤ 32);
 /// lane 3's window ends at byte 3k/8 + 4 ≤ 16 within each load.
 #[cfg(target_arch = "aarch64")]
-fn unpack_even_k_neon(scratch: &[u8], k: usize, dst: &mut [u32; LAMBDA]) {
+pub(crate) fn unpack_even_k_neon(scratch: &[u8], k: usize, dst: &mut [u32; LAMBDA]) {
     use std::arch::aarch64::*;
     debug_assert!(neon_unpack_ok(k));
     assert!(

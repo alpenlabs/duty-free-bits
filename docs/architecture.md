@@ -14,50 +14,51 @@ The reference workload is `N = 256`, `S = 6·256 = 1536` affine maps.
 
 ---
 
-## 1. The streaming pipeline
+## 1. The production path: four straight-line kernels
 
-Garbling the whole computation as one circuit would hold every wire's mask and
-label in memory at once. Instead [`Pipeline`](../src/pipeline.rs) runs it as a
-sequence of **phases**, each a small self-contained `System` (the gate graph):
+`build_s_aff_kernels` ([`src/affine.rs`](../src/affine.rs)) runs the whole
+computation as four straight-line kernels over bare label words — **no
+`System`, no `Pipeline`, no worklist anywhere on the production path**. The
+evaluator knows `x` (switch-private / data-public), so every derivation order
+is closed-form: the garbler's pass is x-blind and level-major (hash every
+slot), the evaluator hashes only closed switches and solves each hot slot
+through a join.
 
-1. Allocate a `System` (buffers are pooled and reused across phases).
-2. Bind a small carry-forward set of `(mask, label, value)` triples from
-   earlier phases as the phase's input wires.
-3. Build the phase's gates.
-4. Garble and evaluate the phase.
-5. Keep only the `(mask, label, value)` of the wires the phase declares as
-   outputs; drop the rest.
-
-Peak memory is therefore the largest single phase plus the carry set, not the
-whole computation. The Free-XOR offset `Δ` is global.
-
-`build_s_aff_streaming` ([`src/affine.rs`](../src/affine.rs)) lays out the
-phases:
-
-* **Chunk conversion** — one phase per input chunk, turning `lg n` input bits
-  into a ring word `w_c ∈ Z_{2^ℓ}` (`bin_to_word`).
+* **Chunk kernel** ([`comp_gc::extract`](../src/comp_gc/extract.rs)) — one
+  per input chunk: the straight-line `bin_to_word` (one-hot doubling tree
+  over the chunk's bits, width-ℓ casts, pin join, `Σ p·A_p`).
 * **Per prime `p_i`:**
-  * **Extract** (a `System` phase) — accumulate `r_i = Σ_c coeff_c · w_c` and
-    decompose it with `sub_chunk_extract`.
-  * **Fold kernel** — fold the sub-chunk one-hots into the length-`p_i` one-hot
-    `h_p` of `x mod p_i` ([`comp_gc::fold`](../src/comp_gc/fold.rs)).
+  * **Extract kernel** ([`comp_gc::extract`](../src/comp_gc/extract.rs)) —
+    `r_i = Σ_c coeff_c · w_c` in label space, then the fused `word_to_bin_up`
+    schedule per sub-chunk: tree, width-`l` casts serving as bit-extraction
+    accumulators *and* the peel upcast, one pin join at the class-tree root.
+  * **Fold kernel** — fold the sub-chunk one-hots into the length-`p_i`
+    one-hot `h_p` of `x mod p_i` ([`comp_gc::fold`](../src/comp_gc/fold.rs)).
   * **Body kernel** — the information-theoretic GC: deliver `a·(x mod p_i) + b`
     from `h_p`, in `RESIDUE_BATCH_SIZE`-sized batches of the `S` maps
     ([`it_gc`](../src/it_gc.rs)).
 
-The two kernels (`fold`, `it_gc`) garble and evaluate their regular, all-Z₂ /
-all-NCF circuits as straight-line loops over bare label words, never building a
-`System`.
+Wires are `[u64; 2]` words (Z₂) and `[u32; λ]` lane arrays (width `l`); the
+hot lane loops run unmasked mod 2^32 (truncation to Z_{2^l} commutes) and
+masks are applied only at boundaries. Peak memory is a few label buffers per
+kernel (~8 MB for the reference workload). The Free-XOR offset `Δ` is global;
+masks/labels hand off directly between kernels.
+
+The `System`-phase path (`build_s_aff_streaming` via [`Pipeline`]
+(../src/pipeline.rs)) is retained as the reference implementation: the kernels
+are differentially tested against it for identical decoded outputs and an
+identical cost ledger (§7).
 
 ---
 
-## 2. Execution paths
+## 2. Execution paths (the `System` reference path)
 
-A `System` phase can be garbled and evaluated two ways. The choice is keyed off
-a **shape key**: phases sharing a key build structurally-identical Systems —
-same gate kinds, wire ids and subscriptions, and the same `Mul` scalar
-zero/nonzero pattern (scalar *values* may differ). The chunk phases share one
-shape; the odd-prime extract phases share another.
+Everything in this section applies to the reference path only — production
+runs the kernels of §1. A `System` phase can be garbled and evaluated two
+ways. The choice is keyed off a **shape key**: phases sharing a key build
+structurally-identical Systems — same gate kinds, wire ids and subscriptions,
+and the same `Mul` scalar zero/nonzero pattern (scalar *values* may differ).
+The chunk phases share one shape; the odd-prime extract phases share another.
 
 ### The keystone
 
@@ -136,10 +137,13 @@ and to the portable software backend.
 group, and `hash_z2` for the kernels' bare-word Z₂ switches.
 
 **Nonce discipline (paper App. A, Def. 4):** no two CCRH queries may share a
-nonce. The pipeline gives each phase a disjoint window of solo-domain nonces
-(`solo_nonce_next`, `num_gates` per phase). The bulk domain (high bit set) is
-split: in-System switch-group ids own `[0, 2^32)`, the kernels draw above
-`KERNEL_NONCE_FLOOR = 2^32`.
+nonce. On the kernel path, the width-`l` cast hashes own the solo domain
+(chunk kernels first, then extracts, position-indexed windows) and the Z₂
+tree hashes share the bulk domain with the fold/body windows (trees allocate
+above them). On the reference path, the `Pipeline` gives each phase a
+disjoint window of solo-domain nonces (`solo_nonce_next`, `num_gates` per
+phase); the bulk domain (high bit set) is split: in-System switch-group ids
+own `[0, 2^32)`, the kernels draw above `KERNEL_NONCE_FLOOR = 2^32`.
 
 ---
 
@@ -164,19 +168,30 @@ split: in-System switch-group ids own `[0, 2^32)`, the kernels draw above
 
 ## 6. Performance
 
-On an Apple M1 P-core (single-threaded, `cargo test --release`), the reference
-workload streams in **~0.057–0.06 s**: ≈21 ms garbler + ≈31 ms evaluator,
-**~1.03 G instructions / ~0.23 G cycles**. The full `x + y` application is two
+On an Apple M1 P-core (single-threaded, `cargo test --release`), the kernel
+path runs the reference workload in **~0.033 s/rep**, **~0.58 G instructions /
+~0.10 G cycles** per rep, ~8 MB peak (`bench_kernel_loop`). The `System`
+reference path measures ~0.058 s / ~0.93 G instructions / ~0.18 G cycles on
+the same binary (`bench_stream_loop`). The full `x + y` application is two
 such runs.
+
+Per-stage split of the kernel path (ms/rep, garble + eval): body ≈ 19 (at its
+MAC floor: one multiply-accumulate per (slot, member), ~46 M per rep across
+both parties), extract ≈ 9.5, fold ≈ 2, chunk ≈ 1.5. The extract/chunk/fold
+kernels sit near their AES-block + lane-op floors (a width-22 cast measures
+~45 ns against a ~30 ns AES floor); the remaining headroom is protocol-level
+(fewer MACs/hashes) or cross-prime parallelism, not execution machinery.
 
 > Measure with hardware counters, not wall time — the M1 throttles under
 > ambient load (scaling wall time but not instructions/cycles):
 > `N=256 S=1536 /usr/bin/time -l <test-binary> test_s_aff_scaling --ignored`.
 
-### Where the time goes (per party)
+### Where the time went on the `System` path (per party)
 
-Shares profiled before the fused `word_to_bin_up` extract landed (which cut
-extract hashes ~29 % and total gates ~21 %), so treat them as approximate:
+Shares profiled on the `System` path before the fused `word_to_bin_up`
+extract and the kernel port landed — kept for orientation on what the kernel
+path eliminated (the fused evaluator's value-discovery fixpoint, the
+`System` build + CSR, and per-phase carry materialization):
 
 | component | share | note |
 | --- | --- | --- |
@@ -189,18 +204,15 @@ extract hashes ~29 % and total gates ~21 %), so treat them as approximate:
 | `System` build + CSR | ~8 % | per-phase setup |
 | boundaries, fold, misc | ~6 % | |
 
-About **56 % of the cycles are irreducible protocol arithmetic** — hashing, the
-IT-GC multiply-accumulates, the λ-lane ring ops, and pad unpacking. A
-hash-only floor estimate undercounts the real compute by ~2–3×, because the
-body alone does one MAC per (slot, member) pair (~20 M per party) that the hash
-count never sees. The hand-derived straight-line form of `word_to_hot`'s
-circular bootstrap now exists as `word_to_bin_up` (its width-`l` casts serve
-as bit-extraction accumulators *and* the peel upcast, fusing out the
-arithmetic-one-hot layer); the extract System still resolves it through the
-worklist, so the remaining structurally-addressable item is running that
-schedule as a straight-line kernel (the `fold.rs` pattern) to eliminate the
-fused evaluator's value-discovery fixpoint. Everything else needs protocol
-changes or cross-prime parallelism.
+The kernel path realized the last structurally-addressable item from that
+profile: `word_to_bin_up`'s hand-derived straight-line schedule now runs as
+the extract/chunk kernels (the `fold.rs` pattern), eliminating the fused
+evaluator's value-discovery fixpoint, the per-phase `System` build, and the
+carry materialization. What remains is dominated by irreducible protocol
+arithmetic — hashing, the IT-GC multiply-accumulates, the λ-lane ring ops,
+and pad unpacking; a hash-only floor estimate undercounts the real compute by
+~2–3×, because the body alone does one MAC per (slot, member) pair (~20 M per
+party) that the hash count never sees.
 
 ---
 
@@ -218,18 +230,26 @@ fast paths). The fast paths are pinned two ways:
   scalar-vs-SIMD differentials (`test_body_batch_simd_matches_scalar_*`,
   `test_unpack_even_k_neon_matches_generic`), and the CCRH has golden vectors
   plus a portable-vs-NEON equality test.
-* **End-to-end known answer** — `test_streaming_sweep`,
-  `test_streaming_edge_regimes`, and (ignored, run manually) `test_s_aff_scaling`
-  run the whole production pipeline and check the decoded `a·x + b mod p_i`
-  against a direct arithmetic oracle, across many primes / inputs / `S` and the
-  edge parameter regimes.
+* **Kernel vs reference** — `test_s_aff_kernels_matches_streaming` runs both
+  drivers on identical inputs and asserts identical decoded outputs AND an
+  identical cost ledger; `test_chunk_kernel_label_mask_invariant` /
+  `test_extract_kernel_label_mask_invariant` (in `comp_gc::extract`) pin the
+  kernels' `label = mask + v·Δ` carry invariant per wire, exhaustively /
+  randomized at the production shapes.
+* **End-to-end known answer** — `test_s_aff_kernels_sweep` (kernel path),
+  `test_streaming_sweep`, `test_streaming_edge_regimes`, and (ignored, run
+  manually) `test_s_aff_scaling` check the decoded `a·x + b mod p_i` against
+  a direct arithmetic oracle, across many primes / inputs / `S` and the edge
+  parameter regimes.
 * **Cost parity** — `test_fold_kernel_cost_matches_system_fold` pins the fold
   kernel's communication + hash ledger to `System::cost` of the equivalent
   circuit; `test_word_to_bin_up_cost` and `test_sub_chunk_extract_cost` pin
   the extract circuit to its closed-form ledger
   (`(2^k − 2) + l·2^k` hashes, `k + l − 1` join bits per sub-chunk).
 
-Ignored (manual) benchmarks: `bench_stream_loop`, `bench_primitives`,
+Ignored (manual) benchmarks: `bench_kernel_loop` (production path, with the
+per-stage split), `bench_stream_loop` (reference path), `bench_extract_micro`
+(extract-kernel primitive attribution), `bench_primitives`,
 `bench_header_decomposition`, and the CCRH `bench_ccrnd_single_vs_interleaved`.
 
 ---
@@ -246,7 +266,8 @@ Ignored (manual) benchmarks: `bench_stream_loop`, `bench_primitives`,
 5. [`comp_gc/garbler.rs`](../src/comp_gc/garbler.rs),
    [`comp_gc/evaluator.rs`](../src/comp_gc/evaluator.rs) — the worklist garbler
    (and schedule recording) and the journal evaluator.
-6. [`comp_gc/fold.rs`](../src/comp_gc/fold.rs),
+6. [`comp_gc/extract.rs`](../src/comp_gc/extract.rs),
+   [`comp_gc/fold.rs`](../src/comp_gc/fold.rs),
    [`it_gc.rs`](../src/it_gc.rs) — the two straight-line kernels.
 7. [`comp_gc/arena.rs`](../src/comp_gc/arena.rs) — flat storage, the compiled
    garbler, the fused evaluator.

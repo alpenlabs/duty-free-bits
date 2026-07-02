@@ -1593,3 +1593,197 @@ fn bench_axb_hashcounts() {
          evaluator count is mildly input-dependent (which one-hot slots are active).\n"
     );
 }
+
+// ==================== the kernel-only path ====================
+
+/// Kernel-path analogue of [`assert_s_aff_streaming_correct`]: known-answer
+/// check plus a differential against the System-phase path on the SAME
+/// (a, b, x) inputs.
+fn assert_s_aff_kernels_correct(
+    params: &CrtParams,
+    a_vals: &[u64],
+    b_vals: &[u64],
+    x: u64,
+    rng: &mut impl Rng,
+) {
+    let n = params.n as usize;
+    let s_dim = a_vals.len();
+    let a_residues: Vec<Vec<u64>> = params
+        .primes
+        .iter()
+        .map(|&pi| a_vals.iter().map(|&a| a % pi).collect())
+        .collect();
+    let b_residues: Vec<Vec<u64>> = params
+        .primes
+        .iter()
+        .map(|&pi| b_vals.iter().map(|&b| b % pi).collect())
+        .collect();
+    let input_bits: Vec<u64> = (0..n).map(|j| (x >> j) & 1).collect();
+
+    let (outputs, _stats) =
+        crate::affine::build_s_aff_kernels(rng, &input_bits, params, &a_residues, &b_residues);
+
+    for (i, &p_i) in params.primes.iter().enumerate() {
+        let x_mod = x % p_i;
+        for j in 0..s_dim {
+            let expected = ((a_vals[j] % p_i) * x_mod + (b_vals[j] % p_i)) % p_i;
+            assert_eq!(
+                outputs[i][j], expected,
+                "kernel a·x+b mod p mismatch (prime {p_i}, comp {j}, x={x}, S={s_dim})"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_s_aff_kernels_sweep() {
+    // The kernel-only production path against the oracle, across the same
+    // parameter sweep as test_streaming_sweep.
+    let mut rng = rng();
+    for n in [8u32, 12, 16, 24, 33, 64] {
+        let params = CrtParams::from_primes(&FIRST_80_PRIMES, n);
+        let max_x = if n >= 63 { u64::MAX } else { (1u64 << n) - 1 };
+        for s_dim in [1usize, 3] {
+            let a_vals: Vec<u64> = (0..s_dim)
+                .map(|_| rng.random_range(0..1u64 << 40))
+                .collect();
+            let b_vals: Vec<u64> = (0..s_dim)
+                .map(|_| rng.random_range(0..1u64 << 40))
+                .collect();
+            let x = rng.random_range(0..=max_x) & max_x;
+            assert_s_aff_kernels_correct(&params, &a_vals, &b_vals, x, &mut rng);
+        }
+    }
+}
+
+#[test]
+fn test_s_aff_kernels_matches_streaming() {
+    // Differential: kernel path and System-phase path decode identical
+    // outputs on identical inputs (production params, several x).
+    let mut rng = rng();
+    let n = 256u32;
+    let params = CrtParams::from_primes(&FIRST_80_PRIMES, n);
+    let s_dim = 5usize;
+    let a_vals: Vec<u64> = (0..s_dim).map(|_| rng.random_range(0..1u64 << 48)).collect();
+    let b_vals: Vec<u64> = (0..s_dim).map(|_| rng.random_range(0..1u64 << 48)).collect();
+    let a_residues: Vec<Vec<u64>> = params
+        .primes
+        .iter()
+        .map(|&pi| a_vals.iter().map(|&a| a % pi).collect())
+        .collect();
+    let b_residues: Vec<Vec<u64>> = params
+        .primes
+        .iter()
+        .map(|&pi| b_vals.iter().map(|&b| b % pi).collect())
+        .collect();
+
+    for _ in 0..3 {
+        let x: u64 = rng.random();
+        let input_bits: Vec<u64> = (0..n).map(|j| ((x >> (j % 64)) >> 0) & 1).collect();
+
+        let (kernel_out, stats) = crate::affine::build_s_aff_kernels(
+            &mut rng,
+            &input_bits,
+            &params,
+            &a_residues,
+            &b_residues,
+        );
+
+        let mut pipeline = Pipeline::new(&mut rng);
+        let bit_ids: Vec<_> = input_bits
+            .iter()
+            .map(|&b| pipeline.seed_input_cf_value(&mut rng, 2, b))
+            .collect();
+        let stream_out = build_s_aff_streaming(
+            &mut pipeline,
+            &bit_ids,
+            &input_bits,
+            &params,
+            &a_residues,
+            &b_residues,
+        );
+
+        assert_eq!(kernel_out, stream_out, "kernel vs streaming outputs differ");
+        // Ledger parity: identical circuits, identical cost accounting.
+        assert_eq!(stats.hash_count_cf, pipeline.hash_count_cf);
+        assert_eq!(stats.hash_count_ncf, pipeline.hash_count_ncf);
+        assert_eq!(stats.join_complexity_cf, pipeline.join_complexity_cf);
+        assert_eq!(stats.join_complexity_ncf, pipeline.join_complexity_ncf);
+    }
+}
+
+#[test]
+#[ignore]
+fn bench_kernel_loop() {
+    // Kernel-path twin of bench_stream_loop.
+    // Run: N=256 S=1536 REPS=30 cargo test --release bench_kernel_loop -- --ignored --nocapture
+    let n: u32 = std::env::var("N")
+        .unwrap_or_else(|_| "256".into())
+        .parse()
+        .unwrap();
+    let s_dim: usize = std::env::var("S")
+        .unwrap_or_else(|_| "1536".into())
+        .parse()
+        .unwrap();
+    let reps: usize = std::env::var("REPS")
+        .unwrap_or_else(|_| "30".into())
+        .parse()
+        .unwrap();
+    let params = CrtParams::from_primes(&FIRST_80_PRIMES, n);
+    let mut rng = rng();
+    let a_residues: Vec<Vec<u64>> = params
+        .primes
+        .iter()
+        .map(|&pi| (0..s_dim).map(|_| rng.random_range(0..pi)).collect())
+        .collect();
+    let b_residues: Vec<Vec<u64>> = params
+        .primes
+        .iter()
+        .map(|&pi| (0..s_dim).map(|_| rng.random_range(0..pi)).collect())
+        .collect();
+    let mut agg = crate::affine::KernelStats::default();
+    let t = std::time::Instant::now();
+    for _ in 0..reps {
+        let x: u64 = rng.random_range(0..u64::MAX >> (64 - n.min(63)));
+        let x_bits: Vec<u64> = (0..n).map(|j| (x >> (j % 64)) & 1).collect();
+        let (outputs, stats) = crate::affine::build_s_aff_kernels(
+            &mut rng,
+            &x_bits,
+            &params,
+            &a_residues,
+            &b_residues,
+        );
+        std::hint::black_box(&outputs);
+        agg.chunk_garble_secs += stats.chunk_garble_secs;
+        agg.chunk_eval_secs += stats.chunk_eval_secs;
+        agg.extract_garble_secs += stats.extract_garble_secs;
+        agg.extract_eval_secs += stats.extract_eval_secs;
+        agg.fold_garble_secs += stats.fold_garble_secs;
+        agg.fold_eval_secs += stats.fold_eval_secs;
+        agg.body_garble_secs += stats.body_garble_secs;
+        agg.body_eval_secs += stats.body_eval_secs;
+    }
+    let per_rep = t.elapsed().as_secs_f64() / reps as f64;
+    let r = reps as f64;
+    eprintln!("{} reps, {:.4}s/rep (kernel path)", reps, per_rep);
+    eprintln!(
+        "  per-rep garble: chunk {:.2}ms extract {:.2}ms fold {:.2}ms body {:.2}ms",
+        1e3 * agg.chunk_garble_secs / r,
+        1e3 * agg.extract_garble_secs / r,
+        1e3 * agg.fold_garble_secs / r,
+        1e3 * agg.body_garble_secs / r,
+    );
+    eprintln!(
+        "  per-rep eval:   chunk {:.2}ms extract {:.2}ms fold {:.2}ms body {:.2}ms",
+        1e3 * agg.chunk_eval_secs / r,
+        1e3 * agg.extract_eval_secs / r,
+        1e3 * agg.fold_eval_secs / r,
+        1e3 * agg.body_eval_secs / r,
+    );
+    eprintln!(
+        "  accounted {:.2}ms of {:.2}ms/rep ({:.0}%)",
+        1e3 * (agg.garble_secs() + agg.eval_secs()) / r,
+        1e3 * per_rep,
+        100.0 * (agg.garble_secs() + agg.eval_secs()) / r / per_rep,
+    );
+}
