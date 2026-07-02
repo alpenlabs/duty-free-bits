@@ -7,7 +7,7 @@
 //! Garbled evaluation of `a·x + b` over a CRT primorial, as a single
 //! straight-line protocol (no gate graph, no worklist).
 //!
-//! * [`label`] — CF (computational, λ-fold) and NCF (IT, single element) labels.
+//! * [`label`] — the garbled label (λ coordinates over a power-of-two ring).
 //! * [`crypto`] — the CCRH core + nonce rules.
 //! * [`hash`] — the label-aware CCRH built atop `crypto`.
 //! * [`comp_gc`] — the computational GC steps (Phase 1: `bin(x)` → hot(CRT(x))):

@@ -4,31 +4,6 @@
 //! (paper App. A, Def. 4: a query sequence is legal iff no `(seed, nonce)`
 //! repeats).
 
-/// A monotonic allocator of disjoint nonce ranges.
-#[derive(Debug, Default, Clone)]
-pub struct NonceAllocator {
-    next: u64,
-}
-
-impl NonceAllocator {
-    /// A fresh allocator starting at nonce 0.
-    pub fn new() -> Self {
-        Self { next: 0 }
-    }
-
-    /// Reserve a contiguous block of `count` nonces; returns its base.
-    pub fn reserve(&mut self, count: u64) -> u64 {
-        let base = self.next;
-        self.next += count;
-        base
-    }
-
-    /// The next nonce that would be issued (number of nonces consumed so far).
-    pub fn position(&self) -> u64 {
-        self.next
-    }
-}
-
 /// Precompute disjoint nonce windows for independent items.
 ///
 /// E.g. the per-prime bodies, which may run in parallel: `bases[i]` is the start
@@ -47,16 +22,6 @@ pub fn windows(start: u64, sizes: &[u64]) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_reserve_is_monotonic_and_disjoint() {
-        let mut a = NonceAllocator::new();
-        assert_eq!(a.reserve(10), 0);
-        assert_eq!(a.reserve(5), 10);
-        assert_eq!(a.reserve(0), 15);
-        assert_eq!(a.reserve(3), 15);
-        assert_eq!(a.position(), 18);
-    }
 
     #[test]
     fn test_windows_are_disjoint_and_cover() {

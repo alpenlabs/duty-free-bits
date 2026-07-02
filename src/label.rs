@@ -237,22 +237,6 @@ fn xor_words(a: &[u64; BITS_WORDS], b: &[u64; BITS_WORDS]) -> [u64; BITS_WORDS] 
     out
 }
 
-/// Pack bit `bit` of every u32 lane into a Z_2 packed-bit buffer.
-/// Accumulates each 64-lane half in a register to avoid per-lane
-/// read-modify-write through memory.
-fn pack_lane_bit(lanes: &[u32], bit: u32) -> [u64; BITS_WORDS] {
-    debug_assert_eq!(lanes.len(), LAMBDA);
-    let mut out = [0u64; BITS_WORDS];
-    for (w, chunk) in lanes.chunks_exact(64).enumerate() {
-        let mut acc = 0u64;
-        for (i, &l) in chunk.iter().enumerate() {
-            acc |= (((l >> bit) & 1) as u64) << i;
-        }
-        out[w] = acc;
-    }
-    out
-}
-
 impl PartialEq for Label {
     fn eq(&self, other: &Self) -> bool {
         self.modulus == other.modulus && (0..LAMBDA).all(|i| self.get(i) == other.get(i))
@@ -274,29 +258,6 @@ pub fn add(a: &Label, b: &Label) -> Label {
                 la.iter()
                     .zip(lb)
                     .map(|(&x, &y)| x.wrapping_add(y) & mask)
-                    .collect(),
-            )
-        }
-        _ => unreachable!("repr is determined by the (equal) modulus"),
-    };
-    Label {
-        repr,
-        modulus: a.modulus,
-    }
-}
-
-/// Coordinate-wise subtraction.
-pub fn sub(a: &Label, b: &Label) -> Label {
-    assert_eq!(a.modulus, b.modulus, "sub: modulus mismatch");
-    let repr = match (&a.repr, &b.repr) {
-        // k = 1: subtraction mod 2 is also XOR.
-        (Repr::Bits(wa), Repr::Bits(wb)) => Repr::Bits(xor_words(wa, wb)),
-        (Repr::Lanes(la), Repr::Lanes(lb)) => {
-            let mask = coord_mask(a.k()) as u32;
-            Repr::Lanes(
-                la.iter()
-                    .zip(lb)
-                    .map(|(&x, &y)| x.wrapping_sub(y) & mask)
                     .collect(),
             )
         }
@@ -335,50 +296,6 @@ pub fn scalar_mul(s: u64, a: &Label) -> Label {
     Label {
         repr: Repr::Lanes(lanes),
         modulus: a.modulus,
-    }
-}
-
-/// Reduce each coordinate mod 2^k_out; output modulus becomes 2^k_out.
-pub fn mod2k(a: &Label, k_out: u32) -> Label {
-    assert!(k_out >= 1 && k_out <= a.k());
-    let out_mod = 1u64 << k_out;
-    let repr = match &a.repr {
-        Repr::Bits(w) => Repr::Bits(*w), // k_in = k_out = 1
-        Repr::Lanes(lanes) if k_out == 1 => Repr::Bits(pack_lane_bit(lanes, 0)),
-        Repr::Lanes(lanes) => {
-            let mask = coord_mask(k_out) as u32;
-            Repr::Lanes(lanes.iter().map(|&l| l & mask).collect())
-        }
-    };
-    Label {
-        repr,
-        modulus: out_mod,
-    }
-}
-
-/// Zero low k bits of each coordinate then divide by 2^k.
-///
-/// Output modulus = input_modulus / 2^k.
-pub fn div2k(a: &Label, k: u32) -> Label {
-    // k = 0 is the identity (zero low 0 bits, divide by 1); the general arm
-    // below assumes a Lanes input, which a Z_2 wire is not.
-    if k == 0 {
-        return a.clone();
-    }
-    assert!(a.modulus > (1u64 << k));
-    let out_mod = a.modulus >> k;
-    let Repr::Lanes(lanes) = &a.repr else {
-        unreachable!("div2k requires modulus > 2, so the input is Lanes");
-    };
-    let repr = if out_mod == 2 {
-        // Wide → Z_2: pack each lane's surviving bit.
-        Repr::Bits(pack_lane_bit(lanes, k))
-    } else {
-        Repr::Lanes(lanes.iter().map(|&l| l >> k).collect())
-    };
-    Label {
-        repr,
-        modulus: out_mod,
     }
 }
 
@@ -481,16 +398,19 @@ mod tests {
     // ---- Arithmetic ----
 
     #[test]
-    fn test_add_sub_roundtrip() {
+    fn test_add_commutes_with_identity() {
         let mut r = rng();
         for k in [1u32, 4, 10, 22] {
             let m = 1u64 << k;
             let a = rand_label(&mut r, m);
             let b = rand_label(&mut r, m);
-            let c = add(&a, &b);
-            let d = sub(&c, &b);
-            assert_eq!(d, a);
+            assert_eq!(add(&a, &b), add(&b, &a)); // commutative
+            assert_eq!(add(&a, &Label::zero(m)), a); // identity
         }
+        // In Z_2, add is XOR, so adding b twice cancels (Free-XOR).
+        let a = rand_label(&mut r, 2);
+        let b = rand_label(&mut r, 2);
+        assert_eq!(add(&add(&a, &b), &b), a);
     }
 
     #[test]
@@ -513,31 +433,6 @@ mod tests {
         assert_eq!(z, Label::zero(2));
         let o = scalar_mul(1, &a);
         assert_eq!(o, a);
-    }
-
-    #[test]
-    fn test_mod2k_reduces_modulus() {
-        let mut r = rng();
-        let a = rand_label(&mut r, 1 << 10);
-        let b = mod2k(&a, 4);
-        assert_eq!(b.modulus(), 16);
-        for i in 0..LAMBDA {
-            assert_eq!(b.get(i), a.get(i) & 0xF);
-        }
-    }
-
-    #[test]
-    fn test_div2k_zeros_low_bits_then_shifts() {
-        let mut r = rng();
-        let a = rand_label(&mut r, 1 << 10);
-        let k = 3u32;
-        let b = div2k(&a, k);
-        let d = 1u64 << k;
-        assert_eq!(b.modulus(), (1u64 << 10) / d);
-        for i in 0..LAMBDA {
-            let expected = (a.get(i) & !(d - 1)) / d;
-            assert_eq!(b.get(i), expected);
-        }
     }
 
     #[test]

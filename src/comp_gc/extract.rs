@@ -397,10 +397,8 @@ pub struct ExtractGarbleOutput {
 pub struct SubChunkDiffs {
     /// Scale-join diff per tree level (k−1 of them, Z₂).
     pub scale: Vec<Z2>,
-    /// Pin-join diff (width `l`).
+    /// Pin-join diff (width `l` = the stage's cast width).
     pub pin: Wide,
-    /// Cast width `l` of this stage.
-    pub l: u32,
 }
 
 /// Per-sub-chunk state shared by garble/eval: widths and nonce bases.
@@ -540,7 +538,7 @@ pub fn extract_batch_garble(
             rem_bits -= k;
         }
 
-        diffs.push(SubChunkDiffs { scale, pin, l });
+        diffs.push(SubChunkDiffs { scale, pin });
         cost.add(stage_cost(k, l));
     }
 
@@ -1035,9 +1033,14 @@ mod tests {
             let (bulk_n, solo_n) = extract_nonces(&sub_widths);
 
             let g = extract_batch_garble(&word_masks, &coeffs, &sub_widths, delta, 100, 200);
-            // Emitted material must be canonical: every pin lane < 2^l.
-            for dd in &g.diffs {
-                let lim = 1u32 << dd.l;
+            // Emitted material must be canonical: every pin lane < 2^l, where
+            // l is the stage's cast width (the remainder width, or k on the
+            // last stage).
+            let mut rb = ell;
+            for (q, (dd, &k)) in g.diffs.iter().zip(&sub_widths).enumerate() {
+                let l = if q == sub_widths.len() - 1 { k } else { rb };
+                rb -= k;
+                let lim = 1u32 << l;
                 assert!(dd.pin.iter().all(|&lane| lane < lim), "pin lane not canonical");
             }
             let expect_cost: usize = {

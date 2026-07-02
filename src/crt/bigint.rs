@@ -56,14 +56,6 @@ impl U576 {
     }
 
     /// Compute self mod m for a small modulus (Horner's method).
-    pub fn mod_u64(&self, m: u64) -> u64 {
-        let m128 = m as u128;
-        let mut result = 0u128;
-        for i in (0..9).rev() {
-            result = ((result << 64) | self.0[i] as u128) % m128;
-        }
-        result as u64
-    }
 
     /// Returns true if self > 0.
     pub fn is_nonzero(&self) -> bool {

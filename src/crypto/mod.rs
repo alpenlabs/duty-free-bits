@@ -116,28 +116,6 @@ pub fn expand(seed: Block, nonce: u64, output: &mut [u8]) {
     );
 }
 
-/// One CCRND block for each of 4 independent `(seed, nonce)` pairs (counter 0).
-///
-/// `outs[i]` is byte-identical to `expand(seeds[i], nonces[i], &mut outs[i])`.
-/// On aarch64 all 4 AES states run interleaved, so kernels that hash many
-/// distinct single-block controls can batch through this instead of paying
-/// 4 serial AES latencies.
-pub fn expand4(seeds: &[Block; 4], nonces: &[u64; 4], outs: &mut [Block; 4]) {
-    let keys = round_keys();
-    let tweaks = nonces.map(|n| ctr_tweak(n, 0));
-    #[cfg(target_arch = "aarch64")]
-    {
-        *outs = backend::ccrnd_wide(seeds, &tweaks, keys, CCRH_PUBLIC_S);
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    for i in 0..4 {
-        outs[i] = backend::ccrnd(seeds[i], tweaks[i], keys, CCRH_PUBLIC_S);
-    }
-
-    #[cfg(feature = "count-hashes")]
-    HASH_BLOCKS.fetch_add(4, std::sync::atomic::Ordering::Relaxed);
-}
-
 #[cfg(test)]
 mod expand_tests {
     use super::*;
@@ -180,29 +158,6 @@ mod expand_tests {
                         "expand mismatch: seed={seed:02x?} nonce={nonce:#x} len={len}",
                     );
                 }
-            }
-        }
-    }
-
-    #[test]
-    fn test_expand4_matches_four_expand_calls() {
-        for round in 0..8u64 {
-            let seeds: [Block; 4] = std::array::from_fn(|i| {
-                std::array::from_fn(|j| {
-                    (round as u8) ^ (i as u8).wrapping_mul(0x1f) ^ (j as u8).wrapping_mul(73)
-                })
-            });
-            let nonces: [u64; 4] = std::array::from_fn(|i| {
-                round
-                    .wrapping_mul(0x9e37_79b9_7f4a_7c15)
-                    .wrapping_add(i as u64)
-            });
-            let mut got = [[0u8; 16]; 4];
-            expand4(&seeds, &nonces, &mut got);
-            for i in 0..4 {
-                let mut want = [0u8; 16];
-                expand(seeds[i], nonces[i], &mut want);
-                assert_eq!(got[i], want, "expand4 lane {i} mismatch (round {round})");
             }
         }
     }

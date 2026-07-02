@@ -229,25 +229,6 @@ pub fn ccrnd(seed: [u8; 16], tweak: [u8; 16], rk: &RoundKeys, public_s: [u8; 16]
 /// group leaves fewer blocks to the single-block tail.
 pub const INTERLEAVE: usize = 4;
 
-/// CCRND on `N` independent `[u8; 16]` `(seed, tweak)` pairs, all in flight.
-///
-/// Lane `i` of the result equals `ccrnd(seeds[i], tweaks[i], rk, public_s)`
-/// byte-for-byte. Safe wrapper — aarch64-apple targets always carry the
-/// `aes`/`neon` features (ARMv8 crypto extensions).
-pub fn ccrnd_wide<const N: usize>(
-    seeds: &[[u8; 16]; N],
-    tweaks: &[[u8; 16]; N],
-    rk: &RoundKeys,
-    public_s: [u8; 16],
-) -> [[u8; 16]; N] {
-    unsafe {
-        let xs = seeds.map(|s| bytes_to_block(s));
-        let ts = tweaks.map(|t| bytes_to_block(t));
-        ccrnd_wide_with_round_keys(xs, ts, rk, bytes_to_block(public_s))
-            .map(|o| transmute::<uint8x16_t, [u8; 16]>(o))
-    }
-}
-
 /// CCRND CTR fill on `[u8; 16]` boundaries, `W` AES states in flight.
 ///
 /// Writes whole groups of `W` blocks of `H(seed, nonce | ctr << 64)` into
@@ -308,32 +289,6 @@ mod tests {
         let a: [u8; 16] = unsafe { transmute(ccrnd_with_round_keys(x1, t, &round_keys, public_s)) };
         let b: [u8; 16] = unsafe { transmute(ccrnd_with_round_keys(x2, t, &round_keys, public_s)) };
         assert_ne!(a, b);
-    }
-
-    /// Every lane of the interleaved kernel must match the single-block kernel
-    /// byte-for-byte, at both widths the crate instantiates (4 and 8).
-    #[test]
-    fn test_ccrnd_wide_lanes_match_single() {
-        fn check<const N: usize>(rk: &RoundKeys) {
-            let public_s = [0xDEu8; 16];
-            let seeds: [[u8; 16]; N] = std::array::from_fn(|i| {
-                std::array::from_fn(|j| (i as u8).wrapping_mul(0x1f) ^ (j as u8).wrapping_mul(73))
-            });
-            let tweaks: [[u8; 16]; N] = std::array::from_fn(|i| {
-                std::array::from_fn(|j| (i as u8 + 1).wrapping_mul(j as u8).wrapping_add(5))
-            });
-            let wide = ccrnd_wide(&seeds, &tweaks, rk, public_s);
-            for i in 0..N {
-                assert_eq!(
-                    wide[i],
-                    ccrnd(seeds[i], tweaks[i], rk, public_s),
-                    "wide lane {i} of {N} diverges from single-block ccrnd",
-                );
-            }
-        }
-        let rk = expand_key(&[0x2Bu8; 16]);
-        check::<4>(&rk);
-        check::<8>(&rk);
     }
 
     #[test]
