@@ -754,10 +754,10 @@ mod tests {
              raw CCRH floor      : {:.2} ns/block\n\
              overhead vs floor   : garble {:.2}x, eval {:.2}x\n\
              comm                : {:.1} MiB (both rows) | {:.1} MiB w/ GRR\n\
-             ---- reference: CRT/switch s-aff path, same a·x+b ----\n\
+             ---- reference: one-hot CRT s-aff path, same a·x+b ----\n\
              hash calls : ~2.3M body / ~5.8M full pipeline  (bit-decomp here: {:.2}M)\n\
              => compute baseline; field work is only add/sub/doubling (no mul).\n\
-                Compare total ms against the switch-system s-aff bench.\n",
+                Compare total ms against the one-hot CRT s-aff bench.\n",
             garble_ns / 1e6,
             g_blocks / 1e6,
             g_per_block,

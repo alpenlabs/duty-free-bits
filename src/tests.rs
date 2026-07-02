@@ -46,7 +46,7 @@ impl rand::RngCore for BenchRng {
 }
 
 /// BN254 base-field modulus q, little-endian limbs (mirror of the private
-/// `bitdecomp::P`); the switch side's smudge/decode arithmetic needs it.
+/// `bitdecomp::P`); the one-hot CRT side's smudge/decode arithmetic needs it.
 const BN254_Q: [u64; 4] = [
     0x3c208c16d87cfd47,
     0x97816a916871ca8d,
@@ -65,8 +65,8 @@ fn bn254_q_mod(p: u64) -> u64 {
 
 /// Reduce a Garner-reconstructed integer to the field: limb-wise Horner with
 /// 64 doublings per limb (`Fp` deliberately has no general multiply; a
-/// production decoder would Barrett-reduce, so this is the conservative,
-/// switch-side-pessimistic form).
+/// production decoder would Barrett-reduce, so this conservative form is
+/// pessimistic for the one-hot CRT side).
 fn u576_mod_q(v: &U576) -> crate::bitdecomp::Fp {
     use crate::bitdecomp::Fp;
     let top = v.0.iter().rposition(|&l| l != 0).unwrap_or(0);
@@ -102,23 +102,23 @@ fn test_u576_mod_q_helper() {
     assert_eq!(u576_mod_q(&U576(two256)), acc);
 }
 
-/// Final head-to-head benchmark: switch system (CRT) vs the bit-decomposition
+/// Final head-to-head benchmark: one-hot CRT vs the bit-decomposition
 /// baseline ([`crate::bitdecomp`]) on the SAME `a·x+b` workload, on identical
 /// footing — single-threaded, release, warmup + ITERS iterations, MEDIAN [MIN]
 /// reported. Both EXCLUDE a,b sampling (done once before timing) and any
 /// correctness/decode step (correctness is covered by
 /// `bitdecomp::tests::test_garble_eval_matches_plaintext` and the assert in
 /// `test_s_aff_scaling`). Input-label provisioning is outside the timed
-/// region for both (bit-decomp `encode`; the switch driver samples input
-/// masks outside its per-stage timers). The switch side runs
+/// region for both (bit-decomp `encode`; the one-hot CRT driver samples input
+/// masks outside its per-stage timers). The one-hot CRT side runs
 /// [`crate::affine::build_s_aff`].
 ///
 /// Workload boundary: available are field elements (a, b) and input labels;
-/// required output is a·x+b as field elements. The switch garble column
+/// required output is a·x+b as field elements. The one-hot CRT garble column
 /// therefore includes statistical smudging (fresh 64-bit μ per component,
 /// b\' = b + μ·q with residues derived directly as (b + μ·q) mod p — the big
 /// integer is never materialized) plus CRT-encoding a, b\' into per-prime
-/// residues; the switch eval column includes Garner reconstruction AND the
+/// residues; the one-hot CRT eval column includes Garner reconstruction AND the
 /// reduction mod q to the field element (double-based Horner — conservative;
 /// a Barrett reduction would shrink it). Garner setup and q mod p tables are
 /// per-prime-set precompute, outside, like bit-decomp\'s compile-time
@@ -155,7 +155,7 @@ fn bench_axb_comparison() {
     }
 
     // Fast PRG for both sides: bit-decomp share sampling uses it directly; the
-    // switch system only uses it for out-of-band (untimed) Δ / input-mask draws.
+    // one-hot CRT side only uses it for out-of-band (untimed) Δ / input-mask draws.
     let mut rng = BenchRng::new(0x0DDC0FFEE0DDF00D);
 
     // ===================== bit-decomposition baseline =====================
@@ -194,7 +194,7 @@ fn bench_axb_comparison() {
     let bd_h = bitdecomp::cost_model(s);
     let (bd_comm, bd_comm_grr) = (g.comm_bytes(), g.comm_bytes_grr());
 
-    // ===================== switch system (CRT) =====================
+    // ===================== one-hot CRT =====================
     let params = CrtParams::from_primes(&FIRST_80_PRIMES, n);
     let a_vals: Vec<u64> = (0..s).map(|_| rng.random_range(0..1u64 << 48)).collect();
     let b_vals: Vec<u64> = (0..s).map(|_| rng.random_range(0..1u64 << 48)).collect();
@@ -276,8 +276,8 @@ fn bench_axb_comparison() {
     let mb = |bits: usize| bits as f64 / 8.0 / 1e6;
     let m = |x: usize| x as f64 / 1e6;
     eprintln!("\n========== a·x + b benchmark  (N={n}, S={s}, single-thread, release) ==========");
-    eprintln!("iters={iters}, warmup={warmup}; values are MEDIAN [MIN] ms; switch garble incl. smudge (64-bit mu)");
-    eprintln!("+ CRT-encode of a,b; switch eval incl. Garner + mod-q to field elements; excludes a,b sampling & verify\n");
+    eprintln!("iters={iters}, warmup={warmup}; values are MEDIAN [MIN] ms; one-hot CRT garble incl. smudge (64-bit mu)");
+    eprintln!("+ CRT-encode of a,b; one-hot CRT eval incl. Garner + mod-q to field elements; excludes a,b sampling & verify\n");
     eprintln!("{:<22}{:>17}{:>17}{:>17}", "approach", "garble", "eval", "garble+eval");
     eprintln!("{:-<73}", "");
     eprintln!(
@@ -286,21 +286,21 @@ fn bench_axb_comparison() {
     );
     eprintln!(
         "{:<22}{:>9.2} [{:>5.2}]{:>9.2} [{:>5.2}]{:>9.2} [{:>5.2}]",
-        "switch system (CRT)", swg_med, swg_min, swe_med, swe_min, swg_med + swe_med, swg_min + swe_min
+        "one-hot CRT", swg_med, swg_min, swe_med, swe_min, swg_med + swe_med, swg_min + swe_min
     );
     eprintln!(
         "{:<22}{:>15.2}x{:>16.2}x{:>16.2}x",
-        "ratio switch/bitdec",
+        "ratio onehot/bitdec",
         swg_med / bdg_med,
         swe_med / bde_med,
         (swg_med + swe_med) / (bdg_med + bde_med)
     );
     eprintln!(
-        "\nswitch full run: {:.2} [{:.2}] ms  (encode+seed+garble+eval+decode+other)",
+        "\none-hot CRT full run: {:.2} [{:.2}] ms  (encode+seed+garble+eval+decode+other)",
         swt_med, swt_min
     );
     eprintln!(
-        "switch CRT split: smudge+encode a,b {:.1} ms (in garble col) | Garner + mod-q {:.1} ms (in eval col)",
+        "one-hot CRT split: smudge+encode a,b {:.1} ms (in garble col) | Garner + mod-q {:.1} ms (in eval col)",
         sw_enc_ms, sw_dec_ms
     );
     eprintln!("\nhashes (CCRH 16-byte blocks, per party):");
@@ -310,15 +310,15 @@ fn bench_axb_comparison() {
         m(bd_h.eval_calls),
     );
     eprintln!(
-        "   switch       garbler {:.2}M / evaluator \u{2248}{:.2}M  (cf {} + ncf {}; evaluator ~0.3% less —",
+        "   one-hot CRT  garbler {:.2}M / evaluator \u{2248}{:.2}M  (cf {} + ncf {}; evaluator ~0.3% less —",
         m(sw_cf + sw_ncf),
         m(sw_cf + sw_ncf),
         sw_cf,
         sw_ncf
     );
-    eprintln!("                skips open switches; exact split via `bench_axb_hashcounts`)");
+    eprintln!("                skips each scaling's active slot; exact split via `bench_axb_hashcounts`)");
     eprintln!(
-        "comm:    bit-decomp  {:.1} MiB (GRR, materialized; {:.1} MiB if both rows sent)   |   switch  {:.2} MB (join width)  => ~{:.0}x less\n",
+        "comm:    bit-decomp  {:.1} MiB (GRR, materialized; {:.1} MiB if both rows sent)   |   one-hot CRT  {:.2} MB (scaling width)  => ~{:.0}x less\n",
         mib(bd_comm_grr),
         mib(bd_comm),
         mb(sw_comm_bits),
@@ -331,7 +331,7 @@ fn bench_axb_comparison() {
 /// a·x+b workload. Transmission is modeled analytically as
 /// `(bytes · 8) / bandwidth` (pure serialization delay, no RTT); only garble,
 /// transmission, and eval are counted — no build/setup, no a,b sampling, no
-/// decode. Single-threaded. This is where the switch system's ~50–100× smaller
+/// decode. Single-threaded. This is where the one-hot CRT's ~50–100× smaller
 /// communication flips the comparison on a constrained link.
 ///
 /// Run:
@@ -405,7 +405,7 @@ fn bench_axb_network() {
     let bd_tx = tx_ms(g.comm_bytes_grr()); // realistic transmitted GC (one row/bit via GRR)
     let bd_e2e = bd_g + bd_tx + bd_e;
 
-    // ---- switch system (CRT) ----
+    // ---- one-hot CRT ----
     let params = CrtParams::from_primes(&FIRST_80_PRIMES, n);
     let a_vals: Vec<u64> = (0..s).map(|_| rng.random_range(0..1u64 << 48)).collect();
     let b_vals: Vec<u64> = (0..s).map(|_| rng.random_range(0..1u64 << 48)).collect();
@@ -490,7 +490,7 @@ fn bench_axb_network() {
     );
     eprintln!(
         "{:<22}{:>7.2}ms{:>9.1}ms{:>14}{:>7.2}ms{:>11.1}ms",
-        "switch system (CRT)",
+        "one-hot CRT",
         sw_g,
         sw_tx,
         format!("({:.2} MB)", sw_bytes as f64 / 1e6),
@@ -498,7 +498,7 @@ fn bench_axb_network() {
         sw_e2e
     );
     eprintln!(
-        "\n=> switch system is {:.1}x FASTER end-to-end ({:.1} ms vs {:.0} ms): tiny comm dominates\n   the bandwidth term that the bit-decomposition GC ({:.1} MiB) pays.",
+        "\n=> one-hot CRT is {:.1}x FASTER end-to-end ({:.1} ms vs {:.0} ms): tiny comm dominates\n   the bandwidth term that the bit-decomposition GC ({:.1} MiB) pays.",
         bd_e2e / sw_e2e,
         sw_e2e,
         bd_e2e,
@@ -519,19 +519,20 @@ fn bench_axb_network() {
         mh(bd_h.eval_calls),
     );
     eprintln!(
-        "   switch       garbler {:.2}M / evaluator \u{2248}{:.2}M  (cf {} + ncf {}; evaluator ~0.3% less,",
+        "   one-hot CRT  garbler {:.2}M / evaluator \u{2248}{:.2}M  (cf {} + ncf {}; evaluator ~0.3% less,",
         mh(sw_cf + sw_ncf),
         mh(sw_cf + sw_ncf),
         sw_cf,
         sw_ncf
     );
-    eprintln!("                skips open switches; exact split via `bench_axb_hashcounts`)\n");
+    eprintln!("                skips each scaling's active slot; exact split via `bench_axb_hashcounts`)\n");
 }
 
 /// Exact per-party CCRH hash-call counts (16-byte AES blocks) for both
 /// approaches, measured via the process-global counter. The garbler and
-/// evaluator differ for the switch system: the garbler hashes every switch, but
-/// the evaluator skips OPEN switches (control ≠ 0), so eval < garble. Requires
+/// evaluator differ for the one-hot CRT: the garbler hashes every slot (x-blind),
+/// but the evaluator skips each scaling's active slot (it opens that share from the
+/// ciphertext), so eval < garble. Requires
 /// the `count-hashes` feature (zero-overhead counter, so this never perturbs the
 /// timing benches).
 ///
@@ -562,7 +563,7 @@ fn bench_axb_hashcounts() {
     let _ = bitdecomp::eval(&g, &active, x, &mut led);
     let bd_e = hash_blocks();
 
-    // ---- switch system: per-party blocks accumulated across the stream ----
+    // ---- one-hot CRT: per-party blocks accumulated across the stream ----
     let params = CrtParams::from_primes(&FIRST_80_PRIMES, n);
     let a_vals: Vec<u64> = (0..s).map(|_| rng.random_range(0..1u64 << 48)).collect();
     let b_vals: Vec<u64> = (0..s).map(|_| rng.random_range(0..1u64 << 48)).collect();
@@ -588,7 +589,7 @@ fn bench_axb_hashcounts() {
     // Cross-checks: measured == ground truth.
     assert_eq!(bd_g as usize, led.garble_calls, "bit-decomp garbler vs HashLedger");
     assert_eq!(bd_e as usize, led.eval_calls, "bit-decomp evaluator vs HashLedger");
-    assert_eq!(sw_g + sw_e, sw_total, "switch per-party blocks must sum to measured total");
+    assert_eq!(sw_g + sw_e, sw_total, "one-hot CRT per-party blocks must sum to measured total");
 
     let mm = |x: u64| x as f64 / 1e6;
     eprintln!("\n===== a·x+b CCRH hash calls (16-byte AES blocks), per party  (N={n}, S={s}) =====\n");
@@ -600,7 +601,7 @@ fn bench_axb_hashcounts() {
     );
     eprintln!(
         "{:<22}{:>14}{:>14}{:>11.2}x",
-        "switch system (CRT)", sw_g, sw_e, sw_e as f64 / sw_g as f64
+        "one-hot CRT", sw_g, sw_e, sw_e as f64 / sw_g as f64
     );
     eprintln!(
         "\nbit-decomp closed form : garbler 4nS = {}, eval 2nS = {}  (exact, input-independent)",
@@ -608,7 +609,7 @@ fn bench_axb_hashcounts() {
         bitdecomp::N_BITS * s * bitdecomp::BLOCKS_PER_FE
     );
     eprintln!(
-        "switch                 : garbler {:.2}M / evaluator {:.2}M  (analytical circuit ledger cf {} + ncf {} = {})",
+        "one-hot CRT            : garbler {:.2}M / evaluator {:.2}M  (analytical circuit ledger cf {} + ncf {} = {})",
         mm(sw_g),
         mm(sw_e),
         stats.hash_count_cf,
@@ -616,7 +617,7 @@ fn bench_axb_hashcounts() {
         sw_ledger
     );
     eprintln!(
-        "  evaluator < garbler because the evaluator skips OPEN switches; the exact\n\
+        "  evaluator < garbler because the evaluator skips each scaling's active slot; the exact\n\
          evaluator count is mildly input-dependent (which one-hot slots are active).\n"
     );
 }
@@ -654,7 +655,7 @@ fn assert_s_aff_correct(
             let expected = ((a_vals[j] % p_i) * x_mod + (b_vals[j] % p_i)) % p_i;
             assert_eq!(
                 outputs[i][j], expected,
-                "kernel a·x+b mod p mismatch (prime {p_i}, comp {j}, x={x}, S={s_dim})"
+                "build_s_aff a·x+b mod p mismatch (prime {p_i}, comp {j}, x={x}, S={s_dim})"
             );
         }
     }

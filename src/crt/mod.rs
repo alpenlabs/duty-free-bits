@@ -2,7 +2,7 @@
 //!
 //! Given coprime moduli p_1, ..., p_T with primorial M = Π p_i, this module
 //! computes the chunking and working-modulus parameters needed to build
-//! an affine switch system, and provides CRT reconstruction via Garner's
+//! the one-hot CRT construction, and provides CRT reconstruction via Garner's
 //! algorithm.
 
 /// Fixed-width 576-bit unsigned integer for CRT output representation.

@@ -6,12 +6,12 @@ authors = [
   "Nakul Khambhati <nakul@cs.ucla.edu>",
   "David Heath <daheath@illinois.edu>",
 ]
-description = "Switch system construction from Duty-Free Bits"
+description = "One-hot CRT construction from Duty-Free Bits"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/alpenlabs/duty-free-bits"
 categories = ["cryptography"]
-keywords = ["garbled-circuits", "mpc", "switch-system", "bitvm"]
+keywords = ["garbled-circuits", "mpc", "one-hot-crt", "bitvm"]
 
 # Lints live as crate attributes in src/lib.rs (the [lints] table tripped the
 # editor's stale Cargo schema; source attributes also avoid the group/lint
