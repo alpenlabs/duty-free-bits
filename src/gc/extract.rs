@@ -2,7 +2,7 @@
 //! bits + a binary one-hot + the peel upcast — the fused `word_to_bin_up`.
 //!
 //! Per prime: form `r_i = Σ_c coeff_c·w_c`, split it into ≤8-bit sub-chunks,
-//! and for each run the [`super::onehot`] tree + casts. The width-`l` casts do
+//! and for each run the shared onehot tree + casts. The width-`l` casts do
 //! double duty — their weighted class sums both peel the bits (LSB-first) and
 //! give the upcast `Σ p·A_p` that reconstructs the sub-chunk value for the next
 //! peel. Outputs the first sub-chunk's binary one-hot + the remaining bits,
@@ -388,7 +388,9 @@ fn nonce_bulk_stage(p: &StagePlan, m: u32) -> u64 {
 
 /// Expand the newly-zero slot `z` (level `lz`) to the leaves — every switch
 /// en route is closed — then cast its leaves and fold the class into
-/// accumulator levels lz..=k.
+/// accumulator levels lz..=k. This is [`super::chunk::chunk_batch_eval`]'s
+/// per-level one-hot solve, generalized to width-`l` casts and batched over a
+/// whole congruence class.
 ///
 /// The fold is subtree-structured: leaves are `p_c = z + c·2^lz`, so
 /// `p_c mod 2^j = z + (c mod 2^{j−lz})·2^lz`, and the class's contribution to

@@ -2,7 +2,8 @@
 //! `w_c ∈ Z_{2^ℓ}` — the straight-line `bin_to_word`.
 //!
 //! Inputs: the `n` input-bit labels of one chunk.  Output: the chunk word `w_c`
-//! (its garbled label). Built on the one-hot tree + casts of [`super::onehot`]:
+//! (its garbled label). Built on the shared one-hot tree + casts (the
+//! crate-internal onehot machinery):
 //! a one-hot over the chunk's bits, width-ℓ casts of the leaves, and
 //! `word = Σ_p p·A_p`. The pin join lets the evaluator recover the one hot cast
 //! it cannot derive.
@@ -44,7 +45,7 @@ pub fn chunk_batch_garble(
     let nb = bit_masks.len() as u32;
     assert!(
         (2..=31).contains(&ell) && ell >= nb,
-        "chunk kernel requires 2 <= nb <= ell <= 31 (got nb={nb}, ell={ell})"
+        "chunk step requires 2 <= nb <= ell <= 31 (got nb={nb}, ell={ell})"
     );
     let mask_l = ((1u64 << ell) - 1) as u32;
     let d2 = {
@@ -101,10 +102,12 @@ pub fn chunk_batch_eval(
     let nb = bit_labels.len() as u32;
     assert!(
         (2..=31).contains(&ell) && ell >= nb,
-        "chunk kernel requires 2 <= nb <= ell <= 31 (got nb={nb}, ell={ell})"
+        "chunk step requires 2 <= nb <= ell <= 31 (got nb={nb}, ell={ell})"
     );
 
     // Tree: expand every level; the hot slot solves through the scale join.
+    // (This is the one-hot solve in its simplest form; the extract step's
+    // `expand_and_fold_class` is the same move generalized to width-`l` casts.)
     let b0 = z2_of(&bit_labels[0]);
     let mut lvl: Vec<Z2> = vec![b0, b0];
     for m in 1..nb {

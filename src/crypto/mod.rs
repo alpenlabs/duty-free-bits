@@ -1,5 +1,6 @@
-//! CCRND construction from §5 of
-//! <https://eprint.iacr.org/2019/074.pdf>:
+//! The crate's concrete CCRH (circular correlation-robust hash) — the CCRND
+//! construction from §5 of <https://eprint.iacr.org/2019/074.pdf>. "CCRND" and
+//! "CCRH" name the same primitive here; downstream modules say CCRH.
 //!
 //!   H(x, t) = AES_K( σ(x ⊕ public_s ⊕ t) ) ⊕ σ(x ⊕ public_s ⊕ t)
 //!

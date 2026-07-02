@@ -2,7 +2,7 @@
 //! runtime-optimized baseline for benchmarking against the CRT/switch path.
 //!
 //! This module deliberately does **not** use the switch system, the CRT, or any
-//! of the engines in [`crate::comp_gc`] / [`crate::gc::body`]. It implements the
+//! of the engines in [`crate::gc`] / [`crate::gc::body`]. It implements the
 //! naive bit-decomposition construction (the [EL26]/BABE-style projectivization
 //! that the CRT path in [`crate::affine`] replaces) so the two can be compared
 //! on the same `a·x+b` workload: the bit-decomposition path pays far more

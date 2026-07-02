@@ -55,8 +55,6 @@ impl U576 {
         U576(out)
     }
 
-    /// Compute self mod m for a small modulus (Horner's method).
-
     /// Returns true if self > 0.
     pub fn is_nonzero(&self) -> bool {
         self.0.iter().any(|&limb| limb != 0)

@@ -7,7 +7,8 @@
 //! x-blind, the evaluator (which knows `x`) hashes only closed switches and
 //! solves each open one through a join.
 //!
-//! * [`onehot`] — the two "moves" steps 1 & 2 are both built from: a one-hot
+//! * `onehot` (crate-internal) — the two "moves" steps 1 & 2 are both built
+//!   from: a one-hot
 //!   doubling tree and width-`l` casts + a pin join, plus the bare-lane types.
 //! * [`chunk`] — step 1: input bits → a ring word.
 //! * [`extract`] — step 2: a ring word → its bits + a binary one-hot + upcast.
@@ -18,7 +19,7 @@ pub mod body;
 pub mod chunk;
 pub mod extract;
 pub mod fold;
-pub mod onehot;
+pub(crate) mod onehot;
 
 /// The garbled-material + hash footprint of one step (for [`crate::affine::Stats`]).
 /// A CF switch on Z_{2^w} costs `w` CCRH blocks, a CF join `w` λ-bit units; an

@@ -1,6 +1,7 @@
-//! Mod-p one-hot folding: reduce the first sub-chunk's binary one-hot mod
-//! `p_i`, then fold in the remaining bits — straight-line garble/eval over
-//! bare labels.
+//! Step 3 / 4 (computational GC): reduce the extract step's binary one-hot mod
+//! `p_i` (free Z₂ adds), then fold in the remaining sub-chunk bits — one switch
+//! per (bit, slot) — to a length-`p_i` one-hot of `x mod p_i` that [`super::body`]
+//! consumes. Straight-line garble/eval over bare Z₂ labels.
 //!
 //! The fold is regular — per folded bit `b`, per slot `r`:
 //!

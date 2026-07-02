@@ -1,6 +1,7 @@
-//! Information-theoretic GC: deliver `a·(x mod p_i) + b` per prime.
+//! Step 4 / 4 (information-theoretic GC): deliver `a·(x mod p_i) + b` per prime.
 //!
-//! Phase 1 handed us a binary one-hot `h_p` of `hot = x mod p_i`: `p_i` CF Z_2
+//! Step 3 ([`super::fold`]) handed us a binary one-hot `h_p` of `hot = x mod p_i`:
+//! `p_i` CF Z_2
 //! wires, exactly the one at index `hot` carrying a 1. Hashing wire `i`'s label
 //! gives a fresh one-time pad `pad_i = H(h_p[i]) ∈ Z_{p_i}` — one pad per slot.
 //!
