@@ -211,6 +211,8 @@ pub fn build_s_aff<R: rand::Rng>(
                 .fold(0u64, |acc, (j, &b)| acc | (b << j))
         })
         .collect();
+    // `c` indexes chunk_values and derives start/end/nonce bases — not a plain map.
+    #[allow(clippy::needless_range_loop)]
     for c in 0..num_chunks {
         let start = c * chunk_size;
         let end = (start + chunk_size).min(n);

@@ -148,6 +148,8 @@ impl Fp {
     }
 
     /// `self + other mod p`.
+    // Inherent field op, deliberately not `std::ops::Add` (keeps `Fp` operator-free).
+    #[allow(clippy::should_implement_trait)]
     #[inline]
     pub fn add(self, other: Fp) -> Fp {
         // a, b < p < 2²⁵⁴, so a+b < 2²⁵⁵ — never carries out of 4 limbs, and at
@@ -158,6 +160,8 @@ impl Fp {
     }
 
     /// `self - other mod p` (branchless: add `p` back iff the subtract borrowed).
+    // Inherent field op, deliberately not `std::ops::Sub` (see `add`).
+    #[allow(clippy::should_implement_trait)]
     #[inline]
     pub fn sub(self, other: Fp) -> Fp {
         let (d, borrow) = sbb(self.0, other.0);
@@ -292,6 +296,8 @@ fn xor_block(a: Block, b: Block) -> Block {
 /// allocation, no incremental growth), and every word is written by `expand`
 /// before it is ever read — so the multi-GB zero-fill `vec![0u64; n]` would do
 /// is pure waste at large `S`.
+// uninit is deliberate — `garble` writes every word via `expand` before any read (SAFETY below).
+#[allow(clippy::uninit_vec)]
 fn alloc_uninit_u64(n: usize) -> Vec<u64> {
     let mut v = Vec::with_capacity(n);
     // SAFETY: `u64` is `Copy` with no invalid bit patterns; capacity is `n`, and
@@ -412,6 +418,8 @@ pub fn garble(a: &[Fp], b: &[Fp], rng: &mut impl Rng, ledger: &mut HashLedger) -
             let bij = Fp::reduce_limbs([p0[0], p0[1], p0[2], p0[3]]); // bᵢⱼ = reduce(H(Lᵢ⁰))
             *accj = accj.double_add(bij);
             let ab = aj.add(bij);
+            // parallel index into c1 and ab.0 (raw pad → ciphertext, in place)
+            #[allow(clippy::needless_range_loop)]
             for k in 0..FE_LIMBS {
                 c1[k] ^= ab.0[k]; // (a + bᵢ) ⊕ H(Lᵢ¹)  (c1 holds raw H(Lᵢ¹))
             }
