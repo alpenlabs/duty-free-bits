@@ -1,3 +1,8 @@
+//! Cleartext execution of a [`System`] — the ground-truth semantics.
+//!
+//! `Exec` propagates concrete wire values through the gates (forward and
+//! backward) to fixpoint. The evaluator runs it on its known input `x` to read switch controls in cleartext.
+
 use crate::system::System;
 use crate::types::*;
 
@@ -20,6 +25,11 @@ impl<'a> Exec<'a> {
     /// Read the current value of a wire.
     pub fn get(&self, w: Wire) -> Val {
         self.values[w.wid]
+    }
+
+    /// All wire values (indexed by wire id).
+    pub fn values(&self) -> &[Val] {
+        &self.values
     }
 
     /// Set a wire's value (must be currently undefined).
@@ -54,50 +64,39 @@ impl<'a> Exec<'a> {
 
     fn propagate(&mut self, queue: &mut Vec<GateId>) {
         while let Some(gid) = queue.pop() {
-            let g = self.system.gates[gid];
-            let vin0 = self.get(g.in0);
-            let vin1 = self.get(g.in1);
-            let vout = self.get(g.out);
-
-            match g.typ {
-                GateType::Switch => {
-                    // Forward: if ctrl=0 and data known, out = data
-                    self.try_set(g.out, guard(vin0, vin1), queue);
-                    // Backward: if ctrl=0 and out known, data = out
-                    self.try_set(g.in0, guard(vout, vin1), queue);
+            match self.system.gates[gid] {
+                Gate::Switch { data, ctrl, out } => {
+                    let (vdata, vctrl, vout) = (self.get(data), self.get(ctrl), self.get(out));
+                    // Forward: if ctrl=0 and data known, out = data.
+                    self.try_set(out, guard(vdata, vctrl), queue);
+                    // Backward: if ctrl=0 and out known, data = out.
+                    self.try_set(data, guard(vout, vctrl), queue);
                 }
-                GateType::Join => {
-                    self.try_set(g.in0, vin1, queue);
-                    self.try_set(g.in1, vin0, queue);
+                Gate::Join { a, b } | Gate::SameWire { a, b } => {
+                    let (va, vb) = (self.get(a), self.get(b));
+                    self.try_set(a, vb, queue);
+                    self.try_set(b, va, queue);
                 }
-                GateType::SameWire => {
-                    self.try_set(g.in0, vin1, queue);
-                    self.try_set(g.in1, vin0, queue);
+                Gate::Add { in0, in1, out } => {
+                    let (v0, v1, vo) = (self.get(in0), self.get(in1), self.get(out));
+                    self.try_set(out, val_add(v0, v1), queue); // out = in0 + in1
+                    self.try_set(in0, val_sub(vo, v1), queue); // in0 = out - in1
+                    self.try_set(in1, val_sub(vo, v0), queue); // in1 = out - in0
                 }
-                GateType::Add => {
-                    // out = in0 + in1
-                    self.try_set(g.out, val_add(vin0, vin1), queue);
-                    // in0 = out - in1
-                    self.try_set(g.in0, val_sub(vout, vin1), queue);
-                    // in1 = out - in0
-                    self.try_set(g.in1, val_sub(vout, vin0), queue);
+                Gate::Sub { in0, in1, out } => {
+                    let (v0, v1, vo) = (self.get(in0), self.get(in1), self.get(out));
+                    self.try_set(out, val_sub(v0, v1), queue); // out = in0 - in1
+                    self.try_set(in0, val_add(vo, v1), queue); // in0 = out + in1
+                    self.try_set(in1, val_sub(v0, vo), queue); // in1 = in0 - out
                 }
-                GateType::Sub => {
-                    // out = in0 - in1
-                    self.try_set(g.out, val_sub(vin0, vin1), queue);
-                    // in0 = out + in1
-                    self.try_set(g.in0, val_add(vout, vin1), queue);
-                    // in1 = in0 - out
-                    self.try_set(g.in1, val_sub(vin0, vout), queue);
+                Gate::Mul { in0, scalar, out } => {
+                    self.try_set(out, val_mul(scalar, self.get(in0)), queue);
                 }
-                GateType::Mul => {
-                    self.try_set(g.out, val_mul(g.param, vin0), queue);
+                Gate::Mod2k { in0, k, out } => {
+                    self.try_set(out, val_mod2k(self.get(in0), k), queue);
                 }
-                GateType::Mod2k => {
-                    self.try_set(g.out, val_mod2k(vin0, g.param as u32), queue);
-                }
-                GateType::Div2k => {
-                    self.try_set(g.out, val_div2k(vin0, g.param as u32), queue);
+                Gate::Div2k { in0, k, out } => {
+                    self.try_set(out, val_div2k(self.get(in0), k), queue);
                 }
             }
         }

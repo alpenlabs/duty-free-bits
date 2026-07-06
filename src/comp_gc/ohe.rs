@@ -1,3 +1,9 @@
+//! One-hot encoding primitives.
+//!
+//! [`ohe`] builds a binary one-hot from input bits (one switch per output
+//! position, then `n-1` binary joins); [`ohe_scale`] turns a binary one-hot
+//! into a ring vector whose hot entry carries a scalar `s`.
+
 use crate::system::System;
 use crate::types::*;
 
@@ -5,9 +11,12 @@ use crate::types::*;
 /// h entries are binary (Z_2), s is in some integer ring R.
 /// Output: vector in R where the hot entry equals s, all others 0.
 /// Join width: lg|R| bits.
+///
+/// Output wires inherit `s`'s kind (CF/NCF), so callers can drive the pipeline
+/// toward an NCF output by passing an NCF `s` — necessary when the ring happens
+/// to be Z_{2^k} but the protocol needs the output labeled as NCF.
 pub fn ohe_scale(sys: &mut System, h: &[Wire], s: Wire) -> Vec<Wire> {
-    let m = sys.modulus(s);
-    let z = sys.constant(0, m);
+    let z = sys.constant_matching(0, s);
     let mut out = Vec::with_capacity(h.len());
 
     let mut acc = z;

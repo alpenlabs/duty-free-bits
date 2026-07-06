@@ -5,7 +5,10 @@
 //! an affine switch system, and provides CRT reconstruction via Garner's
 //! algorithm.
 
-use super::bigint::U576;
+/// Fixed-width 576-bit unsigned integer for CRT output representation.
+pub mod bigint;
+
+pub use bigint::{FIRST_80_PRIMES, U576};
 
 /// Compute gcd of two values.
 fn gcd(mut a: u64, mut b: u64) -> u64 {
@@ -60,11 +63,13 @@ impl CrtParams {
         let num_chunks = n.div_ceil(chunk_size) as usize;
 
         // 2^ell must exceed the worst-case residue accumulation:
-        //   Σ_c coeff_c * w_c  ≤  C * p_max * (2^chunk_size - 1)
+        //   Σ_c coeff_c * w_c  ≤  C * p_max * (2^chunk_size - 1).
+        // For any max_sum ≥ 1, ⌊log₂ max_sum⌋ + 1 is the smallest ell
+        // with 2^ell > max_sum (handles the power-of-2 case correctly).
         let p_max = *primes.iter().max().unwrap();
         let max_word = (1u64 << chunk_size) - 1;
         let max_sum = (num_chunks as u128) * (p_max as u128) * (max_word as u128);
-        let ell = (max_sum - 1).ilog2() + 2;
+        let ell = max_sum.ilog2() + 1;
         assert!(ell < 64, "working modulus 2^{} exceeds u64", ell);
 
         CrtParams {
@@ -416,7 +421,7 @@ mod tests {
 
     #[test]
     fn test_crt_reconstruct_80_primes_roundtrip() {
-        use crate::components::bigint::FIRST_80_PRIMES;
+        use crate::crt::bigint::FIRST_80_PRIMES;
         let mut rng = rng();
         // Pick random values that fit in u64 and verify roundtrip.
         for _ in 0..SAMPLES {
@@ -434,7 +439,7 @@ mod tests {
     #[test]
     fn test_crt_reconstruct_80_primes_max() {
         // All residues = p_i - 1 => x = M - 1
-        use crate::components::bigint::FIRST_80_PRIMES;
+        use crate::crt::bigint::FIRST_80_PRIMES;
         let residues: Vec<u64> = FIRST_80_PRIMES.iter().map(|&p| p - 1).collect();
         let result = crt_reconstruct(&residues, &FIRST_80_PRIMES);
         let params = CrtParams::from_primes(&FIRST_80_PRIMES, 256);
@@ -444,14 +449,14 @@ mod tests {
 
     #[test]
     fn test_crt_reconstruct_80_primes_zero() {
-        use crate::components::bigint::FIRST_80_PRIMES;
+        use crate::crt::bigint::FIRST_80_PRIMES;
         let residues = vec![0u64; 80];
         assert_eq!(crt_reconstruct(&residues, &FIRST_80_PRIMES), U576::ZERO);
     }
 
     #[test]
     fn test_crt_reconstruct_80_primes_one() {
-        use crate::components::bigint::FIRST_80_PRIMES;
+        use crate::crt::bigint::FIRST_80_PRIMES;
         let residues: Vec<u64> = FIRST_80_PRIMES.iter().map(|&p| 1 % p).collect();
         assert_eq!(crt_reconstruct(&residues, &FIRST_80_PRIMES), U576::ONE);
     }

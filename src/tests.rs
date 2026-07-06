@@ -2,15 +2,16 @@
 //!
 //! Unit tests for individual modules live in their respective `#[cfg(test)]` blocks:
 //! - `types.rs`: Val arithmetic
-//! - `components/ohe.rs`: one-hot encoding
-//! - `components/convert.rs`: bin_to_word, word_to_hot, word_to_ring, hot_to_ring
-//! - `components/crt.rs`: CRT parameters and reconstruction
-//! - `components/bigint.rs`: U576 arithmetic
+//! - `comp_gc/ohe.rs`: one-hot encoding
+//! - `comp_gc/convert.rs`: bin_to_word, sub-chunk extraction, mod-OHE folding
+//! - `crt/mod.rs`: CRT parameters and reconstruction
+//! - `crt/bigint.rs`: U576 arithmetic
 
-use crate::components::affine::build_s_aff;
-use crate::components::bigint::{FIRST_80_PRIMES, U576};
-use crate::components::crt::{CrtParams, crt_reconstruct};
+use crate::affine::build_s_aff_streaming;
+use crate::crt::bigint::{FIRST_80_PRIMES, U576};
+use crate::crt::{CrtParams, crt_reconstruct};
 use crate::exec::Exec;
+use crate::pipeline::Pipeline;
 use crate::system::System;
 use crate::types::*;
 
@@ -23,23 +24,54 @@ fn rng() -> impl Rng {
     rand::rng()
 }
 
-/// Generate a random U576 uniformly in [0, bound) via rejection sampling.
-fn rand_u576_below(rng: &mut impl Rng, bound: &U576) -> U576 {
-    let top = bound.0.iter().rposition(|&l| l != 0).unwrap();
-    let top_bits = 64 - bound.0[top].leading_zeros();
-    loop {
-        let mut limbs = [0u64; 9];
-        for limb in limbs.iter_mut().take(top) {
-            *limb = rng.random();
-        }
-        limbs[top] = if top_bits < 64 {
-            rng.random::<u64>() & ((1u64 << top_bits) - 1)
-        } else {
-            rng.random()
-        };
-        let candidate = U576(limbs);
-        if candidate < *bound {
-            return candidate;
+/// Assert the streaming pipeline computes `a_j·x + b_j (mod p_i)` for every prime
+/// and component, against a direct known-answer oracle (the streaming pipeline is
+/// the production path; this needs no reference implementation).
+fn assert_s_aff_streaming_correct(
+    params: &CrtParams,
+    a_vals: &[u64],
+    b_vals: &[u64],
+    x: u64,
+    rng: &mut impl Rng,
+) {
+    let n = params.n as usize;
+    let s_dim = a_vals.len();
+    let a_residues: Vec<Vec<u64>> = params
+        .primes
+        .iter()
+        .map(|&pi| a_vals.iter().map(|&a| a % pi).collect())
+        .collect();
+    let b_residues: Vec<Vec<u64>> = params
+        .primes
+        .iter()
+        .map(|&pi| b_vals.iter().map(|&b| b % pi).collect())
+        .collect();
+    let input_bits: Vec<u64> = (0..n).map(|j| (x >> j) & 1).collect();
+
+    let mut pipeline = Pipeline::new(rng);
+    let bit_ids: Vec<_> = input_bits
+        .iter()
+        .map(|&b| pipeline.seed_input_cf_value(rng, 2, b))
+        .collect();
+    let outputs = build_s_aff_streaming(
+        &mut pipeline,
+        &bit_ids,
+        &input_bits,
+        params,
+        &a_residues,
+        &b_residues,
+    );
+
+    // Known answer: (a_j·x + b_j) mod p_i, in small modular arithmetic
+    // (operands < p_i ≤ 409, so products fit u64).
+    for (i, &p_i) in params.primes.iter().enumerate() {
+        let x_mod = x % p_i;
+        for j in 0..s_dim {
+            let expected = ((a_vals[j] % p_i) * x_mod + (b_vals[j] % p_i)) % p_i;
+            assert_eq!(
+                outputs[i][j], expected,
+                "streaming a·x+b mod p mismatch (prime {p_i}, comp {j}, x={x}, S={s_dim})"
+            );
         }
     }
 }
@@ -315,7 +347,41 @@ fn test_join_complexity() {
     let x = sys.input(8);
     let y = sys.input(8);
     sys.join(x, y);
-    assert_eq!(sys.join_complexity, 3); // log2(8) = 3
+    assert_eq!(sys.cost().join_complexity(), 3); // log2(8) = 3
+}
+
+#[test]
+fn test_cost_fold() {
+    let mut sys = System::new();
+    let ctrl = sys.input(2);
+
+    // CF switch on Z_16 (k = 4): 4 hashes.
+    let cf = sys.input(16);
+    sys.switch(cf, ctrl);
+
+    // Two NCF switches on Z_5.
+    let g_a = sys.num_gates();
+    let na = sys.constant_ncf(0, 5);
+    let a = sys.switch(na, ctrl);
+    let g_b = sys.num_gates();
+    let nb = sys.constant_ncf(0, 5);
+    let b = sys.switch(nb, ctrl);
+
+    // CF join on Z_8 (3 bits) and NCF join on Z_5 (3 bits).
+    let (x, y) = (sys.input(8), sys.input(8));
+    sys.join(x, y);
+    sys.join(a, b);
+
+    // Solo: the two NCF switches cost 1 each.
+    let c = sys.cost();
+    assert_eq!(c.hash_count_cf, 4);
+    assert_eq!(c.hash_count_ncf, 2);
+    assert_eq!(c.join_complexity_cf, 3);
+    assert_eq!(c.join_complexity_ncf, 3);
+
+    // Grouping the two NCF switches packs them: ⌈2·3 / 128⌉ = 1 hash, no double-count.
+    sys.register_ncf_switch_group(ctrl, vec![g_a, g_b]);
+    assert_eq!(sys.cost().hash_count_ncf, 1);
 }
 
 #[test]
@@ -447,186 +513,143 @@ fn exec_does_not_mutate_system() {
 // ==================== S_{aff-Z_M} integration tests ====================
 
 #[test]
-fn test_s_aff_s3_primorial_10() {
-    // M = 2·3·5·7·11·13·17·19·23·29, S=3, random (a, b, x)
-    let primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29];
-    let params = CrtParams::from_primes(&primes, 20);
-    assert_eq!(params.primorial().to_u128(), Some(6469693230));
-
-    let n = params.n;
-    let mut rng = rng();
-
-    let m = params.primorial().to_u128().unwrap();
-    let max_x = 1u64 << n;
-
-    for _ in 0..SAMPLES {
-        let a_vals: Vec<u64> = (0..3).map(|_| rng.random_range(0..m as u64)).collect();
-        let b_vals: Vec<u64> = (0..3).map(|_| rng.random_range(0..m as u64)).collect();
-        let x: u64 = rng.random_range(0..max_x);
-
-        let a_residues: Vec<Vec<u64>> = params
-            .primes
-            .iter()
-            .map(|&pi| a_vals.iter().map(|&a| a % pi).collect())
-            .collect();
-        let b_residues: Vec<Vec<u64>> = params
-            .primes
-            .iter()
-            .map(|&pi| b_vals.iter().map(|&b| b % pi).collect())
-            .collect();
-
-        let mut sys = System::new();
-        let bits: Vec<Wire> = (0..n).map(|_| sys.input(2)).collect();
-        let result = build_s_aff(&mut sys, &bits, &params, &a_residues, &b_residues);
-
-        let mut exec = Exec::new(&sys);
-        for j in 0..n {
-            exec.set(bits[j as usize], Val::new((x >> j) & 1, 2));
-        }
-        exec.run();
-
-        for s in 0..3 {
-            let residues: Vec<u64> = result
-                .outputs
-                .iter()
-                .map(|prime_outs| exec.get(prime_outs[s]).v)
-                .collect();
-            let reconstructed = crt_reconstruct(&residues, &params.primes);
-            let expected = ((a_vals[s] as u128) * (x as u128) + (b_vals[s] as u128)) % m;
-            assert_eq!(
-                reconstructed.to_u128().unwrap(),
-                expected,
-                "S={s}, a={}, b={}, x={x}: got {}, expected {expected} (mod M={m})",
-                a_vals[s],
-                b_vals[s],
-                reconstructed,
-            );
-        }
-    }
-}
-
-#[test]
-fn test_s_aff_s1_primorial_80() {
-    // Full 80-prime CRT pipeline with target parameters: n=256, ell=23.
-    // Coefficients a, b are random elements of Z_M (M ≈ 2^553), x is 256 bits.
-    let params = CrtParams::from_primes(&FIRST_80_PRIMES, 256);
-    let n = params.n as usize;
-    let m = params.primorial();
-    let mut rng = rng();
-
-    for _ in 0..3 {
-        // Pick random a, b ∈ [0, M), then derive CRT residues.
-        let a = rand_u576_below(&mut rng, &m);
-        let b = rand_u576_below(&mut rng, &m);
-
-        let a_residues: Vec<Vec<u64>> = params
-            .primes
-            .iter()
-            .map(|&pi| vec![a.mod_u64(pi)])
-            .collect();
-        let b_residues: Vec<Vec<u64>> = params
-            .primes
-            .iter()
-            .map(|&pi| vec![b.mod_u64(pi)])
-            .collect();
-
-        // Random 256-bit input x (as individual bits).
-        let x_bits: Vec<u64> = (0..n).map(|_| rng.random_range(0..2u64)).collect();
-
-        let mut sys = System::new();
-        let bits: Vec<Wire> = (0..n).map(|_| sys.input(2)).collect();
-        let result = build_s_aff(&mut sys, &bits, &params, &a_residues, &b_residues);
-
-        let mut exec = Exec::new(&sys);
-        for j in 0..n {
-            exec.set(bits[j], Val::new(x_bits[j], 2));
-        }
-        exec.run();
-
-        // Verify each prime's output residue: (a_i · x + b_i) mod p_i
-        let output_residues: Vec<u64> = result
-            .outputs
-            .iter()
-            .map(|prime_outs| exec.get(prime_outs[0]).v)
-            .collect();
-
-        for (t, &p_t) in params.primes.iter().enumerate() {
-            let mut x_mod_p = 0u64;
-            let mut pow2 = 1u64;
-            for &bit in &x_bits {
-                x_mod_p = (x_mod_p + bit * pow2) % p_t;
-                pow2 = (pow2 * 2) % p_t;
-            }
-            let expected = (a_residues[t][0] * x_mod_p + b_residues[t][0]) % p_t;
-            assert_eq!(
-                output_residues[t], expected,
-                "prime {p_t}: got {}, expected {expected}",
-                output_residues[t]
-            );
-        }
-
-        // Verify CRT reconstruction is consistent with the residues.
-        let reconstructed = crt_reconstruct(&output_residues, &params.primes);
-        for (t, &p_t) in params.primes.iter().enumerate() {
-            assert_eq!(
-                reconstructed.mod_u64(p_t),
-                output_residues[t],
-                "CRT consistency failed for prime {p_t}"
-            );
-        }
-    }
-}
-
-#[test]
 #[ignore]
 fn test_s_aff_scaling() {
-    // Run with: N=12 /usr/bin/time -l cargo test --release test_s_aff_scaling -- --ignored --nocapture
+    // Run with: N=12 S=4 /usr/bin/time -l cargo test --release \
+    //   test_s_aff_scaling -- --ignored --nocapture
+    //
+    // Env vars:
+    //   N        — input bit-length (default 8)
+    //   S        — number of affine maps (default 1)
+    //
+    // Drives the streaming pipeline (Pipeline + build_s_aff_streaming), which
+    // builds + garbles + evals one phase at a time, dropping intermediate state
+    // at every phase boundary.
+    use std::time::Instant;
+
     let n: u32 = std::env::var("N")
         .unwrap_or_else(|_| "8".into())
         .parse()
         .expect("N must be a u32");
+    let s_dim: usize = std::env::var("S")
+        .unwrap_or_else(|_| "1".into())
+        .parse()
+        .expect("S must be a usize");
 
     let params = CrtParams::from_primes(&FIRST_80_PRIMES, n);
     eprintln!(
-        "n={n}, ell={}, chunk_size={}, num_chunks={}",
+        "n={n}, S={s_dim}, ell={}, chunk_size={}, num_chunks={}",
         params.ell, params.chunk_size, params.num_chunks
     );
-    eprintln!("table_size = 2^{} = {}", params.ell, 1u64 << params.ell);
 
     let mut rng = rng();
     let max_x = 1u64 << n;
-    let a: u64 = rng.random_range(0..1u64 << 48);
-    let b: u64 = rng.random_range(0..1u64 << 48);
+    let a_vals: Vec<u64> = (0..s_dim)
+        .map(|_| rng.random_range(0..1u64 << 48))
+        .collect();
+    let b_vals: Vec<u64> = (0..s_dim)
+        .map(|_| rng.random_range(0..1u64 << 48))
+        .collect();
     let x: u64 = rng.random_range(0..max_x);
 
-    let a_residues: Vec<Vec<u64>> = params.primes.iter().map(|&pi| vec![a % pi]).collect();
-    let b_residues: Vec<Vec<u64>> = params.primes.iter().map(|&pi| vec![b % pi]).collect();
-
-    let mut sys = System::new();
-    let bits: Vec<Wire> = (0..n).map(|_| sys.input(2)).collect();
-
-    eprintln!("building switch system...");
-    let result = build_s_aff(&mut sys, &bits, &params, &a_residues, &b_residues);
-    eprintln!(
-        "system built: {} wires, {} gates",
-        sys.num_wires(),
-        sys.num_gates()
-    );
-
-    eprintln!("executing...");
-    let mut exec = Exec::new(&sys);
-    for j in 0..n {
-        exec.set(bits[j as usize], Val::new((x >> j) & 1, 2));
-    }
-    exec.run();
-
-    let residues: Vec<u64> = result
-        .outputs
+    let a_residues: Vec<Vec<u64>> = params
+        .primes
         .iter()
-        .map(|prime_outs| exec.get(prime_outs[0]).v)
+        .map(|&pi| a_vals.iter().map(|&a| a % pi).collect())
         .collect();
-    let reconstructed = crt_reconstruct(&residues, &params.primes);
-    let expected = a * x + b;
-    assert_eq!(reconstructed, U576::from_u64(expected));
-    eprintln!("ok: a*x+b = {expected}");
+    let b_residues: Vec<Vec<u64>> = params
+        .primes
+        .iter()
+        .map(|&pi| b_vals.iter().map(|&b| b % pi).collect())
+        .collect();
+
+    {
+        eprintln!("---- streaming pipeline ----");
+        let t_stream = Instant::now();
+        let mut pipeline = Pipeline::new(&mut rng);
+        let x_bits: Vec<u64> = (0..n).map(|j| (x >> j) & 1).collect();
+        let bit_ids: Vec<_> = x_bits
+            .iter()
+            .map(|&b| pipeline.seed_input_cf_value(&mut rng, 2, b))
+            .collect();
+        let outputs = build_s_aff_streaming(
+            &mut pipeline,
+            &bit_ids,
+            &x_bits,
+            &params,
+            &a_residues,
+            &b_residues,
+        );
+        let stream_secs = t_stream.elapsed().as_secs_f64();
+
+        eprintln!(
+            "[stream] {:>7.2}s  | {} phases, peak {} wires / {} gates per phase",
+            stream_secs,
+            pipeline.phase_stats.len(),
+            pipeline.peak_phase_wires,
+            pipeline.peak_phase_gates,
+        );
+        eprintln!(
+            "          garble: {:.2}s ({:.0}%) | eval: {:.2}s ({:.0}%) | other: {:.2}s",
+            pipeline.garble_secs,
+            100.0 * pipeline.garble_secs / stream_secs,
+            pipeline.eval_secs,
+            100.0 * pipeline.eval_secs / stream_secs,
+            stream_secs - pipeline.garble_secs - pipeline.eval_secs,
+        );
+        eprintln!(
+            "          totals: {} wires, {} gates, {} switch groups",
+            pipeline.total_wires, pipeline.total_gates, pipeline.total_switch_groups,
+        );
+        // Real garbler->evaluator communication = the join width (switches reveal
+        // nothing). CF joins pay λ per lg|G| bit, NCF joins pay 1.
+        let comm_bits =
+            crate::label::LAMBDA * pipeline.join_complexity_cf + pipeline.join_complexity_ncf;
+        eprintln!(
+            "          communication (join width): {} bits ({:.2} MB)  [cf {}·λ + ncf {}]",
+            comm_bits,
+            comm_bits as f64 / 8.0 / 1024.0 / 1024.0,
+            pipeline.join_complexity_cf,
+            pipeline.join_complexity_ncf,
+        );
+        // Internal garbled material handled across all phases (join diffs + the
+        // per-phase carry masks, which are NOT sent — they are the garbler's state).
+        eprintln!(
+            "          internal material: {} bits ({:.2} MB)   hash: cf {}, ncf {}",
+            pipeline.total_program_bits,
+            pipeline.total_program_bits as f64 / 8.0 / 1024.0 / 1024.0,
+            pipeline.hash_count_cf,
+            pipeline.hash_count_ncf,
+        );
+
+        // Verify outputs reconstruct correctly.
+        for s in 0..s_dim {
+            let residues: Vec<u64> = outputs.iter().map(|prime_outs| prime_outs[s]).collect();
+            let reconstructed = crt_reconstruct(&residues, &params.primes);
+            let expected = a_vals[s] * x + b_vals[s];
+            assert_eq!(reconstructed, U576::from_u64(expected));
+        }
+        eprintln!("ok: streaming reconstructed all {s_dim} affine maps");
+    }
+}
+
+#[test]
+fn test_streaming_sweep() {
+    // Sweep S around the RESIDUE_BATCH_SIZE=128 body-batch boundary (the path the
+    // nonce advance touches) and several x, asserting the streaming pipeline
+    // computes a·x+b mod p_i correctly each time.
+    let primes: [u64; 10] = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29];
+    let params = CrtParams::from_primes(&primes, 16);
+    let n = params.n as usize;
+    let mut rng = rng();
+    let m: u128 = params.primes.iter().map(|&p| p as u128).product();
+
+    for s_dim in [1usize, 127, 128, 129, 256] {
+        for _ in 0..2 {
+            let a_vals: Vec<u64> = (0..s_dim).map(|_| rng.random_range(0..m as u64)).collect();
+            let b_vals: Vec<u64> = (0..s_dim).map(|_| rng.random_range(0..m as u64)).collect();
+            let x: u64 = rng.random_range(0..(1u64 << n));
+            assert_s_aff_streaming_correct(&params, &a_vals, &b_vals, x, &mut rng);
+        }
+    }
 }

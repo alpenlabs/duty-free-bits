@@ -1,5 +1,14 @@
-use super::crt::pow2_mod;
+//! Bit ↔ word ↔ one-hot conversions: the computational-GC
+//! sub-circuits that turn the binary input into the per-prime CRT one-hot the
+//! IT-GC body consumes.
+//!
+//! The pipeline composes these: `bin_to_word` packs bits into a ring word,
+//! `word_to_hot_with_bits` expands a word to its one-hot, `sub_chunk_extract`
+//! splits a wide word into narrower sub-chunks, and `fold_to_mod_ohe` reduces a
+//! one-hot modulo a prime. All build on the primitives in [`super::ohe`].
+
 use super::ohe::{ohe, ohe_scale};
+use crate::crt::pow2_mod;
 use crate::system::System;
 use crate::types::*;
 
@@ -17,16 +26,13 @@ pub fn arith_ohe_to_word(sys: &mut System, h: &[Wire]) -> Wire {
     out
 }
 
-/// Convert a k-bit word x ∈ Z_{2^k} to a 2^k arithmetic one-hot encoding.
+/// Convert a k-bit word x ∈ Z_{2^k} to a 2^k arithmetic one-hot encoding, also
+/// returning the binary wires (bits of x). We get the bits for free in the
+/// original construction.
 ///
 /// The circular construction from Hea24, Section 4.3.
 /// Output: 2^k wires in Z_{2^k} where entry x = 1, all others = 0.
 /// Join width: 2k-1 bits.
-pub fn word_to_hot(sys: &mut System, x: Wire) -> Vec<Wire> {
-    word_to_hot_with_bits(sys, x).0
-}
-
-/// Like [`word_to_hot`], but also returns the binary wires (bits of x). We get this for free in the original construction.
 pub fn word_to_hot_with_bits(sys: &mut System, x: Wire) -> (Vec<Wire>, Vec<Wire>) {
     let m = sys.modulus(x);
     assert!(m.is_power_of_two());
@@ -94,52 +100,6 @@ pub fn bin_to_word(sys: &mut System, bits: &[Wire], k: u32) -> Wire {
     }
 
     result
-}
-
-/// Evaluate an arbitrary function g on a one-hot encoding, scale by a, add b.
-/// Given binary OHE h of x, computes a · g(x) + b in ring R.
-///
-/// Join width: lg|R| bits.
-pub fn hot_to_ring(sys: &mut System, h: &[Wire], truth_table: &[u64], a: Wire, b: Wire) -> Wire {
-    let r_mod = sys.modulus(a);
-    assert_eq!(sys.modulus(b), r_mod);
-    assert_eq!(h.len(), truth_table.len());
-
-    // scale_hot with a: sh_x = a (the hot entry), sh_i = 0 for i ≠ x
-    let sh = ohe_scale(sys, h, a);
-
-    // Σ_i g(i) · sh_i = g(x) · a, then add b
-    let mut result = sys.constant(0, r_mod);
-    for (i, &sh_i) in sh.iter().enumerate() {
-        let gi = truth_table[i] % r_mod;
-        if gi > 0 {
-            let term = sys.mul(gi, sh_i);
-            result = sys.add(result, term);
-        }
-    }
-    result = sys.add(result, b);
-
-    result
-}
-
-/// word_to_ring: given a word x ∈ Z_{2^k}, evaluate a · g(x) + b in ring R.
-/// Composes word_to_hot with hot_to_ring.
-pub fn word_to_ring(sys: &mut System, x: Wire, truth_table: &[u64], a: Wire, b: Wire) -> Wire {
-    let m = sys.modulus(x);
-    assert!(m.is_power_of_two());
-    let k = m.ilog2();
-    assert_eq!(truth_table.len(), 1usize << k);
-
-    let hot = word_to_hot(sys, x);
-
-    // Extract binary OHE from the arithmetic one-hot vector.
-    let mut bin_hot = Vec::with_capacity(hot.len());
-    for &h in &hot {
-        let b_i = sys.mod2k(h, 1);
-        bin_hot.push(b_i);
-    }
-
-    hot_to_ring(sys, &bin_hot, truth_table, a, b)
 }
 
 // ==================== Sub-chunk extraction ====================
@@ -270,24 +230,6 @@ pub fn fold_to_mod_ohe(sys: &mut System, extraction: &SubChunkExtraction, p: u64
     h_p
 }
 
-/// Evaluate a · (r mod p) + b via sub-chunk extraction and bit folding.
-///
-/// Equivalent to `word_to_ring` with truth table `[i % p for i in 0..2^ℓ]`,
-/// but uses O(Σ 2^{ℓ_q} + (ℓ−ℓ_0)·p) gates instead of O(2^ℓ).
-pub fn word_to_ring_mod(
-    sys: &mut System,
-    r: Wire,
-    p: u64,
-    sub_widths: &[u32],
-    a: Wire,
-    b: Wire,
-) -> Wire {
-    let extraction = sub_chunk_extract(sys, r, sub_widths);
-    let h_p = fold_to_mod_ohe(sys, &extraction, p);
-    let identity_table: Vec<u64> = (0..p).collect();
-    hot_to_ring(sys, &h_p, &identity_table, a, b)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,50 +261,6 @@ mod tests {
             exec.run();
 
             assert_eq!(exec.get(out), Val::new(hot_idx as u64, 8));
-        }
-    }
-
-    // ==================== word_to_hot ====================
-
-    #[test]
-    fn test_word_to_hot_4bit() {
-        let mut sys = System::new();
-        let x = sys.input_bits(4);
-        let hot = word_to_hot(&mut sys, x);
-
-        let mut exec = Exec::new(&sys);
-        exec.set(x, Val::from_bits(11, 4));
-        exec.run();
-
-        for (i, &w) in hot.iter().enumerate() {
-            let v = exec.get(w);
-            if i == 11 {
-                assert_eq!(v, Val::new(1, 16), "hot[{i}] should be 1");
-            } else {
-                assert_eq!(v, Val::new(0, 16), "hot[{i}] should be 0");
-            }
-        }
-    }
-
-    #[test]
-    fn test_word_to_hot_all_values_2bit() {
-        for input in 0..4u64 {
-            let mut sys = System::new();
-            let x = sys.input_bits(2);
-            let hot = word_to_hot(&mut sys, x);
-
-            let mut exec = Exec::new(&sys);
-            exec.set(x, Val::from_bits(input, 2));
-            exec.run();
-
-            for (i, &w) in hot.iter().enumerate() {
-                let expected = if i as u64 == input { 1 } else { 0 };
-                assert_eq!(
-                    exec.get(w),
-                    Val::new(expected, 4),
-                    "word_to_hot({input})[{i}]"
-                );
-            }
         }
     }
 
@@ -399,216 +297,6 @@ mod tests {
             exec.run();
 
             assert_eq!(exec.get(out), Val::new(input, 8), "bin_to_word({input})");
-        }
-    }
-
-    // ==================== hot_to_ring ====================
-
-    #[test]
-    fn test_hot_to_ring() {
-        let truth_table = vec![0, 1, 2, 3];
-        let r_mod = 8u64;
-
-        for input in 0..4u64 {
-            let mut sys = System::new();
-            let b0 = sys.input(2);
-            let b1 = sys.input(2);
-            let h = ohe(&mut sys, &[b0, b1]);
-            let a = sys.constant(1, r_mod);
-            let b = sys.constant(0, r_mod);
-            let out = hot_to_ring(&mut sys, &h, &truth_table, a, b);
-
-            let mut exec = Exec::new(&sys);
-            exec.set(b0, Val::new(input & 1, 2));
-            exec.set(b1, Val::new((input >> 1) & 1, 2));
-            exec.run();
-
-            assert_eq!(
-                exec.get(out),
-                Val::new(input, r_mod),
-                "hot_to_ring({input})"
-            );
-        }
-    }
-
-    #[test]
-    fn test_hot_to_ring_with_scale_and_offset() {
-        let truth_table = vec![0, 1, 2, 3];
-        let r_mod = 16u64;
-
-        for input in 0..4u64 {
-            let mut sys = System::new();
-            let b0 = sys.input(2);
-            let b1 = sys.input(2);
-            let h = ohe(&mut sys, &[b0, b1]);
-            let a = sys.constant(3, r_mod);
-            let b = sys.constant(5, r_mod);
-            let out = hot_to_ring(&mut sys, &h, &truth_table, a, b);
-
-            let mut exec = Exec::new(&sys);
-            exec.set(b0, Val::new(input & 1, 2));
-            exec.set(b1, Val::new((input >> 1) & 1, 2));
-            exec.run();
-
-            let expected = (3 * input + 5) % r_mod;
-            assert_eq!(
-                exec.get(out),
-                Val::new(expected, r_mod),
-                "3·{input} + 5 mod {r_mod}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_hot_to_ring_with_random_a_b() {
-        let mut rng = rng();
-        let truth_table = vec![0, 1, 2, 3];
-        let r_mod = 16u64;
-
-        for _ in 0..SAMPLES {
-            let a_val = rng.random_range(0..r_mod);
-            let b_val = rng.random_range(0..r_mod);
-            let input = rng.random_range(0..4u64);
-
-            let mut sys = System::new();
-            let b0 = sys.input(2);
-            let b1 = sys.input(2);
-            let h = ohe(&mut sys, &[b0, b1]);
-            let a = sys.constant(a_val, r_mod);
-            let b = sys.constant(b_val, r_mod);
-            let out = hot_to_ring(&mut sys, &h, &truth_table, a, b);
-
-            let mut exec = Exec::new(&sys);
-            exec.set(b0, Val::new(input & 1, 2));
-            exec.set(b1, Val::new((input >> 1) & 1, 2));
-            exec.run();
-
-            let expected = (a_val * input + b_val) % r_mod;
-            assert_eq!(exec.get(out), Val::new(expected, r_mod));
-        }
-    }
-
-    // ==================== word_to_ring ====================
-
-    #[test]
-    fn test_word_to_ring_square() {
-        let truth_table: Vec<u64> = (0u64..8).map(|x| (x * x) % 32).collect();
-        let r_mod = 32u64;
-
-        for input in 0u64..8 {
-            let mut sys = System::new();
-            let x = sys.input_bits(3);
-            let a = sys.constant(1, r_mod);
-            let b = sys.constant(0, r_mod);
-            let out = word_to_ring(&mut sys, x, &truth_table, a, b);
-
-            let mut exec = Exec::new(&sys);
-            exec.set(x, Val::from_bits(input, 3));
-            exec.run();
-
-            let expected = (input * input) % r_mod;
-            assert_eq!(
-                exec.get(out),
-                Val::new(expected, r_mod),
-                "g({input}) should be {expected}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_word_to_ring_identity() {
-        let truth_table = vec![0, 1, 2, 3];
-        let r_mod = 8u64;
-
-        for input in 0..4u64 {
-            let mut sys = System::new();
-            let x = sys.input_bits(2);
-            let a = sys.constant(1, r_mod);
-            let b = sys.constant(0, r_mod);
-            let out = word_to_ring(&mut sys, x, &truth_table, a, b);
-
-            let mut exec = Exec::new(&sys);
-            exec.set(x, Val::from_bits(input, 2));
-            exec.run();
-
-            assert_eq!(exec.get(out), Val::new(input, r_mod), "id({input})");
-        }
-    }
-
-    #[test]
-    fn test_word_to_ring_with_scale_and_offset() {
-        let truth_table: Vec<u64> = (0u64..8).map(|x| (x * x) % 32).collect();
-        let r_mod = 32u64;
-
-        for input in 0u64..8 {
-            let mut sys = System::new();
-            let x = sys.input_bits(3);
-            let a = sys.constant(2, r_mod);
-            let b = sys.constant(1, r_mod);
-            let out = word_to_ring(&mut sys, x, &truth_table, a, b);
-
-            let mut exec = Exec::new(&sys);
-            exec.set(x, Val::from_bits(input, 3));
-            exec.run();
-
-            let g = (input * input) % r_mod;
-            let expected = (2 * g + 1) % r_mod;
-            assert_eq!(
-                exec.get(out),
-                Val::new(expected, r_mod),
-                "2·({input}^2) + 1 mod {r_mod}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_word_to_ring_with_random_a_b() {
-        let mut rng = rng();
-        let truth_table: Vec<u64> = (0u64..4).map(|x| (x * x) % 16).collect();
-        let r_mod = 16u64;
-
-        for _ in 0..SAMPLES {
-            let a_val = rng.random_range(0..r_mod);
-            let b_val = rng.random_range(0..r_mod);
-            let input = rng.random_range(0..4u64);
-
-            let mut sys = System::new();
-            let x = sys.input_bits(2);
-            let a = sys.constant(a_val, r_mod);
-            let b = sys.constant(b_val, r_mod);
-            let out = word_to_ring(&mut sys, x, &truth_table, a, b);
-
-            let mut exec = Exec::new(&sys);
-            exec.set(x, Val::from_bits(input, 2));
-            exec.run();
-
-            let g = (input * input) % r_mod;
-            let expected = (a_val * g + b_val) % r_mod;
-            assert_eq!(exec.get(out), Val::new(expected, r_mod));
-        }
-    }
-
-    #[test]
-    fn test_word_to_ring_a_zero_returns_b() {
-        let truth_table = vec![0, 1, 2, 3];
-        let r_mod = 8u64;
-
-        let mut rng = rng();
-        for _ in 0..SAMPLES {
-            let b_val = rng.random_range(0..r_mod);
-            let input = rng.random_range(0..4u64);
-
-            let mut sys = System::new();
-            let x = sys.input_bits(2);
-            let a = sys.constant(0, r_mod);
-            let b = sys.constant(b_val, r_mod);
-            let out = word_to_ring(&mut sys, x, &truth_table, a, b);
-
-            let mut exec = Exec::new(&sys);
-            exec.set(x, Val::from_bits(input, 2));
-            exec.run();
-
-            assert_eq!(exec.get(out), Val::new(b_val, r_mod));
         }
     }
 
@@ -789,106 +477,6 @@ mod tests {
                 let v = exec.get(w).v;
                 let expected = if i as u64 == expected_pos { 1 } else { 0 };
                 assert_eq!(v, expected, "input={input}, h_p[{i}]");
-            }
-        }
-    }
-
-    // ==================== word_to_ring_mod ====================
-
-    #[test]
-    fn test_word_to_ring_mod_identity() {
-        // word_to_ring_mod with a=1, b=0 should give (input mod p).
-        let ell: u32 = 8;
-        let sub_widths = compute_sub_widths(ell, 4);
-
-        for p in [3u64, 5, 7] {
-            for input in 0u64..(1 << ell) {
-                let mut sys = System::new();
-                let x = sys.input_bits(ell);
-                let a = sys.constant(1, p);
-                let b = sys.constant(0, p);
-                let out = word_to_ring_mod(&mut sys, x, p, &sub_widths, a, b);
-
-                let mut exec = Exec::new(&sys);
-                exec.set(x, Val::from_bits(input, ell));
-                exec.run();
-
-                let expected = input % p;
-                assert_eq!(exec.get(out), Val::new(expected, p), "p={p}, input={input}");
-            }
-        }
-    }
-
-    #[test]
-    fn test_word_to_ring_mod_affine() {
-        // Verify a·(input mod p) + b for random a, b.
-        let ell: u32 = 10;
-        let sub_widths = compute_sub_widths(ell, 4);
-
-        let mut rng = rng();
-        for p in [3u64, 5, 7, 11] {
-            for _ in 0..SAMPLES {
-                let a_val = rng.random_range(0..p);
-                let b_val = rng.random_range(0..p);
-                let input = rng.random_range(0u64..(1 << ell));
-
-                let mut sys = System::new();
-                let x = sys.input_bits(ell);
-                let a = sys.constant(a_val, p);
-                let b = sys.constant(b_val, p);
-                let out = word_to_ring_mod(&mut sys, x, p, &sub_widths, a, b);
-
-                let mut exec = Exec::new(&sys);
-                exec.set(x, Val::from_bits(input, ell));
-                exec.run();
-
-                let expected = (a_val * (input % p) + b_val) % p;
-                assert_eq!(
-                    exec.get(out),
-                    Val::new(expected, p),
-                    "p={p}, a={a_val}, b={b_val}, input={input}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_word_to_ring_mod_matches_word_to_ring() {
-        // word_to_ring_mod should match word_to_ring with a mod-p truth table.
-        let ell: u32 = 6;
-        let sub_widths = compute_sub_widths(ell, 4);
-
-        for p in [3u64, 5] {
-            let truth_table: Vec<u64> = (0..(1u64 << ell)).map(|i| i % p).collect();
-
-            for input in 0u64..(1 << ell) {
-                // word_to_ring_mod path
-                let mut sys1 = System::new();
-                let x1 = sys1.input_bits(ell);
-                let a1 = sys1.constant(1, p);
-                let b1 = sys1.constant(0, p);
-                let out1 = word_to_ring_mod(&mut sys1, x1, p, &sub_widths, a1, b1);
-
-                let mut exec1 = Exec::new(&sys1);
-                exec1.set(x1, Val::from_bits(input, ell));
-                exec1.run();
-
-                // word_to_ring path
-                let mut sys2 = System::new();
-                let x2 = sys2.input_bits(ell);
-                let a2 = sys2.constant(1, p);
-                let b2 = sys2.constant(0, p);
-                let out2 = word_to_ring(&mut sys2, x2, &truth_table, a2, b2);
-
-                let mut exec2 = Exec::new(&sys2);
-                exec2.set(x2, Val::from_bits(input, ell));
-                exec2.run();
-
-                assert_eq!(
-                    exec1.get(out1),
-                    exec2.get(out2),
-                    "p={p}, input={input}: word_to_ring_mod vs word_to_ring"
-                );
             }
         }
     }

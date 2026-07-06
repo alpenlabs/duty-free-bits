@@ -13,26 +13,18 @@ repository = "https://github.com/alpenlabs/duty-free-bits"
 categories = ["cryptography"]
 keywords = ["garbled-circuits", "mpc", "switch-system", "bitvm"]
 
-[lints]
-rust.missing_debug_implementations = "warn"
-rust.rust_2018_idioms = { level = "deny", priority = -1 }
-rust.unreachable_pub = "warn"
-rust.unused_crate_dependencies = "deny"
-rust.unused_must_use = "deny"
-rust.unexpected_cfgs = { level = "warn", check-cfg = [
-  'cfg(coverage, coverage_nightly)',
-] }
-rust.missing_docs = "warn"
-rustdoc.all = "warn"
-clippy.too_long_first_doc_paragraph = "warn"
+# Lints live as crate attributes in src/lib.rs (the [lints] table tripped the
+# editor's stale Cargo schema; source attributes also avoid the group/lint
+# priority dance).
 
 [features]
 
-[dev-dependencies]
+[dependencies]
+mimalloc = { version = "0.1", default-features = false }
 rand = "0.10"
 
 [profile.release]
-opt-level = "z"   # Optimized for size, use 3 for speed
+opt-level = 3     # Compute-bound CCRH/modular kernel: ~2.9x faster than "z"
 lto = true        # Enable Link Time Optimization
 codegen-units = 1 # Reduced to increase optimizations
 panic = "abort"   # Abort on panic
