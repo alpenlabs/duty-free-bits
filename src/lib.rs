@@ -4,6 +4,10 @@
 #![warn(missing_debug_implementations, unreachable_pub, missing_docs)]
 #![warn(rustdoc::all)]
 #![warn(clippy::too_long_first_doc_paragraph)]
+// New default clippy lint (nightly ≥ 2026-07) that flags idiomatic
+// `chunks_exact(CONST)` over the `as_chunks` split; the rewrite is a churny
+// follow-up on hot loops, not worth gating this PR on.
+#![allow(clippy::chunks_exact_to_as_chunks)]
 //! Garbled evaluation of `a·x + b` over a CRT primorial, as a single
 //! straight-line protocol — no gate graph, no constraint solver, no worklist.
 //!

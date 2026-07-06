@@ -291,14 +291,15 @@ pub(crate) fn peel_chain(mut acc: Vec<Wide>) -> (Vec<Wide>, Wide) {
     (chain, root)
 }
 
-#[cfg(test)]
+// The only test here is the NEON differential, so the whole module is
+// aarch64-only (keeps its imports from going unused on other targets).
+#[cfg(all(test, target_arch = "aarch64"))]
 mod tests {
     use super::*;
     use rand::RngExt;
 
     /// The NEON even-k unpacker must agree with the scalar window loop on
     /// every width it claims (the upcast pads flow through this).
-    #[cfg(target_arch = "aarch64")]
     #[test]
     fn test_unpack_even_k_neon_matches_generic() {
         let mut rng = rand::rng();
