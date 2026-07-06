@@ -132,7 +132,7 @@ mod tests {
     use super::*;
 
     fn rand_ctrl() -> Label {
-        use rand::Rng;
+        use rand::RngExt;
         let mut r = rand::rng();
         let coords: Vec<u64> = (0..LAMBDA).map(|_| r.random_range(0..2u64)).collect();
         Label::Cf(CfLabel::from_coords(&coords, 2))
@@ -176,7 +176,7 @@ mod tests {
     #[test]
     fn test_solo_ctrl_changes_output() {
         let mut r = rand::rng();
-        use rand::Rng;
+        use rand::RngExt;
         let s_a: Vec<u64> = (0..LAMBDA).map(|_| r.random_range(0..2u64)).collect();
         let mut s_b = s_a.clone();
         s_b[0] ^= 1;

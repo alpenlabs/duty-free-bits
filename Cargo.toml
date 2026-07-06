@@ -21,7 +21,7 @@ keywords = ["garbled-circuits", "mpc", "switch-system", "bitvm"]
 
 [dependencies]
 mimalloc = { version = "0.1", default-features = false }
-rand = "0.9"
+rand = "0.10"
 
 [profile.release]
 opt-level = 3     # Compute-bound CCRH/modular kernel: ~2.9x faster than "z"

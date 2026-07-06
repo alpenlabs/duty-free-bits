@@ -20,7 +20,7 @@ use crate::exec::Exec;
 use crate::label::{self, CfLabel, LAMBDA, Label};
 use crate::system::System;
 use crate::types::{Val, Wire};
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 /// Identifier for a carry-forward wire in the pipeline.
 pub type CarryId = usize;

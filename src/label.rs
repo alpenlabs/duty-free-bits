@@ -65,7 +65,7 @@ impl CfLabel {
         l
     }
 
-    /// Unpack coordinates into a Vec<u64>.
+    /// Unpack coordinates into a `Vec<u64>`.
     pub fn to_coords(&self) -> Vec<u64> {
         (0..LAMBDA).map(|i| self.get(i)).collect()
     }
@@ -453,7 +453,7 @@ pub fn delta_r(delta: u128, modulus: u64) -> CfLabel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::Rng;
+    use rand::{Rng, RngExt};
 
     fn rng() -> impl Rng {
         rand::rng()
