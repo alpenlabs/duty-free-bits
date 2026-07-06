@@ -477,7 +477,7 @@ fn expand_and_fold_class(
 mod tests {
     use super::*;
     use crate::label::{self, LAMBDA};
-    use rand::Rng;
+    use rand::{Rng, RngExt};
 
     fn rand_wide(rng: &mut impl Rng, modulus: u64) -> Label {
         let coords: Vec<u64> = (0..LAMBDA).map(|_| rng.random_range(0..modulus)).collect();

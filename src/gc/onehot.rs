@@ -294,7 +294,7 @@ pub(crate) fn peel_chain(mut acc: Vec<Wide>) -> (Vec<Wide>, Wide) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::Rng;
+    use rand::RngExt;
 
     /// The NEON even-k unpacker must agree with the scalar window loop on
     /// every width it claims (the upcast pads flow through this).

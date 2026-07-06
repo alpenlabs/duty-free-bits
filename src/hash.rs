@@ -75,7 +75,7 @@ pub fn hash_z2(ctrl_words: &[u64; 2], group_id: u64) -> [u64; 2] {
 mod tests {
     use super::*;
     use crate::label::{LAMBDA, Label};
-    use rand::Rng;
+    use rand::RngExt;
 
     fn rand_ctrl() -> Label {
         let mut r = rand::rng();

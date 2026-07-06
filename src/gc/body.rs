@@ -493,7 +493,7 @@ fn mod_mul(a: u64, b: u64, p: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::Rng;
+    use rand::{Rng, RngExt};
 
     fn rand_cf2_label<R: Rng>(rng: &mut R) -> Label {
         let coords: Vec<u64> = (0..crate::label::LAMBDA)

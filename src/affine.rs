@@ -26,7 +26,7 @@ use crate::gc::extract::{
 };
 use crate::gc::fold::{fold_batch_eval, fold_batch_garble};
 use crate::label::{self, LAMBDA, Label};
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 /// Maximum sub-chunk width for the sub-chunk extraction optimization.
 /// 2^8 = 256 one-hot positions per sub-chunk.
