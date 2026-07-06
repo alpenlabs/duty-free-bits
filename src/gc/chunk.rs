@@ -15,7 +15,6 @@ use super::onehot::*;
 use crate::hash;
 use crate::label::{LAMBDA, Label, delta_r};
 
-
 /// (bulk ids, solo ids) consumed by one chunk step over `n_bits` input bits.
 pub fn chunk_nonces(n_bits: u32) -> (u64, u64) {
     (tree_ids(n_bits), 1u64 << n_bits)
@@ -37,8 +36,9 @@ pub struct ChunkGarbleOutput {
 }
 
 /// Garbler side: pack `bit_masks` (boolean-label masks, LSB-first) into a
-/// Z_{2^ell} arithmetic label — the straight-line `bin_to_word` (grow a one-hot
-/// over the input bits, upcast the leaves to width ell, `Σ p·A_p`).
+/// `Z_{2^ell}` arithmetic label — the straight-line `bin_to_word`.
+///
+/// Grow a one-hot over the input bits, upcast the leaves to width ell, `Σ p·A_p`.
 pub fn chunk_batch_garble(
     bit_masks: &[Label],
     ell: u32,
@@ -192,17 +192,20 @@ mod tests {
         let delta: u128 = rng.random::<u128>() | 1;
         let d2 = delta_r(delta, 2);
         let dl = delta_r(delta, 1u64 << ell);
-    
+
         let bit_masks: Vec<Label> = (0..nb).map(|_| rand_z2(&mut rng)).collect();
         let g = chunk_batch_garble(&bit_masks, ell, delta, 5_000, 9_000);
         let lim = 1u32 << ell;
-        assert!(g.pin.iter().all(|&lane| lane < lim), "pin lane not canonical");
+        assert!(
+            g.pin.iter().all(|&lane| lane < lim),
+            "pin lane not canonical"
+        );
         assert_eq!(g.cost.join_complexity as u32, nb - 1 + ell);
         assert_eq!(
             g.cost.hash_count as u64,
             (1u64 << nb) - 2 + ell as u64 * (1u64 << nb)
         );
-    
+
         for v in 0..(1u64 << nb) {
             let bit_labels: Vec<Label> = bit_masks
                 .iter()
@@ -217,7 +220,10 @@ mod tests {
                 .collect();
             let w = chunk_batch_eval(&bit_labels, v, ell, &g.scale, &g.pin, 5_000, 9_000);
             let expect = label::add(&g.word_mask, &label::scalar_mul(v, &dl));
-            assert_eq!(w, expect, "chunk word label ≠ mask + v·Δ for v={v} nb={nb} ell={ell}");
+            assert_eq!(
+                w, expect,
+                "chunk word label ≠ mask + v·Δ for v={v} nb={nb} ell={ell}"
+            );
         }
     }
 }

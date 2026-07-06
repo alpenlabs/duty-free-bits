@@ -13,7 +13,6 @@ use super::onehot::*;
 use crate::hash;
 use crate::label::{LAMBDA, Label, delta_r};
 
-
 /// Sub-chunk widths for decomposing an `ell`-bit value, each at most
 /// `max_width` bits (greedy: `ell = 22, max = 8 → [8, 8, 6]`).
 pub fn compute_sub_widths(ell: u32, max_width: u32) -> Vec<u32> {
@@ -236,11 +235,12 @@ pub fn extract_batch_garble(
     }
 }
 
-/// Evaluator side: the label-side mirror of [`extract_batch_garble`],
-/// following the straight-line `word_to_bin_up` schedule. `r_value` is the
-/// evaluator's cleartext `Σ coeff_c·v_c` (it knows `x`): every active index and
-/// class residue is index arithmetic; active slots are solved through the
-/// growth scalings, and the active upcast class through the root scaling.
+/// Evaluator side: the label-side mirror of [`extract_batch_garble`], following
+/// the straight-line `word_to_bin_up` schedule.
+///
+/// `r_value` is the evaluator's cleartext `Σ coeff_c·v_c` (it knows `x`): every
+/// active index and class residue is index arithmetic; active slots are solved
+/// through the growth scalings, and the active upcast class through the root scaling.
 pub fn extract_batch_eval(
     chunk_word_labels: &[Label],
     coeffs: &[u64],
@@ -257,7 +257,11 @@ pub fn extract_batch_eval(
         ell,
         "sub-chunk widths must sum to the chunk-word width"
     );
-    assert_eq!(diffs.len(), sub_widths.len(), "one SubChunkDiffs per sub-chunk");
+    assert_eq!(
+        diffs.len(),
+        sub_widths.len(),
+        "one SubChunkDiffs per sub-chunk"
+    );
     debug_assert!(chunk_word_labels.iter().all(|m| m.k() == ell));
     let mask_ell = ((1u64 << ell) - 1) as u32;
 
@@ -332,10 +336,7 @@ pub fn extract_batch_eval(
             // Active slot of level i solves through the growth scaling.
             let d = dd.scale[ii];
             let ys = ysum[i as usize];
-            let y_hot = [
-                bit_i[0] ^ d[0] ^ ys[0],
-                bit_i[1] ^ d[1] ^ ys[1],
-            ];
+            let y_hot = [bit_i[0] ^ d[0] ^ ys[0], bit_i[1] ^ d[1] ^ ys[1]];
             let hot = qi as usize;
             let parent = lvl[i as usize][hot];
             lvl[i as usize + 1][hot] = [parent[0] ^ y_hot[0], parent[1] ^ y_hot[1]];
@@ -433,7 +434,12 @@ fn expand_and_fold_class(
     for c in 0..(1u64 << tmax) {
         let leaf = z + (c << lz);
         let mut cast = [0u32; LAMBDA];
-        hash_cast(&lvl[k as usize][leaf as usize], p.solo_base + leaf, l, &mut cast);
+        hash_cast(
+            &lvl[k as usize][leaf as usize],
+            p.solo_base + leaf,
+            l,
+            &mut cast,
+        );
         sums.push(cast);
     }
     // Halve to the class total, gathering the high-half sums H_t.
@@ -504,16 +510,17 @@ mod tests {
         let mut rng = rand::rng();
         let delta: u128 = rng.random::<u128>() | 1;
         let d2 = delta_r(delta, 2);
-    
+
         for (ell, sub_widths, coeffs) in [
             (8u32, vec![4u32, 4], vec![1u64, 16]),
             (22, vec![8, 8, 6], vec![1, 37, 4123]),
         ] {
             let m_ell = 1u64 << ell;
-            let word_masks: Vec<Label> =
-                (0..coeffs.len()).map(|_| rand_wide(&mut rng, m_ell)).collect();
+            let word_masks: Vec<Label> = (0..coeffs.len())
+                .map(|_| rand_wide(&mut rng, m_ell))
+                .collect();
             let (bulk_n, solo_n) = extract_nonces(&sub_widths);
-    
+
             let g = extract_batch_garble(&word_masks, &coeffs, &sub_widths, delta, 100, 200);
             // Emitted material must be canonical: every pin lane < 2^l, where
             // l is the stage's upcast width (the remainder width, or k on the
@@ -523,7 +530,10 @@ mod tests {
                 let l = if q == sub_widths.len() - 1 { k } else { rb };
                 rb -= k;
                 let lim = 1u32 << l;
-                assert!(dd.pin.iter().all(|&lane| lane < lim), "pin lane not canonical");
+                assert!(
+                    dd.pin.iter().all(|&lane| lane < lim),
+                    "pin lane not canonical"
+                );
             }
             let expect_cost: usize = {
                 let mut rb = ell;
@@ -539,11 +549,12 @@ mod tests {
             };
             assert_eq!(g.cost.hash_count, expect_cost);
             let _ = (bulk_n, solo_n);
-    
+
             // Random chunk-word values; r = Σ coeff·v mod 2^ell.
             for _ in 0..24 {
-                let values: Vec<u64> =
-                    (0..coeffs.len()).map(|_| rng.random_range(0..m_ell)).collect();
+                let values: Vec<u64> = (0..coeffs.len())
+                    .map(|_| rng.random_range(0..m_ell))
+                    .collect();
                 let r: u64 = values
                     .iter()
                     .zip(&coeffs)
@@ -554,18 +565,11 @@ mod tests {
                     .zip(&values)
                     .map(|(m, &v)| label::add(m, &label::scalar_mul(v, &dl_ell)))
                     .collect();
-    
-                let ev = extract_batch_eval(
-                    &word_labels,
-                    &coeffs,
-                    r,
-                    &sub_widths,
-                    &g.diffs,
-                    100,
-                    200,
-                );
+
+                let ev =
+                    extract_batch_eval(&word_labels, &coeffs, r, &sub_widths, &g.diffs, 100, 200);
                 let (fbh, fbits) = (&ev.first_bin_hot_labels, &ev.fold_bit_labels);
-    
+
                 // first_bin_hot: label = mask + [p == r mod 2^{w0}]·Δ₂.
                 let w0 = sub_widths[0];
                 let low = (r & ((1u64 << w0) - 1)) as usize;
@@ -668,7 +672,12 @@ mod micro {
         let resid_secs = t.elapsed().as_secs_f64();
 
         let per = |s: f64| 1e3 * s / 30.0; // ms per bench_axb_stages rep (80 primes)
-        eprintln!("per-rep (80 primes): cast hashing {:.2}ms | tree z2 {:.2}ms | eval folds {:.2}ms | garbler residues {:.2}ms",
-            per(cast_secs), per(tree_secs), per(fold_secs), per(resid_secs));
+        eprintln!(
+            "per-rep (80 primes): cast hashing {:.2}ms | tree z2 {:.2}ms | eval folds {:.2}ms | garbler residues {:.2}ms",
+            per(cast_secs),
+            per(tree_secs),
+            per(fold_secs),
+            per(resid_secs)
+        );
     }
 }

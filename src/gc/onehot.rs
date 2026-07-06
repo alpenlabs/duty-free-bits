@@ -19,7 +19,6 @@ use crate::gc::Cost;
 use crate::hash;
 use crate::label::{LAMBDA, Label};
 
-
 /// Packed words of a boolean label (the bare-word working type).
 pub(crate) type Z2 = [u64; 2];
 
@@ -200,11 +199,7 @@ fn unpack_even_k_neon(scratch: &[u8], k: usize, dst: &mut Wide) {
 pub(crate) fn peel_bit(sub: &Wide, res: &Wide, i: u32, k: u32) -> Z2 {
     let mask_k = ((1u64 << k) - 1) as u32;
     let mut out = [0u64; 2];
-    for (w, (sc, rc)) in sub
-        .chunks_exact(64)
-        .zip(res.chunks_exact(64))
-        .enumerate()
-    {
+    for (w, (sc, rc)) in sub.chunks_exact(64).zip(res.chunks_exact(64)).enumerate() {
         let mut acc = 0u64;
         for (idx, (&s, &r)) in sc.iter().zip(rc).enumerate() {
             let d = s.wrapping_sub(r) & mask_k;

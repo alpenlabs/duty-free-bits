@@ -1,8 +1,10 @@
-//! Step 3 of 4 (computational GC): free-reindex the extract step's boolean
-//! one-hot into residue classes mod `p_i` (h[i mod p] = Σ, a free Z₂ recombine),
-//! then one-hot-scale in the remaining sub-chunk bits — one scaling per fold
-//! bit, hashing all `p` slots — to a length-`p_i` one-hot of `x mod p_i` that
-//! [`super::body`] consumes. Straight-line garble/eval over boolean labels.
+//! Step 3 of 4 (computational GC): reduce the extract step's boolean one-hot to
+//! a length-`p_i` one-hot of `x mod p_i` that [`super::body`] consumes.
+//!
+//! Free-reindex the one-hot into residue classes mod `p_i` (h[i mod p] = Σ, a
+//! free Z₂ recombine), then one-hot-scale in the remaining sub-chunk bits — one
+//! scaling per fold bit, hashing all `p` slots. Straight-line garble/eval over
+//! boolean labels.
 //!
 //! The fold is regular — per folded bit `b`, per slot `r`:
 //!
@@ -44,7 +46,7 @@ pub struct FoldGarbleOutput {
 /// Packed words of a boolean label.
 #[inline]
 fn z2_words(l: &Label) -> [u64; 2] {
-    debug_assert_eq!(l.modulus(), 2, "fold wires are CF Z_2");
+    debug_assert_eq!(l.modulus(), 2, "fold wires are boolean labels (Z_2)");
     let raw = l.raw_bits();
     [raw[0], raw[1]]
 }

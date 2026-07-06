@@ -1,6 +1,7 @@
 //! The crate's concrete CCRH (circular correlation-robust hash) — the CCRND
-//! construction from §5 of <https://eprint.iacr.org/2019/074.pdf>. "CCRND" and
-//! "CCRH" name the same primitive here; downstream modules say CCRH.
+//! construction from §5 of <https://eprint.iacr.org/2019/074.pdf>.
+//!
+//! "CCRND" and "CCRH" name the same primitive here; downstream modules say CCRH.
 //!
 //!   H(x, t) = AES_K( σ(x ⊕ public_s ⊕ t) ) ⊕ σ(x ⊕ public_s ⊕ t)
 //!
@@ -34,9 +35,10 @@ pub type Block = [u8; 16];
 #[cfg(feature = "count-hashes")]
 static HASH_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// CCRH blocks (16-byte AES outputs) emitted so far. Returns 0 unless built
-/// with the `count-hashes` feature — used for per-party hash accounting in
-/// benchmarks (snapshot the delta around a garble or eval region).
+/// CCRH blocks (16-byte AES outputs) emitted so far.
+///
+/// Returns 0 unless built with the `count-hashes` feature — used for per-party
+/// hash accounting in benchmarks (snapshot the delta around a garble or eval region).
 #[inline]
 pub fn hash_blocks() -> u64 {
     #[cfg(feature = "count-hashes")]

@@ -209,7 +209,6 @@ impl Label {
             modulus,
         }
     }
-
 }
 
 /// Packed words of the widest supported label (k = 32), plus one pad word so

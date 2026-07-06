@@ -12,7 +12,6 @@ fn rng() -> impl Rng {
     rand::rng()
 }
 
-
 struct BenchRng {
     state: u64,
 }
@@ -135,7 +134,10 @@ fn bench_axb_comparison() {
     use std::time::Instant;
 
     let env = |k: &str, d: usize| -> usize {
-        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
     };
     let n = env("N", 256) as u32;
     let s = env("S", 1536);
@@ -237,8 +239,7 @@ fn bench_axb_comparison() {
         // per-stage timers, so garble/eval exclude label provisioning —
         // matching bit-decomp's untimed encode().
         let t = Instant::now();
-        let (out, stats) =
-            crate::affine::build_s_aff(&mut rng, &x_bits, &params, &a_res, &b_res);
+        let (out, stats) = crate::affine::build_s_aff(&mut rng, &x_bits, &params, &a_res, &b_res);
         let core = t.elapsed().as_secs_f64();
         black_box(&out);
 
@@ -276,17 +277,36 @@ fn bench_axb_comparison() {
     let mb = |bits: usize| bits as f64 / 8.0 / 1e6;
     let m = |x: usize| x as f64 / 1e6;
     eprintln!("\n========== a·x + b benchmark  (N={n}, S={s}, single-thread, release) ==========");
-    eprintln!("iters={iters}, warmup={warmup}; values are MEDIAN [MIN] ms; one-hot CRT garble incl. smudge (64-bit mu)");
-    eprintln!("+ CRT-encode of a,b; one-hot CRT eval incl. Garner + mod-q to field elements; excludes a,b sampling & verify\n");
-    eprintln!("{:<22}{:>17}{:>17}{:>17}", "approach", "garble", "eval", "garble+eval");
+    eprintln!(
+        "iters={iters}, warmup={warmup}; values are MEDIAN [MIN] ms; one-hot CRT garble incl. smudge (64-bit mu)"
+    );
+    eprintln!(
+        "+ CRT-encode of a,b; one-hot CRT eval incl. Garner + mod-q to field elements; excludes a,b sampling & verify\n"
+    );
+    eprintln!(
+        "{:<22}{:>17}{:>17}{:>17}",
+        "approach", "garble", "eval", "garble+eval"
+    );
     eprintln!("{:-<73}", "");
     eprintln!(
         "{:<22}{:>9.2} [{:>5.2}]{:>9.2} [{:>5.2}]{:>9.2} [{:>5.2}]",
-        "bit-decomposition", bdg_med, bdg_min, bde_med, bde_min, bdg_med + bde_med, bdg_min + bde_min
+        "bit-decomposition",
+        bdg_med,
+        bdg_min,
+        bde_med,
+        bde_min,
+        bdg_med + bde_med,
+        bdg_min + bde_min
     );
     eprintln!(
         "{:<22}{:>9.2} [{:>5.2}]{:>9.2} [{:>5.2}]{:>9.2} [{:>5.2}]",
-        "one-hot CRT", swg_med, swg_min, swe_med, swe_min, swg_med + swe_med, swg_min + swe_min
+        "one-hot CRT",
+        swg_med,
+        swg_min,
+        swe_med,
+        swe_min,
+        swg_med + swe_med,
+        swg_min + swe_min
     );
     eprintln!(
         "{:<22}{:>15.2}x{:>16.2}x{:>16.2}x",
@@ -316,7 +336,9 @@ fn bench_axb_comparison() {
         sw_cf,
         sw_ncf
     );
-    eprintln!("                skips each scaling's active slot; exact split via `bench_axb_hashcounts`)");
+    eprintln!(
+        "                skips each scaling's active slot; exact split via `bench_axb_hashcounts`)"
+    );
     eprintln!(
         "comm:    bit-decomp  {:.1} MiB (GRR, materialized; {:.1} MiB if both rows sent)   |   one-hot CRT  {:.2} MB (scaling width)  => ~{:.0}x less\n",
         mib(bd_comm_grr),
@@ -345,7 +367,10 @@ fn bench_axb_network() {
     use std::time::Instant;
 
     let env = |k: &str, d: usize| -> usize {
-        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
     };
     let n = env("N", 256) as u32;
     let s = env("S", 1536);
@@ -439,8 +464,7 @@ fn bench_axb_network() {
             })
             .collect();
         let t_enc = t.elapsed().as_secs_f64();
-        let (out, stats) =
-            crate::affine::build_s_aff(&mut rng, &x_bits, &params, &a_res, &b_res);
+        let (out, stats) = crate::affine::build_s_aff(&mut rng, &x_bits, &params, &a_res, &b_res);
         black_box(&out);
         // Evaluator ends with a·x+b over the field: Garner + mod-q is eval-side.
         let t = Instant::now();
@@ -473,7 +497,9 @@ fn bench_axb_network() {
         "\n===== a·x + b end-to-end over a {:.0} Mbps link  (N={n}, S={s}, single-thread, release) =====",
         bw_mbps
     );
-    eprintln!("iters={iters}, warmup={warmup}; garble/eval = MEDIAN ms; transmit = (GC bytes·8)/bandwidth\n");
+    eprintln!(
+        "iters={iters}, warmup={warmup}; garble/eval = MEDIAN ms; transmit = (GC bytes·8)/bandwidth\n"
+    );
     eprintln!(
         "{:<22}{:>10}{:>16}{:>10}{:>14}",
         "approach", "garble", "transmit", "eval", "END-TO-END"
@@ -525,7 +551,9 @@ fn bench_axb_network() {
         sw_cf,
         sw_ncf
     );
-    eprintln!("                skips each scaling's active slot; exact split via `bench_axb_hashcounts`)\n");
+    eprintln!(
+        "                skips each scaling's active slot; exact split via `bench_axb_hashcounts`)\n"
+    );
 }
 
 /// Exact per-party CCRH hash-call counts (16-byte AES blocks) for both
@@ -546,7 +574,10 @@ fn bench_axb_hashcounts() {
     use crate::crypto::{hash_blocks, reset_hash_blocks};
 
     let n = 256u32;
-    let s: usize = std::env::var("S").ok().and_then(|v| v.parse().ok()).unwrap_or(1536);
+    let s: usize = std::env::var("S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1536);
     assert_eq!(n as usize, bitdecomp::N_BITS);
     let mut rng = BenchRng::new(0x0DDC0FFEE0DDF00D);
 
@@ -579,29 +610,49 @@ fn bench_axb_hashcounts() {
         .collect();
     let x_bits: Vec<u64> = (0..n as usize).map(|_| rng.random_range(0..2u64)).collect();
     reset_hash_blocks();
-    let (_, stats) =
-        crate::affine::build_s_aff(&mut rng, &x_bits, &params, &a_res, &b_res);
+    let (_, stats) = crate::affine::build_s_aff(&mut rng, &x_bits, &params, &a_res, &b_res);
     let sw_total = hash_blocks();
     let sw_g = stats.garble_hash_blocks;
     let sw_e = stats.eval_hash_blocks;
     let sw_ledger = (stats.hash_count_cf + stats.hash_count_ncf) as u64;
 
     // Cross-checks: measured == ground truth.
-    assert_eq!(bd_g as usize, led.garble_calls, "bit-decomp garbler vs HashLedger");
-    assert_eq!(bd_e as usize, led.eval_calls, "bit-decomp evaluator vs HashLedger");
-    assert_eq!(sw_g + sw_e, sw_total, "one-hot CRT per-party blocks must sum to measured total");
+    assert_eq!(
+        bd_g as usize, led.garble_calls,
+        "bit-decomp garbler vs HashLedger"
+    );
+    assert_eq!(
+        bd_e as usize, led.eval_calls,
+        "bit-decomp evaluator vs HashLedger"
+    );
+    assert_eq!(
+        sw_g + sw_e,
+        sw_total,
+        "one-hot CRT per-party blocks must sum to measured total"
+    );
 
     let mm = |x: u64| x as f64 / 1e6;
-    eprintln!("\n===== a·x+b CCRH hash calls (16-byte AES blocks), per party  (N={n}, S={s}) =====\n");
-    eprintln!("{:<22}{:>14}{:>14}{:>12}", "approach", "GARBLER", "EVALUATOR", "eval/garble");
+    eprintln!(
+        "\n===== a·x+b CCRH hash calls (16-byte AES blocks), per party  (N={n}, S={s}) =====\n"
+    );
+    eprintln!(
+        "{:<22}{:>14}{:>14}{:>12}",
+        "approach", "GARBLER", "EVALUATOR", "eval/garble"
+    );
     eprintln!("{:-<62}", "");
     eprintln!(
         "{:<22}{:>14}{:>14}{:>11.2}x",
-        "bit-decomposition", bd_g, bd_e, bd_e as f64 / bd_g as f64
+        "bit-decomposition",
+        bd_g,
+        bd_e,
+        bd_e as f64 / bd_g as f64
     );
     eprintln!(
         "{:<22}{:>14}{:>14}{:>11.2}x",
-        "one-hot CRT", sw_g, sw_e, sw_e as f64 / sw_g as f64
+        "one-hot CRT",
+        sw_g,
+        sw_e,
+        sw_e as f64 / sw_g as f64
     );
     eprintln!(
         "\nbit-decomp closed form : garbler 4nS = {}, eval 2nS = {}  (exact, input-independent)",
@@ -681,7 +732,6 @@ fn test_s_aff_sweep() {
     }
 }
 
-
 #[test]
 #[ignore]
 fn bench_axb_stages() {
@@ -716,13 +766,8 @@ fn bench_axb_stages() {
     for _ in 0..reps {
         let x: u64 = rng.random_range(0..u64::MAX >> (64 - n.min(63)));
         let x_bits: Vec<u64> = (0..n).map(|j| (x >> (j % 64)) & 1).collect();
-        let (outputs, stats) = crate::affine::build_s_aff(
-            &mut rng,
-            &x_bits,
-            &params,
-            &a_residues,
-            &b_residues,
-        );
+        let (outputs, stats) =
+            crate::affine::build_s_aff(&mut rng, &x_bits, &params, &a_residues, &b_residues);
         std::hint::black_box(&outputs);
         agg.chunk_garble_secs += stats.chunk_garble_secs;
         agg.chunk_eval_secs += stats.chunk_eval_secs;

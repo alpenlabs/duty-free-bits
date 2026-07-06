@@ -61,11 +61,10 @@ fn measure<T>(secs: &mut f64, blocks: &mut u64, f: impl FnOnce() -> T) -> T {
     out
 }
 
-
-
-/// Per-stage telemetry of one [`build_s_aff`] run. Times are wall-clock
-/// seconds; `*_hash_blocks` are CCRH AES blocks (nonzero only under the
-/// `count-hashes` feature); the ledger fields count communication + hashes.
+/// Per-stage telemetry of one [`build_s_aff`] run.
+///
+/// Times are wall-clock seconds; `*_hash_blocks` are CCRH AES blocks (nonzero
+/// only under the `count-hashes` feature); the ledger fields count communication + hashes.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Stats {
     /// Chunk-step garble wall time.
@@ -103,7 +102,9 @@ pub struct Stats {
 impl Stats {
     /// Total garble/eval wall time.
     pub fn garble_secs(&self) -> f64 {
-        self.chunk_garble_secs + self.extract_garble_secs + self.fold_garble_secs
+        self.chunk_garble_secs
+            + self.extract_garble_secs
+            + self.fold_garble_secs
             + self.body_garble_secs
     }
     /// See [`garble_secs`](Self::garble_secs).
@@ -126,11 +127,13 @@ impl Stats {
     }
 }
 
-/// Garble + evaluate the affine maps: chunk conversion → per-prime extract
-/// → fold → body, all straight-line loops over bare labels ([`crate::gc::chunk`],
-/// [`crate::gc::extract`], [`crate::gc::fold`], [`crate::gc::body`]).
-/// No gate graph, no worklist: the evaluator holds `x_bits` in the clear, so it
-/// knows every active position and every derivation order is closed-form.
+/// Garble + evaluate the affine maps as four straight-line steps: chunk
+/// conversion → per-prime extract → fold → body.
+///
+/// The steps are [`crate::gc::chunk`], [`crate::gc::extract`],
+/// [`crate::gc::fold`], [`crate::gc::body`]. No gate graph, no worklist: the
+/// evaluator holds `x_bits` in the clear, so it knows every active position and
+/// every derivation order is closed-form.
 ///
 /// One parameter restriction: the extract step represents width-`l` arithmetic
 /// labels as u32 lanes, so every sub-chunk width must be in `2..=31`; shapes
@@ -220,13 +223,17 @@ pub fn build_s_aff<R: rand::Rng>(
         let bulk = bulk_chunk_base + c as u64 * chunk_bulk_ids;
         let solo = solo_chunk_base + c as u64 * chunk_solo_ids;
 
-        let g = measure(&mut stats.chunk_garble_secs, &mut stats.garble_hash_blocks, || {
-            chunk_batch_garble(&masks, ell, delta, bulk, solo)
-        });
+        let g = measure(
+            &mut stats.chunk_garble_secs,
+            &mut stats.garble_hash_blocks,
+            || chunk_batch_garble(&masks, ell, delta, bulk, solo),
+        );
 
-        let w = measure(&mut stats.chunk_eval_secs, &mut stats.eval_hash_blocks, || {
-            chunk_batch_eval(&labels, chunk_values[c], ell, &g.scale, &g.pin, bulk, solo)
-        });
+        let w = measure(
+            &mut stats.chunk_eval_secs,
+            &mut stats.eval_hash_blocks,
+            || chunk_batch_eval(&labels, chunk_values[c], ell, &g.scale, &g.pin, bulk, solo),
+        );
 
         stats.add_cf(g.cost);
         chunk_word_masks.push(g.word_mask);
@@ -239,11 +246,7 @@ pub fn build_s_aff<R: rand::Rng>(
         let coeffs: Vec<u64> = (0..num_chunks)
             .map(|c| pow2_mod((c * chunk_size) as u32, p_i))
             .collect();
-        let r_value: u64 = chunk_values
-            .iter()
-            .zip(&coeffs)
-            .map(|(&v, &c)| c * v)
-            .sum();
+        let r_value: u64 = chunk_values.iter().zip(&coeffs).map(|(&v, &c)| c * v).sum();
         assert!(
             r_value < work_mod,
             "r_i overflows 2^ell — CrtParams.ell undersized for these primes/n"
@@ -253,26 +256,61 @@ pub fn build_s_aff<R: rand::Rng>(
         let bulk = bulk_extract_base + i as u64 * ex_bulk_ids;
         let solo = solo_extract_base + i as u64 * ex_solo_ids;
 
-        let g = measure(&mut stats.extract_garble_secs, &mut stats.garble_hash_blocks, || {
-            extract_batch_garble(&chunk_word_masks, &coeffs, &sub_widths, delta, bulk, solo)
-        });
+        let g = measure(
+            &mut stats.extract_garble_secs,
+            &mut stats.garble_hash_blocks,
+            || extract_batch_garble(&chunk_word_masks, &coeffs, &sub_widths, delta, bulk, solo),
+        );
 
-        let ex = measure(&mut stats.extract_eval_secs, &mut stats.eval_hash_blocks, || {
-            extract_batch_eval(&chunk_word_labels, &coeffs, r_value, &sub_widths, &g.diffs, bulk, solo)
-        });
+        let ex = measure(
+            &mut stats.extract_eval_secs,
+            &mut stats.eval_hash_blocks,
+            || {
+                extract_batch_eval(
+                    &chunk_word_labels,
+                    &coeffs,
+                    r_value,
+                    &sub_widths,
+                    &g.diffs,
+                    bulk,
+                    solo,
+                )
+            },
+        );
 
         stats.add_cf(g.cost);
 
         // ---- Fold step. ----
         let fold_nonce_base = prime_nonce_bases[i] + num_batches as u64 * p_i;
-        let fold_g = measure(&mut stats.fold_garble_secs, &mut stats.garble_hash_blocks, || {
-            fold_batch_garble(p_i, &g.first_bin_hot_masks, &g.fold_bit_masks, first_width, fold_nonce_base)
-        });
+        let fold_g = measure(
+            &mut stats.fold_garble_secs,
+            &mut stats.garble_hash_blocks,
+            || {
+                fold_batch_garble(
+                    p_i,
+                    &g.first_bin_hot_masks,
+                    &g.fold_bit_masks,
+                    first_width,
+                    fold_nonce_base,
+                )
+            },
+        );
 
-        let h_p_labels = measure(&mut stats.fold_eval_secs, &mut stats.eval_hash_blocks, || {
-            fold_batch_eval(p_i, r_value, &ex.first_bin_hot_labels, &ex.fold_bit_labels,
-                &fold_g.join_diffs, first_width, fold_nonce_base)
-        });
+        let h_p_labels = measure(
+            &mut stats.fold_eval_secs,
+            &mut stats.eval_hash_blocks,
+            || {
+                fold_batch_eval(
+                    p_i,
+                    r_value,
+                    &ex.first_bin_hot_labels,
+                    &ex.fold_bit_labels,
+                    &fold_g.join_diffs,
+                    first_width,
+                    fold_nonce_base,
+                )
+            },
+        );
         stats.add_cf(fold_g.cost);
         let h_p_masks = fold_g.h_p_masks;
 
@@ -287,13 +325,27 @@ pub fn build_s_aff<R: rand::Rng>(
             let batch_idx = start / RESIDUE_BATCH_SIZE;
             let nonce_base = prime_nonce_bases[i] as usize + batch_idx * p_i as usize;
 
-            let g_out = measure(&mut stats.body_garble_secs, &mut stats.garble_hash_blocks, || {
-                body_batch_garble(p_i, &h_p_masks, &a_batch, &b_batch, &weights, nonce_base)
-            });
+            let g_out = measure(
+                &mut stats.body_garble_secs,
+                &mut stats.garble_hash_blocks,
+                || body_batch_garble(p_i, &h_p_masks, &a_batch, &b_batch, &weights, nonce_base),
+            );
 
-            let result_labels = measure(&mut stats.body_eval_secs, &mut stats.eval_hash_blocks, || {
-                body_batch_eval(p_i, hot_i, &h_p_labels, &g_out.join_diffs, &b_batch, &weights, nonce_base)
-            });
+            let result_labels = measure(
+                &mut stats.body_eval_secs,
+                &mut stats.eval_hash_blocks,
+                || {
+                    body_batch_eval(
+                        p_i,
+                        hot_i,
+                        &h_p_labels,
+                        &g_out.join_diffs,
+                        &b_batch,
+                        &weights,
+                        nonce_base,
+                    )
+                },
+            );
 
             for (l, m) in result_labels.iter().zip(g_out.result_masks.iter()) {
                 let value = if l >= m { l - m } else { l + p_i - m };
@@ -314,7 +366,7 @@ pub fn build_s_aff<R: rand::Rng>(
 ///
 /// Solo domain (the width-`l` upcast pads): chunk-step windows first, then the
 /// per-prime extract windows. Bulk domain (the boolean one-hot growing hashes
-/// + the fold/body steps): the fold/body per-prime windows from
+/// and the fold/body steps): the fold/body per-prime windows from
 /// [`BULK_NONCE_FLOOR`], then the chunk windows, then the per-prime extract
 /// windows above those. This struct is the single source of truth the driver
 /// draws its bases from; `test_nonce_windows_disjoint` pins the partition (a
@@ -390,12 +442,28 @@ impl NonceLayout {
     pub(crate) fn windows(&self) -> Vec<(bool, u64, u64)> {
         let mut w = Vec::new();
         for c in 0..self.num_chunks as u64 {
-            w.push((false, self.solo_chunk_base + c * self.chunk_solo_ids, self.chunk_solo_ids));
-            w.push((true, self.bulk_chunk_base + c * self.chunk_bulk_ids, self.chunk_bulk_ids));
+            w.push((
+                false,
+                self.solo_chunk_base + c * self.chunk_solo_ids,
+                self.chunk_solo_ids,
+            ));
+            w.push((
+                true,
+                self.bulk_chunk_base + c * self.chunk_bulk_ids,
+                self.chunk_bulk_ids,
+            ));
         }
         for i in 0..self.num_primes {
-            w.push((false, self.solo_extract_base + i as u64 * self.ex_solo_ids, self.ex_solo_ids));
-            w.push((true, self.bulk_extract_base + i as u64 * self.ex_bulk_ids, self.ex_bulk_ids));
+            w.push((
+                false,
+                self.solo_extract_base + i as u64 * self.ex_solo_ids,
+                self.ex_solo_ids,
+            ));
+            w.push((
+                true,
+                self.bulk_extract_base + i as u64 * self.ex_bulk_ids,
+                self.ex_bulk_ids,
+            ));
             w.push((true, self.prime_nonce_bases[i], self.prime_window_sizes[i]));
         }
         w

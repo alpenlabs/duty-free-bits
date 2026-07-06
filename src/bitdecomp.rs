@@ -4,7 +4,7 @@
 //!
 //! This module deliberately does **not** use one-hot scaling, the CRT, or any
 //! of the engines in [`crate::gc`] / [`crate::gc::body`]. It implements the
-//! naive bit-decomposition construction (the [EL26]/BABE-style projectivization
+//! naive bit-decomposition construction (the \[EL26\]/BABE-style projectivization
 //! that the CRT path in [`crate::affine`] replaces) so the two can be compared
 //! on the same `a·x+b` workload: the bit-decomposition path pays far more
 //! *communication* (`Θ(S·n²)`) but is almost pure CCRH, so its *runtime* is the
@@ -52,10 +52,10 @@
 use crate::crypto::{Block, expand};
 use rand::Rng;
 
-/// Number of bits `x` is decomposed into. Matches the s-aff workload's `N=256`
-/// (the BN254 prime is 254-bit, so the top two bit-positions are always zero,
-/// but the garbler still garbles all `N_BITS` positions since it cannot know
-/// `x`).
+/// Number of bits `x` is decomposed into (the s-aff workload's `N=256`).
+///
+/// The BN254 prime is 254-bit, so the top two bit-positions are always zero, but
+/// the garbler still garbles all `N_BITS` positions since it cannot know `x`.
 pub const N_BITS: usize = 256;
 
 /// Bytes in the canonical encoding of an `F_p` element.
@@ -275,7 +275,9 @@ fn u64_bytes_mut(s: &mut [u64]) -> &mut [u8] {
     // borrows `s` for its lifetime. Byte order is whatever the host uses, which
     // is consistent across garble and eval (ciphertexts are never compared
     // across machines).
-    unsafe { core::slice::from_raw_parts_mut(s.as_mut_ptr().cast::<u8>(), std::mem::size_of_val(s)) }
+    unsafe {
+        core::slice::from_raw_parts_mut(s.as_mut_ptr().cast::<u8>(), std::mem::size_of_val(s))
+    }
 }
 
 /// XOR two 128-bit blocks.
@@ -315,8 +317,10 @@ pub fn cost_model(s: usize) -> HashLedger {
 // ---- Garbling ----
 
 /// The garbler's output under **garbled-row-reduction (GRR)**: only the
-/// transmitted ciphertexts are materialized. The `xᵢ=0` rows for bits `1..n`
-/// are *free* — their share is defined as `bᵢ := reduce(H(Lᵢ⁰))`, so the masked
+/// transmitted ciphertexts are materialized.
+///
+/// The `xᵢ=0` rows for bits `1..n` are *free* — their share is defined as
+/// `bᵢ := reduce(H(Lᵢ⁰))`, so the masked
 /// value is 0 and the row need not be stored or sent. Only the `n` row-1
 /// ciphertexts (the `xᵢ=1` selections) plus the single non-free row-0 (bit 0,
 /// whose share is forced to meet the `Σ 2ⁱ bᵢ = b` constraint) are kept. This
@@ -384,10 +388,20 @@ pub fn garble(a: &[Fp], b: &[Fp], rng: &mut impl Rng, ledger: &mut HashLedger) -
         let l0 = labels0[i];
         let l1 = xor_block(l0, delta);
         let off = i * row_words;
-        expand_counted(l0, i as u64, u64_bytes_mut(&mut scratch0), &mut ledger.garble_calls);
+        expand_counted(
+            l0,
+            i as u64,
+            u64_bytes_mut(&mut scratch0),
+            &mut ledger.garble_calls,
+        );
         // Expand H(Lᵢ¹) straight into the bank slot; reduce it in place to pad1,
         // then overwrite with the computed ciphertext.
-        expand_counted(l1, i as u64, u64_bytes_mut(&mut ct1[off..off + row_words]), &mut ledger.garble_calls);
+        expand_counted(
+            l1,
+            i as u64,
+            u64_bytes_mut(&mut ct1[off..off + row_words]),
+            &mut ledger.garble_calls,
+        );
         let row1 = &mut ct1[off..off + row_words];
         for (((c1, p0), accj), &aj) in row1
             .chunks_exact_mut(FE_LIMBS)
@@ -408,8 +422,18 @@ pub fn garble(a: &[Fp], b: &[Fp], rng: &mut impl Rng, ledger: &mut HashLedger) -
     {
         let l0 = labels0[0];
         let l1 = xor_block(l0, delta);
-        expand_counted(l0, 0, u64_bytes_mut(&mut scratch0), &mut ledger.garble_calls);
-        expand_counted(l1, 0, u64_bytes_mut(&mut ct1[0..row_words]), &mut ledger.garble_calls);
+        expand_counted(
+            l0,
+            0,
+            u64_bytes_mut(&mut scratch0),
+            &mut ledger.garble_calls,
+        );
+        expand_counted(
+            l1,
+            0,
+            u64_bytes_mut(&mut ct1[0..row_words]),
+            &mut ledger.garble_calls,
+        );
         let row1 = &mut ct1[0..row_words];
         for ((((c1, c0), p0), &accj), (&aj, &bj)) in row1
             .chunks_exact_mut(FE_LIMBS)
@@ -428,7 +452,14 @@ pub fn garble(a: &[Fp], b: &[Fp], rng: &mut impl Rng, ledger: &mut HashLedger) -
         }
     }
 
-    Garbling { s, row_words, ct1, ct0_0, labels0, delta }
+    Garbling {
+        s,
+        row_words,
+        ct1,
+        ct0_0,
+        labels0,
+        delta,
+    }
 }
 
 /// Select the evaluator's active input labels for `x` (bit `i` of `x`). The
@@ -457,7 +488,12 @@ pub fn eval(g: &Garbling, active: &[Block], x: Fp, ledger: &mut HashLedger) -> V
     for i in (0..N_BITS).rev() {
         let off = i * row_words;
         let xi = x.bit(i);
-        expand_counted(active[i], i as u64, u64_bytes_mut(&mut pad_raw), &mut ledger.eval_calls);
+        expand_counted(
+            active[i],
+            i as u64,
+            u64_bytes_mut(&mut pad_raw),
+            &mut ledger.eval_calls,
+        );
         // The stored ciphertext backing this row (if any): row-1 when xᵢ=1, the
         // non-free row-0 when (i=0, x₀=0); otherwise the row is free.
         let ct: Option<&[u64]> = if xi {
@@ -565,13 +601,20 @@ mod tests {
             let x = Fp::random(&mut rng);
             let r = Fp::random(&mut rng);
             assert_eq!(x.double(), x.add(x), "double must equal x+x");
-            assert_eq!(x.double_add(r), x.double().add(r), "double_add must equal 2x+r");
+            assert_eq!(
+                x.double_add(r),
+                x.double().add(r),
+                "double_add must equal 2x+r"
+            );
         }
     }
 
     #[test]
     fn test_plaintext_mul_oracle() {
-        assert_eq!(plaintext_mul(Fp::from_u64(7), Fp::from_u64(11)), Fp::from_u64(77));
+        assert_eq!(
+            plaintext_mul(Fp::from_u64(7), Fp::from_u64(11)),
+            Fp::from_u64(77)
+        );
         let x = Fp::zero().sub(Fp::from_u64(3)); // p - 3
         assert_eq!(plaintext_mul(Fp::from_u64(2), x), x.double());
         let pm1 = Fp::zero().sub(Fp::from_u64(1));
@@ -614,7 +657,11 @@ mod tests {
             let out = eval(&g, &active, x, &mut ledger);
 
             for j in 0..s {
-                assert_eq!(out[j], plaintext_mul(a[j], x).add(b[j]), "map {j}: a·x+b mismatch");
+                assert_eq!(
+                    out[j],
+                    plaintext_mul(a[j], x).add(b[j]),
+                    "map {j}: a·x+b mismatch"
+                );
             }
         }
     }
@@ -636,7 +683,11 @@ mod tests {
         let out_x2 = eval(&g, &encode(&g, x2), x2, &mut ledger);
         for j in 0..s {
             assert_eq!(out_x[j], plaintext_mul(a[j], x).add(b[j]), "map {j} at x");
-            assert_eq!(out_x2[j], plaintext_mul(a[j], x2).add(b[j]), "map {j} at x2");
+            assert_eq!(
+                out_x2[j],
+                plaintext_mul(a[j], x2).add(b[j]),
+                "map {j} at x2"
+            );
         }
         assert!(
             (0..s).any(|j| out_x[j] != out_x2[j]),
@@ -661,7 +712,11 @@ mod tests {
         let active = encode(&g, x);
         let _ = eval(&g, &active, x, &mut ledger);
 
-        assert_eq!(ledger, cost_model(s), "measured hash count must match 4nS / 2nS");
+        assert_eq!(
+            ledger,
+            cost_model(s),
+            "measured hash count must match 4nS / 2nS"
+        );
         assert_eq!(ledger.garble_calls, 2 * N_BITS * s * BLOCKS_PER_FE);
         assert_eq!(ledger.eval_calls, N_BITS * s * BLOCKS_PER_FE);
         assert_eq!(g.comm_bytes(), 2 * N_BITS * s * FE_BYTES); // both-rows reference

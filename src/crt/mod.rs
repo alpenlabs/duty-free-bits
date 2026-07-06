@@ -72,7 +72,7 @@ impl CrtParams {
         let ell = max_sum.ilog2() + 1;
         assert!(
             ell <= 32,
-            "working modulus 2^{} exceeds the CF label machinery's 32-bit ring cap",
+            "working modulus 2^{} exceeds the arithmetic-label machinery's 32-bit ring cap",
             ell
         );
 

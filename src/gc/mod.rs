@@ -25,6 +25,7 @@ pub mod fold;
 pub(crate) mod onehot;
 
 /// The ciphertext + hash footprint of one step (for [`crate::affine::Stats`]).
+///
 /// A boolean-label scaling into `Z_{2^w}` costs `w` CCRH blocks and `w` λ-bit
 /// units of communication; a `Z_p`-share scaling costs one residue. Which side
 /// of the ledger a step's cost lands on is set by the driver, not the step.

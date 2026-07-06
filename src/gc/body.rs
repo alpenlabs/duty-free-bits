@@ -485,7 +485,7 @@ fn mod_mul(a: u64, b: u64, p: u64) -> u64 {
     // (primes ≤ 409) this holds with enormous margin; the assert pins it.
     debug_assert!(
         p <= (1u64 << 32),
-        "NCF modulus {p} exceeds the u64 fast-path bound"
+        "Z_p modulus {p} exceeds the u64 fast-path bound"
     );
     (a * b) % p
 }
