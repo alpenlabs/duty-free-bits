@@ -1,5 +1,3 @@
-// TODO: Replace with x86_64 AES-NI backend, this is written by Claude so that CI doesn't fail, although it passes tests.
-
 //! Portable software AES-128 + CCRND backend.
 //!
 //! Used on non-aarch64 targets (aarch64 uses the AES-NI backend). Produces
@@ -13,7 +11,7 @@
 //!
 //! NOTE: this table-based AES is **not constant-time**. It exists so the crate
 //! compiles and CI runs off-aarch64; the production target is aarch64. A
-//! constant-time / bitsliced fallback is future work (see the architecture spec).
+//! constant-time / bitsliced fallback is future work.
 
 /// The 11 AES-128 round keys (round 0 = whitening, rounds 1..=10 the rounds).
 pub type RoundKeys = [[u8; 16]; 11];

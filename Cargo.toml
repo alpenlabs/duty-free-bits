@@ -6,18 +6,21 @@ authors = [
   "Nakul Khambhati <nakul@cs.ucla.edu>",
   "David Heath <daheath@illinois.edu>",
 ]
-description = "Switch system construction from Duty-Free Bits"
+description = "One-hot CRT construction from Duty-Free Bits"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/alpenlabs/duty-free-bits"
 categories = ["cryptography"]
-keywords = ["garbled-circuits", "mpc", "switch-system", "bitvm"]
+keywords = ["garbled-circuits", "mpc", "one-hot-crt", "bitvm"]
 
 # Lints live as crate attributes in src/lib.rs (the [lints] table tripped the
 # editor's stale Cargo schema; source attributes also avoid the group/lint
 # priority dance).
 
 [features]
+# Enable a process-global CCRH (AES-block) counter for per-party hash accounting
+# in benchmarks. OFF by default — zero overhead on the hot path when disabled.
+count-hashes = []
 
 [dependencies]
 mimalloc = { version = "0.1", default-features = false }

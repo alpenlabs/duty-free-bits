@@ -2,7 +2,7 @@
 //!
 //! Given coprime moduli p_1, ..., p_T with primorial M = Π p_i, this module
 //! computes the chunking and working-modulus parameters needed to build
-//! an affine switch system, and provides CRT reconstruction via Garner's
+//! the one-hot CRT construction, and provides CRT reconstruction via Garner's
 //! algorithm.
 
 /// Fixed-width 576-bit unsigned integer for CRT output representation.
@@ -70,7 +70,11 @@ impl CrtParams {
         let max_word = (1u64 << chunk_size) - 1;
         let max_sum = (num_chunks as u128) * (p_max as u128) * (max_word as u128);
         let ell = max_sum.ilog2() + 1;
-        assert!(ell < 64, "working modulus 2^{} exceeds u64", ell);
+        assert!(
+            ell <= 32,
+            "working modulus 2^{} exceeds the arithmetic-label machinery's 32-bit ring cap",
+            ell
+        );
 
         CrtParams {
             n,
@@ -108,7 +112,122 @@ pub fn pow2_mod(j: u32, p: u64) -> u64 {
     result
 }
 
+/// Precomputed Garner constants for repeated CRT reconstruction over a fixed
+/// prime set.
+///
+/// [`crt_reconstruct`] recomputes, per call, every prefix product mod p_i and
+/// an extended-Euclid inverse per prime — all functions of the prime set
+/// alone. For S reconstructions over the same primes (the production decode
+/// path), build a `GarnerDecoder` once and amortize: the per-call inner loop
+/// collapses to u64 multiply-accumulates with one `% p_i` per prime.
+#[derive(Debug)]
+pub struct GarnerDecoder {
+    primes: Vec<u64>,
+    /// `ppi[i][j] = (p_0 · … · p_{j-1}) mod p_i` for `j ≤ i` (row i has i+1
+    /// entries; `ppi[i][0] = 1`). Stored row-flattened.
+    ppi: Vec<u64>,
+    /// Row offsets into `ppi` (row i starts at `i·(i+1)/2`).
+    row: Vec<usize>,
+    /// `inv[i] = (p_0 · … · p_{i-1})^{-1} mod p_i`.
+    inv: Vec<u64>,
+    /// `pp[i] = p_0 · … · p_{i-1}` as U576 (pp[0] = 1).
+    pp: Vec<U576>,
+}
+
+impl GarnerDecoder {
+    /// Precompute Garner constants for `primes` (pairwise coprime, each ≥ 2).
+    pub fn new(primes: &[u64]) -> Self {
+        let t = primes.len();
+        // Hard bound (not debug-only: decode runs in release): reconstruct's
+        // delayed-reduction accumulator needs Σ_{j<t} c_j·w_j < 2^64 with
+        // c_j, w_j < p_max, and diff·inv < 2^64 with both < p_max. The assert
+        // uses p²·t < 2^63 — one bit under that 2^64 ceiling, for headroom.
+        for &p in primes {
+            assert!(
+                (p as u128) * (p as u128) * (t as u128) < (1u128 << 63),
+                "GarnerDecoder: prime set exceeds the u64 delayed-reduction bound \
+                 (use crt_reconstruct)"
+            );
+        }
+        let mut ppi = Vec::with_capacity(t * (t + 1) / 2);
+        let mut row = Vec::with_capacity(t);
+        let mut inv = Vec::with_capacity(t);
+        for (i, &p_i) in primes.iter().enumerate() {
+            row.push(ppi.len());
+            let mut prod = 1u64;
+            ppi.push(1);
+            for &p_j in primes.iter().take(i) {
+                prod = mulmod128(prod as u128, p_j as u128, p_i as u128) as u64;
+                ppi.push(prod);
+            }
+            inv.push(if i == 0 {
+                0 // unused: c_0 = r_0 directly
+            } else {
+                mod_inverse(prod as u128, p_i as u128) as u64
+            });
+        }
+        let mut pp = Vec::with_capacity(t);
+        let mut prod = U576::ONE;
+        for &p in primes.iter().take(t) {
+            pp.push(prod);
+            prod = prod.mul_u64(p);
+        }
+        GarnerDecoder {
+            primes: primes.to_vec(),
+            ppi,
+            row,
+            inv,
+            pp,
+        }
+    }
+
+    /// Reconstruct x from its residues (same order as the constructor's
+    /// primes; each residue must be reduced, `residues[i] < primes[i]`).
+    ///
+    /// Same value as [`crt_reconstruct`]; the mixed-radix coefficients are
+    /// accumulated raw in u64 — terms are < p_i² ≤ 2^18 over ≤ t ≤ 2^9 primes,
+    /// so the running sum stays < 2^27 — with a single `% p_i` per prime.
+    pub fn reconstruct(&self, residues: &[u64]) -> U576 {
+        let t = self.primes.len();
+        assert_eq!(residues.len(), t);
+        if t == 0 {
+            return U576::ZERO;
+        }
+        debug_assert!(
+            residues.iter().zip(&self.primes).all(|(&r, &p)| r < p),
+            "residues must be reduced mod their primes"
+        );
+
+        let mut coeffs: Vec<u64> = Vec::with_capacity(t);
+        coeffs.push(residues[0] % self.primes[0]);
+        let mut result = U576::from_u64(coeffs[0]);
+        for (i, (&r_i, &p_i)) in residues.iter().zip(&self.primes).enumerate().skip(1) {
+            let ppi_row = &self.ppi[self.row[i]..self.row[i] + i];
+            // temp = Σ_j c_j · (Π_{m<j} p_m mod p_i), reduced once.
+            let mut acc = 0u64;
+            for (c, w) in coeffs.iter().zip(ppi_row) {
+                acc += c * w;
+            }
+            let temp = acc % p_i;
+            let diff = if r_i >= temp {
+                r_i - temp
+            } else {
+                r_i + p_i - temp
+            };
+            let c_i = (diff * self.inv[i]) % p_i;
+            coeffs.push(c_i);
+            if c_i != 0 {
+                result = result + self.pp[i].mul_u64(c_i);
+            }
+        }
+        result
+    }
+}
+
 /// Reconstruct x from CRT residues using Garner's mixed-radix algorithm.
+///
+/// One-shot variant; for many reconstructions over the same primes use
+/// [`GarnerDecoder`].
 pub fn crt_reconstruct(residues: &[u64], primes: &[u64]) -> U576 {
     assert_eq!(residues.len(), primes.len());
     let t = primes.len();
@@ -118,7 +237,8 @@ pub fn crt_reconstruct(residues: &[u64], primes: &[u64]) -> U576 {
 
     // Garner's algorithm: find coefficients c_i such that
     //   x = c_0 + c_1·p_0 + c_2·p_0·p_1 + ...
-    // All coefficients are < p_i <= 409, so u128 arithmetic suffices here. TODO: use u16 instead of u128.
+    // u128 arithmetic keeps this correct for any u64 primes; the repeated-use
+    // path with precomputed constants is GarnerDecoder.
     let mut coeffs: Vec<u128> = vec![0; t];
     coeffs[0] = residues[0] as u128;
 
@@ -144,7 +264,7 @@ pub fn crt_reconstruct(residues: &[u64], primes: &[u64]) -> U576 {
     }
 
     // Reconstruct from mixed-radix coefficients into U576.
-    // coeffs[i] < p_i <= 409, so casting to u64 is safe.
+    // coeffs[i] < p_i (a u64), so the u128 → u64 cast is safe.
     let mut result = U576::from_u64(coeffs[0] as u64);
     let mut product = U576::ONE;
     for i in 1..t {
@@ -355,6 +475,32 @@ mod tests {
     #[should_panic(expected = "≠ 1")]
     fn test_mod_inverse_non_coprime_panics() {
         mod_inverse(4, 6);
+    }
+
+    // ==================== GarnerDecoder ====================
+
+    #[test]
+    fn test_garner_decoder_matches_crt_reconstruct() {
+        // The precomputed decoder must agree with the one-shot Garner on every
+        // input, including extremes (all-zero, max residues) and the full
+        // 80-prime production set.
+        let mut rng = rng();
+        let small: [u64; 4] = [2, 3, 5, 7];
+        for primes in [&small[..], &FIRST_80_PRIMES[..]] {
+            let dec = GarnerDecoder::new(primes);
+            let zero: Vec<u64> = primes.iter().map(|_| 0).collect();
+            assert_eq!(dec.reconstruct(&zero), crt_reconstruct(&zero, primes));
+            let max: Vec<u64> = primes.iter().map(|&p| p - 1).collect();
+            assert_eq!(dec.reconstruct(&max), crt_reconstruct(&max, primes));
+            for _ in 0..SAMPLES {
+                let residues: Vec<u64> = primes.iter().map(|&p| rng.random_range(0..p)).collect();
+                assert_eq!(
+                    dec.reconstruct(&residues),
+                    crt_reconstruct(&residues, primes),
+                    "primes={primes:?}, residues={residues:?}"
+                );
+            }
+        }
     }
 
     // ==================== crt_reconstruct ====================
