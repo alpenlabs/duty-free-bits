@@ -109,7 +109,7 @@ fn test_u576_mod_q_helper() {
 /// reported. Both EXCLUDE a,b sampling (done once before timing) and any
 /// correctness/decode step (correctness is covered by
 /// `bitdecomp::tests::test_garble_eval_matches_plaintext` and the assert in
-/// `test_s_aff_scaling`). Input-label provisioning is outside the timed
+/// `test_s_aff_sweep`). Input-label provisioning is outside the timed
 /// region for both (bit-decomp `encode`; the one-hot CRT driver samples input
 /// masks outside its per-stage timers). The one-hot CRT side runs
 /// [`crate::affine::build_s_aff`].
