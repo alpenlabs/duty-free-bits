@@ -141,14 +141,19 @@ headroom is protocol-level (fewer MACs/hashes) or cross-prime parallelism, not
 execution machinery. Two notes on the hot paths:
 
 * **Body pads are rejection-sampled raw slices** (see `gc::body::pad_width`):
-  per slot, successive `w`-bit windows of the CCRH stream are scanned and the
-  first one below `p·⌊2^w/p⌋` becomes the next pad — exactly uniform over
-  `Z_p` once the fold reduces it, where reducing a bare window is biased by
-  `(2^w mod p)/2^w`. The width `w ∈ {4, 8, 12}` is chosen per prime to
-  minimize the expected hash bits per pad (`w/(1−r)`), accepted values stay
-  nibble-aligned load + shift + mask slices with no per-pad reduction, and the
-  ledger prices the rejections as a deterministic expected block count
-  (`gc::body::batch_cost`), cross-checked to ±3% by `bench_axb_hashcounts`.
+  a member's pad is a `w`-bit window of the slot's CCRH stream below
+  `p·⌊2^w/p⌋` — exactly uniform over `Z_p` once the fold reduces it, where
+  reducing a bare window is biased by `(2^w mod p)/2^w`. Sampling is in-place
+  probing: the stream's first `b` windows land in the slab verbatim exactly as
+  before rejection, one vectorized pass (NEON in the 16-bit band) flags the
+  ~0.25% of windows the bound rejects, and each flagged member is patched from
+  a deterministic spare-window cursor on the same stream. `w = 16` for every
+  p ≥ 17 (one scan kernel, whole-u16-lane cells, rejects ≤ 0.54%) and
+  `w = 4` for p ≤ 13; accepted
+  values stay nibble-aligned load + shift + mask slices with no per-pad
+  reduction, and the ledger prices the rejections as a deterministic expected
+  block count (`gc::body::batch_cost`), cross-checked to ±3% by
+  `bench_axb_hashcounts`.
 * **The body is MAC-bound at scale**: it does one multiply-accumulate per
   (slot, member) pair — ~22.5 M per party at `S = 1536`, growing linearly with
   `S` — which a hash-only floor estimate never sees (it undercounts the real

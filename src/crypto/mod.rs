@@ -100,6 +100,21 @@ pub fn expand(seed: Block, nonce: u64, output: &mut [u8]) {
 /// (paper App. A, Def. 4 legality is per 128-bit tweak).
 pub fn expand_from(seed: Block, nonce: u64, first_block: u64, output: &mut [u8]) {
     let keys = round_keys();
+
+    // Single-block fast path: the body's rejection sampler extends a slot's
+    // stream one 16-byte block at a time, where the grouped kernel's setup
+    // would dominate. Byte-identical: same tweak, same CCRND block.
+    if output.len() <= 16 {
+        let h = backend::ccrnd(seed, ctr_tweak(nonce, first_block), keys, CCRH_PUBLIC_S);
+        output.copy_from_slice(&h[..output.len()]);
+        #[cfg(feature = "count-hashes")]
+        HASH_BLOCKS.fetch_add(
+            output.len().div_ceil(16) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        return;
+    }
+
     let mut counter: u64 = first_block;
     let mut written = 0;
 
