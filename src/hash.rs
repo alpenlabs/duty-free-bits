@@ -6,11 +6,13 @@ use crate::label::Label;
 
 /// `⌈log₂ modulus⌉` (number of bits needed to represent values < modulus).
 ///
-/// Note (known limitation): for a non-power-of-two modulus `p` — which the CRT
-/// primes are — reducing this tight `⌈log₂ p⌉`-bit slice mod `p` is slightly
-/// non-uniform: residues `0..(2^⌈log₂ p⌉ − p)` occur twice as often as the
-/// rest. The IT-GC body widens its slice to a nibble to shrink this bias (see
-/// `gc::body::pad_bits`).
+/// Note: reducing a `⌈log₂ p⌉`-bit hash slice mod a non-power-of-two `p` —
+/// which the CRT primes are — is non-uniform (residues `0..(2^⌈log₂ p⌉ − p)`
+/// occur twice as often as the rest), so the IT-GC body does NOT sample its
+/// `Z_p` pads this way: it rejection-samples wider windows to exact uniformity
+/// (see `gc::body::pad_width`). This function only sizes the power-of-two
+/// quantities — scaling-residue widths and `Z_{2^k}` ring words — where the
+/// slice is exactly uniform.
 pub fn lg_modulus(modulus: u64) -> usize {
     if modulus <= 1 {
         0
@@ -49,6 +51,27 @@ pub fn hash_bulk_into(ctrl_mask: &Label, group_id: usize, total_bits: usize, out
     let len = total_bits.div_ceil(8);
     assert!(out.len() >= len, "hash_bulk_into: out shorter than output");
     expand(seed, domain, &mut out[..len]);
+}
+
+/// Continue a bulk CCRH stream from block `first_block`.
+///
+/// Fills all of `out` with blocks `first_block..` of the `(ctrl_mask,
+/// group_id)` stream that [`hash_bulk_into`] starts at block 0 —
+/// byte-identical to the corresponding suffix of one longer `hash_bulk_into`.
+///
+/// The per-block CTR counter, not the `group_id`, sequences blocks within a
+/// stream (see [`crate::crypto::expand_from`]), so a caller that cannot bound
+/// its consumption up front — the body's rejection sampler — extends the same
+/// stream instead of reserving extra nonces. Def-4 freshness holds as long as
+/// no block index is queried twice for a `(ctrl_mask, group_id)`.
+pub fn hash_bulk_more(ctrl_mask: &Label, group_id: usize, first_block: u64, out: &mut [u8]) {
+    let seed = label_to_block(ctrl_mask);
+    debug_assert!(
+        (group_id as u64) < (1u64 << 63),
+        "group id uses the bulk-domain bit"
+    );
+    let domain = (group_id as u64) | (1u64 << 63);
+    crate::crypto::expand_from(seed, domain, first_block, out);
 }
 
 /// CCRH for one one-hot scaling with a Z₂ payload, allocation-free.
@@ -92,6 +115,21 @@ mod tests {
         let mut out = vec![0u8; 10];
         hash_bulk_into(&ctrl, 7, 80, &mut out);
         assert_eq!(out, [175, 72, 194, 184, 45, 188, 159, 234, 245, 163]);
+    }
+
+    /// `hash_bulk_more` must reproduce the tail of a longer `hash_bulk_into`
+    /// exactly — the label-level mirror of `test_expand_from_continues_the_stream`.
+    #[test]
+    fn test_bulk_more_continues_bulk_into() {
+        let s = rand_ctrl();
+        let mut whole = vec![0u8; 5 * 16];
+        hash_bulk_into(&s, 11, 5 * 128, &mut whole);
+        for first_block in [1u64, 2, 4] {
+            let start = first_block as usize * 16;
+            let mut got = vec![0u8; whole.len() - start];
+            hash_bulk_more(&s, 11, first_block, &mut got);
+            assert_eq!(got, &whole[start..], "first_block={first_block}");
+        }
     }
 
     #[test]

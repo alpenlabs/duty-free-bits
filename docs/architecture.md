@@ -1,17 +1,17 @@
 # Architecture
 
-`duty-free-bits` garbles and evaluates the switch-system construction `S_aff`:
-given an `n`-bit input `x` and per-prime affine coefficients `(a, b)`, it
-produces the garbled material a garbler sends an evaluator, and the labels the
-evaluator decodes to `a·x + b mod p_i` for each CRT prime `p_i`. Reconstructing
-those residues (Chinese Remainder Theorem) recovers `a·x + b` over the
-primorial.
+`duty-free-bits` garbles and evaluates the straight-line one-hot CRT
+construction `S_aff` — repeated one-hot scaling + free recombination: given an
+`n`-bit input `x` and per-prime affine coefficients `(a, b)`, it produces the
+garbled material a garbler sends an evaluator, and the labels the evaluator
+decodes to `a·x + b mod p_i` for each CRT prime `p_i`. Reconstructing those
+residues (Chinese Remainder Theorem) recovers `a·x + b` over the primorial.
 
 The whole computation runs as **straight-line code over bare label words** —
 no gate graph, no constraint solver, no worklist. The evaluator knows `x`
-(switch-private / data-public), so every derivation order is fixed in advance:
-the garbler's pass is x-blind and level-major (it hashes every switch slot),
-and the evaluator hashes only the closed slots, solving each hot slot through a
+(data-public), so every derivation order is fixed in advance: the garbler's
+pass is x-blind and level-major (it hashes every one-hot slot), and the
+evaluator hashes only the closed slots, solving each hot slot through a
 join.
 
 The reference workload is `N = 256`, `S = 6·256 = 1536` affine maps.
@@ -23,21 +23,21 @@ The reference workload is `N = 256`, `S = 6·256 = 1536` affine maps.
 [`build_s_aff`](../src/affine.rs) composes four steps, all straight-line loops
 over bare labels:
 
-* **Chunk conversion** ([`comp_gc::extract`](../src/comp_gc/extract.rs)) — one
+* **Chunk conversion** ([`gc::chunk`](../src/gc/chunk.rs)) — one
   per input chunk: pack `lg n` input bits into a ring word `w_c ∈ Z_{2^ℓ}` (a
   one-hot doubling tree over the chunk's bits, width-ℓ casts, a pin join, and
   `Σ p·A_p`).
 * **Per prime `p_i`:**
-  * **Extract** ([`comp_gc::extract`](../src/comp_gc/extract.rs)) — form
+  * **Extract** ([`gc::extract`](../src/gc/extract.rs)) — form
     `r_i = Σ_c coeff_c · w_c` in label space, then run the fused
     `word_to_bin_up` schedule per sub-chunk: the tree, width-`l` casts serving
     as bit-extraction accumulators *and* the peel upcast, and one pin join at
     the class-tree root. Carries out the first sub-chunk's binary one-hot plus
     the remaining bits.
-  * **Fold** ([`comp_gc::fold`](../src/comp_gc/fold.rs)) — reduce that one-hot
+  * **Fold** ([`gc::fold`](../src/gc/fold.rs)) — reduce that one-hot
     mod `p_i` (free Z₂ adds), then fold in the remaining bits to a length-`p_i`
     one-hot `h_p` of `x mod p_i`.
-  * **Body** ([`it_gc`](../src/it_gc.rs)) — the information-theoretic GC:
+  * **Body** ([`gc::body`](../src/gc/body.rs)) — the information-theoretic GC:
     deliver `a·(x mod p_i) + b` from `h_p`, in `RESIDUE_BATCH_SIZE`-sized
     batches of the `S` maps.
 
@@ -75,7 +75,7 @@ word-to-hot + separate peel).
   wire/hash format; conversion happens only at hash boundaries. Every label is
   control-friendly — the IT-GC body works on bare u64 residues, so there is no
   separate NCF label type.
-* **Bare working types** ([`comp_gc::extract`](../src/comp_gc/extract.rs)) —
+* **Bare working types** ([`gc::onehot`](../src/gc/onehot.rs)) —
   inside the hot loops a Z₂ wire is a `[u64; 2]` and a width-`l` wire is a
   `[u32; λ]` lane array; the lane loops run unmasked mod 2^32 (truncation to
   `Z_{2^l}` commutes with wrapping u32 add/mul) with masks applied only at the
@@ -92,9 +92,11 @@ buffer in CTR mode; on aarch64 it runs four AES blocks interleaved
 and to the portable software backend.
 
 [`src/hash.rs`](../src/hash.rs) wraps the core with the label↔block encoding:
-`hash_z2` for a bare-word Z₂ switch and `hash_bulk_into` for a switch group
-packed into one slab. The extract/chunk steps' width-`l` cast pads use the CTR
-`expand` directly and unpack the packed coordinates (NEON gather on aarch64).
+`hash_z2` for a bare-word Z₂ scaling and `hash_bulk_into` for a scaling group
+packed into one slab (`hash_bulk_more` continues such a stream mid-nonce — the
+body's rejection sampler draws on it). The extract/chunk steps' width-`l` cast
+pads use the CTR `expand` directly and unpack the packed coordinates (NEON
+gather on aarch64).
 
 **Nonce discipline (paper App. A, Def. 4):** no two CCRH queries may share a
 `(domain, id)`. The width-`l` cast hashes own the solo domain (chunk windows
@@ -111,8 +113,8 @@ still decode.
 ## 4. Security properties
 
 * **Carry invariant** — every wire satisfies `label = mask + value · Δ_R`.
-* **Switches reveal nothing** — the evaluator knows `x` (switch-private /
-  data-public), derives every switch control itself, and the garbler sends only
+* **Scalings reveal nothing** — the evaluator knows `x` (data-public),
+  derives every scaling control itself, and the garbler sends only
   the join diffs. Communication is exactly the join width.
 * **Smudging (paper Thm. 5.2)** — when the evaluator CRT-reconstructs over
   `Z_M`, the garbler must pre-smudge each `b` as `b' = b + μ·q` before deriving
@@ -138,11 +140,20 @@ chunk ≈ 1.5. The steps sit near their AES-block + lane-op floors; the remainin
 headroom is protocol-level (fewer MACs/hashes) or cross-prime parallelism, not
 execution machinery. Two notes on the hot paths:
 
-* **Body pads are nibble-aligned raw slices** (see `it_gc::pad_bits`):
-  extraction is load + shift + mask with no per-pad reduction, trading ~23 %
-  more body AES blocks for eliminating the bit-surgery that otherwise dominates
-  its non-hash time (−24 % on the body at large S), and shrinking the
-  pad-sampling bias from `2^⌈lg p⌉ mod p` to `2^w mod p`.
+* **Body pads are rejection-sampled raw slices** (see `gc::body::pad_width`):
+  a member's pad is a `w`-bit window of the slot's CCRH stream below
+  `p·⌊2^w/p⌋` — exactly uniform over `Z_p` once the fold reduces it, where
+  reducing a bare window is biased by `(2^w mod p)/2^w`. Sampling is in-place
+  probing: the stream's first `b` windows land in the slab verbatim exactly as
+  before rejection, one vectorized pass (NEON in the 16-bit band) flags the
+  ~0.25% of windows the bound rejects, and each flagged member is patched from
+  a deterministic spare-window cursor on the same stream. `w = 16` for every
+  p ≥ 17 (one scan kernel, whole-u16-lane cells, rejects ≤ 0.54%) and
+  `w = 4` for p ≤ 13; accepted
+  values stay nibble-aligned load + shift + mask slices with no per-pad
+  reduction, and the ledger prices the rejections as a deterministic expected
+  block count (`gc::body::batch_cost`), cross-checked to ±3% by
+  `bench_axb_hashcounts`.
 * **The body is MAC-bound at scale**: it does one multiply-accumulate per
   (slot, member) pair — ~22.5 M per party at `S = 1536`, growing linearly with
   `S` — which a hash-only floor estimate never sees (it undercounts the real
@@ -161,7 +172,7 @@ Run `cargo test` (debug exercises the `debug_assert`s; release exercises the
 fast paths). Coverage:
 
 * **Carry invariant per wire** — `test_chunk_label_mask_invariant{,_production}`
-  and `test_extract_label_mask_invariant` (in `comp_gc::extract`) pin
+  and `test_extract_label_mask_invariant` (in `gc::chunk` / `gc::extract`) pin
   `label = mask + v·Δ` at every emitted wire, exhaustively / randomized at the
   production shapes; `test_fold_label_mask_invariant` does the same for the
   fold.
@@ -175,7 +186,9 @@ fast paths). Coverage:
   regimes.
 * **Ledger** — the `Stats` cost fields are checked against the closed forms in
   the step tests (`(2^k − 2) + l·2^k` hashes and `k + l − 1` join bits per
-  sub-chunk for extract).
+  sub-chunk for extract); the body's hash term is an expected count (its pads
+  are rejection-sampled), pinned to the measured counter within ±3% by
+  `bench_axb_hashcounts`.
 
 Ignored (manual) benchmarks: `bench_axb_comparison` / `bench_axb_network` (the
 field-to-field head-to-head vs the bit-decomposition baseline),
@@ -191,12 +204,13 @@ count-hashes`), `bench_axb_stages` (per-stage split of `build_s_aff`),
 1. [`label.rs`](../src/label.rs) — the label representation.
 2. [`crypto/`](../src/crypto/mod.rs), [`hash.rs`](../src/hash.rs) — the CCRH
    core, nonce rules, and label-aware wrapper.
-3. [`comp_gc/extract.rs`](../src/comp_gc/extract.rs) — the one-hot tree + cast
+3. [`gc/onehot.rs`](../src/gc/onehot.rs), [`gc/chunk.rs`](../src/gc/chunk.rs),
+   [`gc/extract.rs`](../src/gc/extract.rs) — the one-hot tree + cast
    machinery and the chunk/extract steps (the fused `word_to_bin_up`).
-4. [`comp_gc/fold.rs`](../src/comp_gc/fold.rs) — the mod-p fold.
-5. [`it_gc.rs`](../src/it_gc.rs) — the IT-GC residue body.
+4. [`gc/fold.rs`](../src/gc/fold.rs) — the mod-p fold.
+5. [`gc/body.rs`](../src/gc/body.rs) — the IT-GC residue body.
 6. [`affine.rs`](../src/affine.rs) — how the steps wire together
    (`build_s_aff`, `Stats`, `NonceLayout`).
 7. [`crt/`](../src/crt/mod.rs) — CRT parameters and Garner reconstruction.
-8. [`bitdecomp.rs`](../src/bitdecomp.rs) — the switch-free baseline the
+8. [`bitdecomp.rs`](../src/bitdecomp.rs) — the bit-decomposition baseline the
    benchmarks compare against.
