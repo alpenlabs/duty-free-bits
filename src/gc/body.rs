@@ -4,7 +4,8 @@
 //! Step 3 ([`super::fold`]) handed us a length-`p_i` one-hot `h_p` of
 //! `hot = x mod p_i`: `p_i` boolean labels, exactly the one at the active slot
 //! `hot` sharing a 1. Hashing slot `i`'s label gives a fresh one-time pad
-//! `pad_i = H(h_p[i]) ∈ Z_{p_i}` — one pad per slot.
+//! `pad_i = H(h_p[i]) ∈ Z_{p_i}` — one pad per slot, rejection-sampled from
+//! the slot's hash stream so it is exactly uniform (see [`slot_pads`]).
 //!
 //! **One pad is hidden from the evaluator.** The evaluator knows `x`, hence the
 //! active slot `hot`. At every *off* slot the one-hot bit is 0, so its label
@@ -69,7 +70,8 @@ pub fn body_batch_garble(
     assert_eq!(weights.len(), p, "weights length mismatch");
 
     // pad_i = H(h_p[i]) for each one-hot slot, bulk-packed across the b members.
-    let slot_hash = slot_pads(h_p_masks, group_id_base, b, p_i);
+    // The garbler is x-blind, so it samples every slot's stream.
+    let slot_hash = slot_pads(h_p_masks, group_id_base, b, p_i, None);
 
     // Delayed reduction — see accumulate_pads.
     let mut pad_sum_raw = vec![0u64; b]; // Σ_i pad_i (unreduced)
@@ -95,14 +97,34 @@ pub fn body_batch_garble(
 
 /// Garbled-material footprint of a `b`-member body batch mod `p_i`: one scaling
 /// residue of `lg|p_i|` bits per member (communication is unchanged by the pad
-/// layout), and `p_i` slot hashes of `b·pad_bits` bits each (one CCRH
-/// block per `λ` bits — see [`pad_bits`] for the alignment trade).
+/// sampling), and the EXPECTED CCRH block count of the `p_i` slot streams.
+///
+/// With rejection sampling ([`slot_pads`]) the realized block count is random
+/// — each slot scans a negative-binomially distributed number of `w`-bit
+/// windows to collect its `b` accepts — so the ledger reports a deterministic
+/// estimate: `b·w / (1 − r) = b·w·2^w / acc` expected bits per slot
+/// (`acc` = [`accept_bound`], `r` the rejection rate of [`pad_width`]'s rule),
+/// plus λ/2 for drawing the stream in whole blocks, all over λ. When `r = 0`
+/// (p = 2 in the concrete prime set: `acc = 2^w`) no window can reject and the
+/// exact deterministic count is reported instead. `bench_axb_hashcounts`
+/// cross-checks the measured garbler count against this to ±3%; on the
+/// 80-prime set the estimate sits within ~0.1% of the true expectation.
 fn batch_cost(p_i: u64, b: usize) -> Cost {
     let join_bits = b * hash::lg_modulus(p_i);
+    let w = pad_width(p_i);
+    let acc = accept_bound(p_i, w);
+    let (bw, lambda) = ((b * w) as u64, LAMBDA as u64);
+    let hash_count = if acc == 1u64 << w {
+        p_i * bw.div_ceil(lambda)
+    } else {
+        // p·(b·w·2^w/(acc·λ) + 1/2), rounded up in exact integer arithmetic
+        // (< 2^36 at the largest test modulus — no overflow near u64).
+        (p_i * (2 * bw * (1u64 << w) + acc * lambda)).div_ceil(2 * acc * lambda)
+    };
     Cost {
         program_bits: join_bits,
         join_complexity: join_bits,
-        hash_count: p_i as usize * (b * pad_bits(p_i)).div_ceil(LAMBDA),
+        hash_count: hash_count as usize,
     }
 }
 
@@ -131,8 +153,11 @@ pub fn body_batch_eval(
     assert!(hot < p, "hot index out of range");
 
     // Same pads the garbler formed. At an off slot the one-hot bit is 0, so
-    // label == mask and the evaluator recomputes pad_i exactly; only pad_hot differs.
-    let slot_hash = slot_pads(h_p_labels, group_id_base, b, p_i);
+    // label == mask and the evaluator recomputes pad_i exactly. At the active
+    // slot its label diverges — the stream (and its accept/reject pattern)
+    // would be garbage — so it skips that slot outright and opens pad_hot
+    // from `diff` below.
+    let slot_hash = slot_pads(h_p_labels, group_id_base, b, p_i, Some(hot));
     let g_hot = weights[hot] % p_i;
 
     // Delayed reduction — see accumulate_pads.
@@ -191,63 +216,174 @@ fn eval_outputs_from_sums(
         .collect()
 }
 
-/// Bits of hash output sliced per pad: `lg|p_i|` rounded up to a nibble
-/// (4, 8, or 12 for our prime range).
+/// Bits of hash output sliced per sampling attempt: the window width
+/// `w ∈ {4, 8, 12, 16}` minimizing the expected hash bits per accepted pad,
+/// `w / (1 − r(w))` with rejection rate `r(w) = (2^w mod p) / 2^w` (ties break
+/// to the smaller width; widths with `2^w < p`, where every window rejects,
+/// never win).
 ///
-/// Nibble alignment makes every pad's bit phase 0 or 4, so extraction is a
-/// load + fixed shift + mask with NO per-pad reduction: the raw `w`-bit slice
-/// is accumulated as-is and the fold's single `% p` per member reduces it
-/// (`pad ≡ slice mod p`; both parties slice identically, so the shared Z_p
-/// pad value is unchanged in kind). Two effects, both bought with more AES
-/// blocks per slot (`⌈b·w/λ⌉` vs `⌈b·lg p/λ⌉`, ≤ 4/3 at the dominant widths):
-/// the extraction bit-surgery that dominated the body's non-hash time
-/// disappears, and the pad-sampling bias shrinks from `2^⌈lg p⌉ mod p`
-/// (documented on [`hash::lg_modulus`], up to ~20% at p = 409) to
-/// `2^w mod p` (< 0.2%). The scaling residues — the actual communication —
-/// remain `lg|p_i|`-bit.
-fn pad_bits(p_i: u64) -> usize {
-    hash::lg_modulus(p_i).next_multiple_of(4)
+/// Rejection against [`accept_bound`] makes the pads EXACTLY uniform over
+/// `Z_p` — see [`slot_pads`] — where reducing a bare `w`-bit slice mod `p` is
+/// biased by `r(w)` (up to ~49% at p = 131 for the former nibble-aligned
+/// `w = 8`). The rule prices that exactness per prime: a wider window costs
+/// more bits per attempt but rejects less often. Concretely, on the 80-prime
+/// set: `w = 4` for p ≤ 13, `w = 8` for 17 ≤ p ≤ 128 and 167 ≤ p ≤ 251,
+/// `w = 12` for 131 ≤ p ≤ 163 and 257 ≤ p ≤ 409 (`w = 16` never wins below
+/// `p = 2^12`); `test_pad_width_rule` pins the rule and these bands.
+///
+/// Every candidate width is a nibble multiple, so window extraction and slab
+/// packing stay load + shift + mask on bit phases {0, 4} with no per-pad
+/// reduction ([`extract_pad`] / [`pack_pad`]). The scaling residues — the
+/// actual communication — remain `lg|p_i|`-bit.
+fn pad_width(p_i: u64) -> usize {
+    assert!(
+        (2..=1 << 16).contains(&p_i),
+        "pad_width covers 2 ≤ p ≤ 2^16 (the concrete primes are ≤ 409)"
+    );
+    let mut best: Option<(usize, u64, u64)> = None; // (w, w·2^w, accept_bound)
+    for w in [4usize, 8, 12, 16] {
+        let acc = accept_bound(p_i, w);
+        if acc == 0 {
+            continue;
+        }
+        // Minimize w·2^w / acc, compared as cross products (≤ 16·2^32 ≪ u64).
+        let num = (w as u64) << w;
+        match best {
+            Some((_, bn, bd)) if num * bd >= bn * acc => {}
+            _ => best = Some((w, num, acc)),
+        }
+    }
+    best.expect("some window width admits acceptance").0
 }
 
-/// Slot-major slab of the per-slot bulk hashes: slot `i`'s `b·pad_bits` pad
-/// bits occupy `bytes[i·stride .. i·stride + exact_len]`, where `stride` is
-/// `exact_len` rounded up to a u64 boundary. 8 trailing zero bytes guarantee
-/// that any u64 load starting inside a slot's exact region stays in bounds.
+/// Acceptance bound of the `w`-bit rejection sampler for `Z_p`: windows
+/// `v < p·⌊2^w/p⌋` are accepted — an exact multiple of `p` equiprobable
+/// values, so `v mod p` is exactly uniform — and the `2^w mod p` values above
+/// are rejected. Zero (nothing accepted) iff `2^w < p`.
+fn accept_bound(p_i: u64, w: usize) -> u64 {
+    ((1u64 << w) / p_i) * p_i
+}
+
+/// Slot-major slab of the per-slot accepted pads: slot `i`'s `b·pad_width`
+/// pad bits occupy `bytes[i·stride .. i·stride + exact_len]`, where `stride`
+/// is `exact_len` rounded up to a u64 boundary. 8 trailing zero bytes
+/// guarantee that any u64 load starting inside a slot's exact region stays in
+/// bounds.
 struct HashSlab {
     bytes: Vec<u8>,
     stride: usize,
 }
 
-/// The pad material `H(h_p[i])` for each one-hot slot, bulk-packed: each slot
-/// holds `b·lg|p_i|` pseudorandom bits, one `lg|p_i|`-bit pad per batch member.
-/// Garbler and evaluator call this identically (on masks / labels); at every
-/// off slot the two agree, which is what lets `pad_i` line up.
-fn slot_pads(ohe: &[Label], group_id_base: usize, b: usize, p_i: u64) -> HashSlab {
-    let w = pad_bits(p_i);
+/// The pad material for each one-hot slot, bulk-packed: each slot holds `b`
+/// accepted `w`-bit windows of its CCRH stream `H(h_p[i])`, one pad per batch
+/// member (`w` = [`pad_width`]).
+///
+/// Per slot, successive `w`-bit windows are read off the stream; the first
+/// window below [`accept_bound`] becomes the next member's pad (its residue
+/// mod `p` is exactly uniform), rejected windows are skipped, and retries are
+/// unbounded — a geometric tail, no fallback. The stream starts at the
+/// reject-free footprint (`⌈b·w/λ⌉` blocks, one bulk CCRH call) and extends
+/// one block at a time via [`hash::hash_bulk_more`] under the slot's one
+/// nonce: the CTR block counter, not the nonce, sequences a stream, so the
+/// [`crate::affine`] nonce layout is untouched by rejections. Accepted
+/// windows are packed RAW (not reduced): the fold's single `% p` per member
+/// absorbs the reduction, exactly as before (`Σ vᵢ ≡ Σ (vᵢ mod p)`).
+///
+/// Garbler and evaluator call this identically (on masks / labels): at every
+/// off slot the two streams agree bit for bit, so the accept/reject pattern —
+/// and hence every pad — lines up. At the active slot the evaluator's stream
+/// diverges and its pads would be garbage; it passes `skip` to neither hash
+/// nor scan that slot (its slab region stays zero, and [`accumulate_pads`]
+/// skips it regardless), which is why the evaluator's measured block count is
+/// the garbler's minus the active slots'. The garbler passes `None`.
+fn slot_pads(
+    ohe: &[Label],
+    group_id_base: usize,
+    b: usize,
+    p_i: u64,
+    skip: Option<usize>,
+) -> HashSlab {
+    let w = pad_width(p_i);
+    let bound = accept_bound(p_i, w);
     let total_bits = b * w;
     let exact_len = total_bits.div_ceil(8);
     let stride = exact_len.div_ceil(8) * 8;
-    // One allocation for the whole batch; intra-slot padding and the 8-byte
-    // tail stay zero (and are masked off in `extract_pad` regardless).
+    // One allocation for the whole batch; intra-slot padding, a skipped slot
+    // and the 8-byte tail stay zero (and are masked off in `extract_pad`
+    // regardless).
     let mut bytes = vec![0u8; ohe.len() * stride + 8];
+    // Stream scratch, reused across slots. Its own 8 tail bytes keep the u64
+    // window loads in bounds; bytes past a slot's generated prefix are never
+    // interpreted (windows are read only below the generated bit count), so
+    // stale content from an earlier slot's extension is harmless.
+    let init_blocks = total_bits.div_ceil(LAMBDA);
+    let mut stream = vec![0u8; init_blocks * 16 + 8];
     for (i, l) in ohe.iter().enumerate() {
+        if Some(i) == skip {
+            continue;
+        }
         let base = i * stride;
         hash::hash_bulk_into(
             l,
             group_id_base + i,
-            total_bits,
-            &mut bytes[base..base + exact_len],
+            init_blocks * LAMBDA,
+            &mut stream[..init_blocks * 16],
         );
+        let mut blocks = init_blocks;
+        let mut max_win = blocks * LAMBDA / w; // whole windows generated so far
+        let (mut member, mut win) = (0usize, 0usize);
+        while member < b {
+            if win == max_win {
+                // Stream exhausted before the b-th accept: extend by one block.
+                if stream.len() < (blocks + 1) * 16 + 8 {
+                    stream.resize((blocks + 1) * 16 + 8, 0);
+                }
+                hash::hash_bulk_more(
+                    l,
+                    group_id_base + i,
+                    blocks as u64,
+                    &mut stream[blocks * 16..(blocks + 1) * 16],
+                );
+                blocks += 1;
+                max_win = blocks * LAMBDA / w;
+            }
+            let v = extract_pad(&stream, 0, win, w);
+            win += 1;
+            if v < bound {
+                pack_pad(&mut bytes, base, member, w, v);
+                member += 1;
+            }
+        }
     }
     HashSlab { bytes, stride }
+}
+
+/// Pack member `j`'s accepted RAW pad (`v < 2^w`) into slot `i`'s slab region
+/// at bits `[j·w .. (j+1)·w)` past `base = i·stride` — the exact layout
+/// [`extract_pad`] reads back. Nibble alignment keeps the bit phase in
+/// {0, 4}, so `v << phase` spans at most two bytes; the region is still zero
+/// there (slots are packed once, members ascending), so OR-ing is a plain
+/// store.
+#[inline(always)]
+fn pack_pad(slab: &mut [u8], base: usize, member_idx: usize, w: usize, v: u64) {
+    let bit_off = member_idx * w;
+    let byte = base + (bit_off >> 3);
+    let phase = bit_off & 7;
+    debug_assert!(phase + w <= 16 && v >> w == 0, "pack_pad writes ≤ 2 bytes");
+    let sh = (v as u16) << phase;
+    slab[byte] |= sh as u8;
+    if phase + w > 8 {
+        slab[byte + 1] |= (sh >> 8) as u8;
+    }
 }
 
 /// Accumulate `Σ_i pad_i` and `Σ_i g_i·pad_i` per batch member into
 /// `pad_sum_raw` / `readout_raw`, skipping slot `skip` entirely when given
 /// (eval's active slot — always a whole-slot skip, never a per-member one).
 ///
-/// Delayed reduction: pads are raw `w`-bit slices (< 2^w, see [`pad_bits`])
-/// and weights are < p, so with p²·2^w < 2⁶³ the u64 sums `Σ pad_i`
+/// Delayed reduction: pads are raw accepted `w`-bit windows (< 2^w, see
+/// [`pad_width`] — rejection only thins the value range, so the bound is
+/// unchanged) and weights are < p, so with p²·2^w < 2⁶³ the u64 sums `Σ pad_i`
 /// (< p·2^w) and `Σ g_i·pad_i` (< p²·2^w, at most p terms) cannot overflow —
 /// one `% p` per member at the fold replaces one per pad.
 ///
@@ -264,7 +400,7 @@ fn accumulate_pads(
     pad_sum_raw: &mut [u64],
     readout_raw: &mut [u64],
 ) {
-    let w = pad_bits(p_i);
+    let w = pad_width(p_i);
     assert!(
         (p_i as u128) * (p_i as u128) * (1u128 << w) < (1u128 << 63),
         "delayed-reduction accumulators would overflow for p = {p_i}"
@@ -297,7 +433,7 @@ fn accumulate_pads_scalar(
     pad_sum_raw: &mut [u64],
     readout_raw: &mut [u64],
 ) {
-    let w = pad_bits(p_i);
+    let w = pad_width(p_i);
     for (i, &t) in weights.iter().enumerate() {
         if Some(i) == skip {
             continue;
@@ -345,7 +481,7 @@ fn accumulate_pads_neon(
     use core::arch::aarch64::*;
 
     let b = pad_sum_raw.len();
-    let w = pad_bits(p_i);
+    let w = pad_width(p_i);
     debug_assert!((4..=12).contains(&w), "NEON gate admits 2 ≤ p ≤ 1023");
     // Per-slot weights g = weights[i] mod p, hoisted out of the
     // member-major walk (g < p ≤ 1023 fits u32 by the gate).
@@ -444,12 +580,13 @@ fn accumulate_pads_neon(
     }
 }
 
-/// Member `j`'s RAW pad slice from slot `i`'s bulk hash: bits
-/// `[j·w .. (j+1)·w)` past `base = i·stride`, w = [`pad_bits`]. The value is
-/// NOT reduced mod p — the accumulators run unreduced and the fold's single
-/// `% p` per member reduces the sums (see [`accumulate_pads`]). Nibble
-/// alignment keeps the bit phase in {0, 4}; the slab's 8-byte tail keeps the
-/// unconditional u64 load in bounds.
+/// Member `j`'s RAW pad from slot `i`'s slab region — and, with `base = 0`,
+/// window `j` of a slot's raw hash stream in [`slot_pads`]'s rejection scan:
+/// bits `[j·w .. (j+1)·w)` past `base = i·stride`, w = [`pad_width`]. The
+/// value is NOT reduced mod p — the accumulators run unreduced and the fold's
+/// single `% p` per member reduces the sums (see [`accumulate_pads`]). Nibble
+/// alignment keeps the bit phase in {0, 4}; the buffer's 8-byte tail keeps
+/// the unconditional u64 load in bounds.
 #[inline(always)]
 fn extract_pad(slab: &[u8], base: usize, member_idx: usize, w: usize) -> u64 {
     debug_assert!(w <= 57, "extract_pad u64 load covers ≤ 57-bit slices");
@@ -579,7 +716,7 @@ mod tests {
                 // Garbler: full kernel (auto dispatch) vs the forced-scalar
                 // reference rebuilt from the same deterministic slab.
                 let g_out = body_batch_garble(p_i, &h_p_masks, &a_batch, &b_batch, &weights, gid);
-                let slab = slot_pads(&h_p_masks, gid, b, p_i);
+                let slab = slot_pads(&h_p_masks, gid, b, p_i, None);
                 let (mut ps_auto, mut ro_auto) = (vec![0u64; b], vec![0u64; b]);
                 accumulate_pads(&slab, &weights, None, p_i, &mut ps_auto, &mut ro_auto);
                 let (mut ps_ref, mut ro_ref) = (vec![0u64; b], vec![0u64; b]);
@@ -621,7 +758,7 @@ mod tests {
                         &weights,
                         gid,
                     );
-                    let slab_l = slot_pads(&h_p_labels, gid, b, p_i);
+                    let slab_l = slot_pads(&h_p_labels, gid, b, p_i, Some(hot));
                     let (mut ps_e, mut ro_e) = (vec![0u64; b], vec![0u64; b]);
                     accumulate_pads_scalar(
                         &slab_l,
@@ -697,6 +834,99 @@ mod tests {
                     a_batch[j], b_batch[j],
                 );
             }
+        }
+    }
+
+    /// The width rule against a direct rational argmin of `w·2^w / acc` (with
+    /// the smaller-width tie-break), plus the concrete bands on the 80-prime
+    /// set and the moduli the differential test exercises.
+    #[test]
+    fn test_pad_width_rule() {
+        let cost = |p: u64, w: usize| -> Option<(u64, u64)> {
+            let acc = accept_bound(p, w);
+            (acc != 0).then_some(((w as u64) << w, acc))
+        };
+        for p in (2u64..=421).chain([1009, 1621, 4093, 4099, 65521]) {
+            let w = pad_width(p);
+            let (n0, d0) = cost(p, w).expect("chosen width must admit acceptance");
+            for cand in [4usize, 8, 12, 16] {
+                let Some((n1, d1)) = cost(p, cand) else {
+                    continue;
+                };
+                // Chosen width is no worse than any candidate, and strictly
+                // better than any smaller one (ties break small).
+                if cand < w {
+                    assert!(n1 * d0 > n0 * d1, "p={p}: tie/loss to smaller w={cand}");
+                } else {
+                    assert!(n1 * d0 >= n0 * d1, "p={p}: w={w} beaten by w={cand}");
+                }
+            }
+        }
+        for &p in crate::crt::bigint::FIRST_80_PRIMES.iter() {
+            let expect = match p {
+                2..=13 => 4,
+                17..=128 | 167..=251 => 8,
+                _ => 12,
+            };
+            assert_eq!(pad_width(p), expect, "band mismatch at p={p}");
+        }
+        // Spot values: p = 2 rejects nothing at any width (the generic rule
+        // picks 4); p = 167 is the exact 8-vs-12 tie (8·2^8/167 = 12·2^12/4008).
+        assert_eq!((pad_width(2), accept_bound(2, 4)), (4, 16));
+        assert_eq!((pad_width(167), accept_bound(167, 8)), (8, 167));
+        assert_eq!((pad_width(131), accept_bound(131, 12)), (12, 4061));
+        assert_eq!((pad_width(409), accept_bound(409, 12)), (12, 4090));
+    }
+
+    /// Every packed pad respects the acceptance bound (the rejection actually
+    /// ran), and the eval-side `skip` leaves exactly that slot's region zero
+    /// while reproducing the garbler's pads everywhere else.
+    #[test]
+    fn test_slot_pads_rejection_bound_and_skip() {
+        let mut rng = rand::rng();
+        for &p_i in &[3u64, 13, 131, 167, 409] {
+            let p = p_i as usize;
+            let b = 37usize;
+            let w = pad_width(p_i);
+            let bound = accept_bound(p_i, w);
+            let masks: Vec<Label> = (0..p).map(|_| rand_cf2_label(&mut rng)).collect();
+            let full = slot_pads(&masks, 99, b, p_i, None);
+            let skip = p / 2;
+            let skipped = slot_pads(&masks, 99, b, p_i, Some(skip));
+            assert_eq!(full.stride, skipped.stride);
+            for i in 0..p {
+                for j in 0..b {
+                    let v = extract_pad(&full.bytes, i * full.stride, j, w);
+                    assert!(v < bound, "pad ≥ acceptance bound: p={p_i} slot={i} j={j}");
+                    let vs = extract_pad(&skipped.bytes, i * skipped.stride, j, w);
+                    assert_eq!(
+                        vs,
+                        if i == skip { 0 } else { v },
+                        "skip divergence: p={p_i} slot={i} j={j}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Pins the expected-count ledger: exact `p·⌈b·w/λ⌉` when no window can
+    /// reject (p = 2), else `⌈p·(b·w·2^w/(acc·λ) + 1/2)⌉`; join/program bits
+    /// stay the communication-exact `b·lg p`.
+    #[test]
+    fn test_batch_cost_expected_hash_count() {
+        for (p, b, expect) in [
+            (2u64, 128usize, 8usize), // r = 0: deterministic 4 blocks × 2 slots
+            (3, 128, 15),
+            (17, 128, 146),
+            (131, 128, 1652), // w = 12 band below the 8-vs-12 crossover
+            (167, 128, 2132), // the tie prime, w = 8
+            (409, 128, 5120),
+            (409, 1, 243), // ragged batch: the ½-block term dominates
+        ] {
+            let c = batch_cost(p, b);
+            assert_eq!(c.hash_count, expect, "hash_count at p={p} b={b}");
+            assert_eq!(c.program_bits, b * hash::lg_modulus(p), "join at p={p}");
+            assert_eq!(c.join_complexity, c.program_bits);
         }
     }
 }

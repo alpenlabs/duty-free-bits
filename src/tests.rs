@@ -632,6 +632,17 @@ fn bench_axb_hashcounts() {
         sw_total,
         "one-hot CRT per-party blocks must sum to measured total"
     );
+    // The ledger's ncf term is an EXPECTED count — the body's rejection-sampled
+    // pads make the realized block count random (see `gc::body::batch_cost`) —
+    // so the ledger cross-check is a tolerance, not the old equality. The
+    // estimate sits within ~0.1% of the true expectation and the sampling
+    // noise across ~10^5 slot streams is far smaller, so ±3% is generous.
+    let drift = (sw_g as f64 - sw_ledger as f64).abs() / sw_ledger as f64;
+    assert!(
+        drift <= 0.03,
+        "one-hot CRT measured garbler blocks {sw_g} vs ledger {sw_ledger}: {:.2}% > 3%",
+        drift * 100.0
+    );
 
     let mm = |x: u64| x as f64 / 1e6;
     eprintln!(
