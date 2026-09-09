@@ -366,8 +366,11 @@ fn slot_pads(
         // chunk's bitmap as it is produced, was measured 2–3x slower: the
         // short per-chunk dependency chain (compare tree, lane extraction,
         // branch) serializes against its neighbors.
-        if rejectable {
+        if rejectable && b > 0 {
             // whole ⟹ λ | b·w ⟹ 8 | b, so there is no sub-group tail.
+            // b > 0 above: b·w = 0 is trivially "whole" (0 mod λ), but there
+            // are no windows to scan and `chunks_exact_mut` panics on a
+            // zero chunk size, so an empty batch skips this pass outright.
             debug_assert!(b.is_multiple_of(8), "whole-block batches scan cleanly");
             let maps_per_slot = b.div_ceil(64);
             let mut bitmaps = vec![0u64; ohe.len() * maps_per_slot];
@@ -419,7 +422,7 @@ fn slot_pads(
                 &mut scratch[..init_blocks * 16],
             );
             bytes[i * stride..i * stride + exact_len].copy_from_slice(&scratch[..exact_len]);
-            if rejectable {
+            if rejectable && b > 0 {
                 let mut cursor = SpareCursor::new(b, init_blocks, whole, w);
                 fix_slot_rejects(
                     &mut bytes[i * stride..],
@@ -1059,6 +1062,28 @@ mod tests {
                 a_batch[j], b_batch[j],
             );
         }
+    }
+
+    #[test]
+    fn test_body_batch_empty_batch_p3_no_panic() {
+        // b = 0 with a rejectable prime (p = 3): `slot_pads` takes the
+        // `whole` branch (0 is trivially a multiple of λ) and must skip the
+        // reject-scan pass rather than build a zero-sized bitmap chunk.
+        let p_i = 3u64;
+        let p = p_i as usize;
+        let mut rng = rand::rng();
+        let hot_idx = 0usize;
+        let h_p_masks: Vec<Label> = (0..p).map(|_| rand_cf2_label(&mut rng)).collect();
+        let h_p_labels = h_p_masks.clone();
+        let weights: Vec<u64> = (0..p_i).collect();
+
+        let g_out = body_batch_garble(p_i, &h_p_masks, &[], &[], &weights, 0);
+        assert!(g_out.join_diffs.is_empty());
+        assert!(g_out.result_masks.is_empty());
+
+        let result_labels =
+            body_batch_eval(p_i, hot_idx, &h_p_labels, &g_out.join_diffs, &[], &weights, 0);
+        assert!(result_labels.is_empty());
     }
 
     /// Differential test for the SIMD dispatch: the auto kernel (NEON on
