@@ -5,7 +5,8 @@
 //! `hot = x mod p_i`: `p_i` boolean labels, exactly the one at the active slot
 //! `hot` sharing a 1. Hashing slot `i`'s label gives a fresh one-time pad
 //! `pad_i = H(h_p[i]) ∈ Z_{p_i}` — one pad per slot, rejection-sampled from
-//! the slot's hash stream so it is exactly uniform (see [`slot_pads`]).
+//! the slot's hash stream so it is exactly uniform (see `slot_pads`, private
+//! to this module).
 //!
 //! **One pad is hidden from the evaluator.** The evaluator knows `x`, hence the
 //! active slot `hot`. At every *off* slot the one-hot bit is 0, so its label
@@ -1081,8 +1082,15 @@ mod tests {
         assert!(g_out.join_diffs.is_empty());
         assert!(g_out.result_masks.is_empty());
 
-        let result_labels =
-            body_batch_eval(p_i, hot_idx, &h_p_labels, &g_out.join_diffs, &[], &weights, 0);
+        let result_labels = body_batch_eval(
+            p_i,
+            hot_idx,
+            &h_p_labels,
+            &g_out.join_diffs,
+            &[],
+            &weights,
+            0,
+        );
         assert!(result_labels.is_empty());
     }
 
