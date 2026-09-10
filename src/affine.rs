@@ -91,7 +91,10 @@ pub struct Stats {
     pub join_complexity_ncf: usize,
     /// Ledger CCRH blocks from the boolean-label steps' scalings.
     pub hash_count_cf: usize,
-    /// Ledger CCRH blocks from the `Z_p`-share body's scalings (bulk-pack rebated).
+    /// Ledger CCRH blocks from the `Z_p`-share body's scalings — an EXPECTED
+    /// count: the body's rejection-sampled pads make the realized count random
+    /// (see `gc::body::batch_cost`; `bench_axb_hashcounts` pins measured to
+    /// this within ±3%).
     pub hash_count_ncf: usize,
     /// Measured garbler CCRH blocks (`count-hashes` feature; else 0).
     pub garble_hash_blocks: u64,
@@ -373,6 +376,11 @@ pub fn build_s_aff<R: rand::Rng>(
 /// windows above those. This struct is the single source of truth the driver
 /// draws its bases from; `test_nonce_windows_disjoint` pins the partition (a
 /// regression output tests cannot catch — the test explains why).
+///
+/// The body's rejection sampler draws an unbounded number of BLOCKS per slot,
+/// but blocks within a stream are sequenced by the CTR counter, not the nonce
+/// (see [`crate::crypto::expand_from`]), so its reservation stays one nonce
+/// per slot regardless of rejections and the window sizes here are unchanged.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct NonceLayout {
     pub chunk_solo_ids: u64,

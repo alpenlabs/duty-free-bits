@@ -86,8 +86,36 @@ fn ctr_tweak(nonce: u64, counter: u64) -> Block {
 /// Each 16-byte block uses a tweak with `nonce` in the low 64 bits and a per-block
 /// counter in the high 64 bits, so blocks never collide.
 pub fn expand(seed: Block, nonce: u64, output: &mut [u8]) {
+    expand_from(seed, nonce, 0, output);
+}
+
+/// Continue the `(seed, nonce)` CTR stream from block `first_block`.
+///
+/// Fills `output` with blocks `first_block..` of the same stream [`expand`]
+/// starts at block 0 — byte-identical to the corresponding suffix of one long
+/// `expand`. This is how a caller draws more output from a stream without a fresh nonce
+/// (the per-block counter, not the nonce, sequences blocks): re-invoking
+/// `expand` would re-query the blocks already consumed, while a distinct
+/// `first_block` range keeps every `(seed, nonce, counter)` triple fresh
+/// (paper App. A, Def. 4 legality is per 128-bit tweak).
+pub fn expand_from(seed: Block, nonce: u64, first_block: u64, output: &mut [u8]) {
     let keys = round_keys();
-    let mut counter: u64 = 0;
+
+    // Single-block fast path: the body's rejection sampler extends a slot's
+    // stream one 16-byte block at a time, where the grouped kernel's setup
+    // would dominate. Byte-identical: same tweak, same CCRND block.
+    if output.len() <= 16 {
+        let h = backend::ccrnd(seed, ctr_tweak(nonce, first_block), keys, CCRH_PUBLIC_S);
+        output.copy_from_slice(&h[..output.len()]);
+        #[cfg(feature = "count-hashes")]
+        HASH_BLOCKS.fetch_add(
+            output.len().div_ceil(16) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        return;
+    }
+
+    let mut counter: u64 = first_block;
     let mut written = 0;
 
     // Grouped path (aarch64): `INTERLEAVE` independent CTR blocks in flight
@@ -136,6 +164,32 @@ mod expand_tests {
             output[written..written + take].copy_from_slice(&h[..take]);
             written += take;
             counter += 1;
+        }
+    }
+
+    /// `expand_from(_, _, k, out)` must reproduce blocks `k..` of the one-shot
+    /// stream exactly — the body's rejection sampler leans on this to extend a
+    /// slot's pad stream without a fresh nonce.
+    #[test]
+    fn test_expand_from_continues_the_stream() {
+        let seed: Block = std::array::from_fn(|i| (i as u8).wrapping_mul(29).wrapping_add(3));
+        let nonce = 0x0123_4567_89ab_cdefu64;
+        let mut whole = vec![0u8; 7 * 16];
+        expand(seed, nonce, &mut whole);
+        for first_block in [0u64, 1, 3, 6] {
+            for len in [1usize, 15, 16, 17, 48] {
+                let start = first_block as usize * 16;
+                if start + len > whole.len() {
+                    continue;
+                }
+                let mut got = vec![0u8; len];
+                expand_from(seed, nonce, first_block, &mut got);
+                assert_eq!(
+                    got,
+                    &whole[start..start + len],
+                    "expand_from mismatch: first_block={first_block} len={len}"
+                );
+            }
         }
     }
 
