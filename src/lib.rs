@@ -109,5 +109,7 @@ pub mod hash;
 
 pub mod label;
 
+pub mod pgs;
+
 #[cfg(test)]
 mod tests;
