@@ -1,0 +1,199 @@
+\documentclass[nonacm,sigconf]{acmart}
+
+\usepackage{paralist}
+\usepackage{physics} % for \vb
+
+\begin{document}
+
+\title{Duty-Free Bits: Projectivizing Garbling Schemes}
+
+\author{Nakul Khambhati}
+\email{nakul@cs.ucla.edu}
+\affiliation{%
+  \institution{University of California, Los Angeles / Alpen Labs}
+  \city{Los Angeles}
+  \country{USA}
+}
+\author{Anwesh Bhattacharya}
+\email{anwesh2@illinois.edu}
+\affiliation{%
+  \institution{University of Illinois, Urbana-Champaign}
+  \city{Urbana}
+  \country{USA}
+}
+\author{David Heath}
+\email{daheath@illinois.edu}
+\affiliation{%
+  \institution{University of Illinois, Urbana-Champaign}
+  \city{Urbana}
+  \country{USA}
+}
+
+\maketitle
+
+\appendix
+
+\section{Artifact Appendix}
+
+\subsection{Abstract}
+
+Our artifact is a Rust implementation of the paper's projectivizing
+transformation, together with a bit-decomposition baseline whose
+communication matches the projectivization step of prior work (the
+comparison point throughout the paper). It garbles and evaluates $S$
+affine maps $\vb{a}x+\vb{b}$ over the BN254 base field for both approaches
+on identical footing, and it is the source of every number in Table~1 and
+Figure~1 and the two application totals (Embryo, Argo MAC) in
+Section~7/Appendix~B. It is a \texttt{cargo} package: no external services,
+no datasets, no GPU/accelerator. It is dual-licensed MIT/Apache-2.0 and
+public at \url{https://github.com/alpenlabs/duty-free-bits}.
+
+\subsection{Description \& Requirements}
+
+The repository root has the usual Rust layout: \texttt{src/} (the
+construction, one module per pipeline stage — chunk, extract, fold, body —
+plus the CCRH core, label representation, the bit-decomposition baseline,
+and a composable garble/encode/eval split of the same protocol,
+\texttt{pgs.rs}, \S A.5), \texttt{docs/architecture.md} (the construction, storage
+layout, cryptography, and testing story), \texttt{README.md} (build and
+benchmark commands), and \texttt{AE.md} (this artifact's reviewer roadmap,
+mapping every benchmark command to the specific paper claim it reproduces).
+All benchmarks are \texttt{\#[ignore]}d tests under \texttt{src/tests.rs}.
+
+\subsubsection{Security, privacy, and ethical concerns}
+None. The artifact only garbles and evaluates synthetic, randomly sampled
+inputs on the reviewer's own machine; it makes no network connections, and
+running it poses no risk to the evaluator's machine or data.
+
+\subsubsection{How to access}
+Public GitHub repository, tag \texttt{ccs26-artifact}:
+\url{https://github.com/alpenlabs/duty-free-bits}. That tag is \texttt{main}
+plus this appendix and \texttt{AE.md}; \texttt{main} already carries the
+exact code that produced every paper number (previously frozen as tag
+\texttt{camera-ready-ccs26}, commit \texttt{3501dce}) plus an additive
+reusability feature, \texttt{src/pgs.rs} (\S A.5), that changes no benchmark
+number. A permanent, DOI-backed archive of the \texttt{ccs26-artifact} tag
+is deposited at Zenodo: \url{PLACEHOLDER-ZENODO-URL} (DOI
+\texttt{PLACEHOLDER-DOI}).
+
+\subsubsection{Hardware dependencies}
+None. The paper's absolute wall-clock numbers are single-threaded Apple M1
+(2020 MacBook Pro) measurements; communication and hash counts are exact
+and machine-independent, and wall-clock \emph{ratios} between our
+construction and the baseline reproduce on any modern CPU. An
+aarch64-specific NEON path activates automatically on Apple Silicon; a
+portable fallback runs everywhere else and both are tested bit-identical.
+
+\subsubsection{Software dependencies}
+Stable Rust, edition 2024 (\textgreater= 1.85; we used 1.90.0). No system
+packages; \texttt{cargo build} fetches its two dependencies
+(\texttt{mimalloc}, \texttt{rand}) from crates.io.
+
+\subsubsection{Benchmarks}
+None beyond the crate itself: every workload is synthetic, randomly sampled
+$(\vb{a},\vb{b},x)$ at fixed sizes ($n=256$-bit input, CRT basis the first
+80 primes), generated in-process by the benchmark harness. No external
+datasets.
+
+\subsection{Set Up}
+
+\subsubsection{Installation}
+\begin{compactenum}
+\item Install stable Rust (\url{https://rustup.rs}) if not already present.
+\item \texttt{git clone https://github.com/alpenlabs/duty-free-bits \&\& cd duty-free-bits \&\& git checkout ccs26-artifact}
+\item \texttt{cargo build --release}
+\end{compactenum}
+
+\subsubsection{Basic test}
+\texttt{cargo test --release} should print \texttt{test result: ok. 100
+passed; 0 failed; 6 ignored} in well under a second. The 6 ignored tests are
+the benchmarks below (\texttt{\#[ignore]}d so they run individually with
+chosen parameters rather than as part of every \texttt{cargo test}).
+
+\subsection{Evaluation Workflow}
+
+\subsubsection{Major claims}
+\begin{compactitem}
+\item[(C1):] At $S=3{,}072$ and $S=153{,}600$, our construction uses
+  $\approx$75--110$\times$ less communication than the bit-decomposition
+  baseline at the cost of $\approx$2$\times$ slower garbling and
+  $\approx$4--5$\times$ slower evaluation (Table~1). Experiment (E1).
+\item[(C2):] Measured per-party CCRH hash counts match the paper's
+  closed-form ledger to within rejection-sampling noise (Figure~1,
+  middle; \S8 ``Hash count''). Experiment (E2).
+\item[(C3):] End-to-end latency (garble + transmit + eval) favors our
+  construction by $\approx$22--28$\times$ at 100\,Mbps and
+  $\approx$3--5$\times$ at 1\,Gbps (Figure~1, right; Table~1; \S8
+  ``End-to-end latency''). Experiment (E3).
+\item[(C4):] Communication is a constant $\approx$110\,KiB plus exactly
+  593 bits per output element, at every measured point $S\in\{1536,\ldots,
+  153{,}600\}$ (Figure~1, left). Experiment (E4).
+\item[(C5):] The Embryo and Argo MAC applications (\S7) improve total
+  communication over prior work (BABE, Argo MAC's original encoding) by
+  $51\times$ and $23\times$ respectively (Appendix~B). Experiment (E5).
+\end{compactitem}
+
+\subsubsection{Experiments}
+
+\begin{compactitem}
+\item[(E1):] Table 1 head-to-head [5~person-minutes + 1~compute-minute]:
+  \textbf{Preparation:} none beyond Set Up. \textbf{Execution:}
+  \texttt{N=256 S=3072 cargo test -r --lib bench\_axb\_comparison --
+  --ignored --nocapture}, then repeat with \texttt{S=153600}.
+  \textbf{Results:} compare the printed garble/eval ms, hash counts, and
+  communication for ``one-hot CRT'' against Table~1's \emph{ours} column at
+  the matching $S$; communication and hashes should match exactly (up to
+  rejection-sampling noise on hashes), wall-clock ratios should be within
+  the paper's range regardless of your CPU's absolute speed.
+
+\item[(E2):] Hash-count ledger cross-check [5~person-minutes +
+  1~compute-minute]: \textbf{Execution:} \texttt{N=256 S=1536 cargo test -r
+  --features count-hashes --lib bench\_axb\_hashcounts -- --ignored
+  --nocapture}. \textbf{Results:} the printed measured count should be
+  within a fraction of a percent of the printed closed-form prediction.
+
+\item[(E3):] End-to-end network latency [10~person-minutes +
+  1~compute-minute]: \textbf{Execution:} \texttt{N=256 S=3072 BW\_MBPS=100
+  cargo test -r --lib bench\_axb\_network -- --ignored --nocapture}, repeat
+  with \texttt{BW\_MBPS=1000} and with \texttt{S=153600}.
+  \textbf{Results:} compare the printed end-to-end times and the
+  ``X.Xx FASTER'' line against \S8's ``End-to-end latency'' paragraph.
+
+\item[(E4):] Communication scaling [10~person-minutes + 2~compute-minutes]:
+  \textbf{Execution:} run (E1)'s command at each $S \in \{1536, 3072,
+  6144, 12288, 24576, 49152, 98304, 153600\}$. \textbf{Results:} the
+  printed communication at each point should match
+  $112.2\text{KB} + 74.14 S\text{ bytes}$ to within measurement rounding;
+  full expected table is in \texttt{AE.md}.
+
+\item[(E5):] Application totals [10~person-minutes, arithmetic only]:
+  \textbf{Execution:} run (E1)'s command at $S=3072$ (Embryo) and
+  $S=1092$ (Argo MAC). \textbf{Results:} Embryo total $\approx$ printed
+  comm $+$ one more $\approx$110\,KiB fixed cost $+$ $\approx$0.4\,KiB
+  curve-check term $\approx 442$\,KiB, a $51\times$ improvement over
+  BABE's reported 22.16\,MiB; Argo MAC total $\approx$ printed comm $+$
+  $\approx$110\,KiB $\approx 298$\,KiB, a $23\times$ improvement over its
+  reported 6.8\,MiB. Full derivation in \texttt{AE.md} and Appendix~B.
+\end{compactitem}
+
+\subsection{Notes on Reusability}
+\texttt{src/pgs.rs} exposes the construction as a composable partial
+garbling scheme: \texttt{build\_s\_aff} (what the benchmarks call) runs
+garbler and evaluator in one pass, whereas \texttt{pgs::garble} /
+\texttt{pgs::encode} / \texttt{pgs::eval} split the identical protocol
+(same steps, nonce layout, ciphertexts) so a caller can compose this
+affine-map scheme as a sub-protocol inside a larger garbled circuit, rather
+than only running it standalone. \texttt{pgs::tests::test\_pgs\_split\_matches\_build\_s\_aff}
+proves the split API is the same protocol via a same-seed equality check
+against \texttt{build\_s\_aff}. Separately, the four pipeline stages
+(chunk, extract, fold, body) and the CCRH core are cut cleanly enough to
+reuse independently of the affine-map application: any construction
+needing a one-hot-encoded value garbled/evaluated over a
+$\mathbb{Z}_{2^k}$ ring can reuse \texttt{gc::onehot} and \texttt{hash.rs}
+directly, and the CRT parameter/reconstruction logic in \texttt{crt/} is
+independent of the garbling machinery.
+
+\subsection{Version}
+Based on the LaTeX template for Artifact Evaluation V20220926.
+
+\end{document}
