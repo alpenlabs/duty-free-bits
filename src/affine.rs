@@ -30,12 +30,12 @@ use rand::{Rng, RngExt};
 
 /// Maximum sub-chunk width for the sub-chunk extraction optimization.
 /// 2^8 = 256 one-hot positions per sub-chunk.
-const MAX_SUB_CHUNK_WIDTH: u32 = 8;
+pub(crate) const MAX_SUB_CHUNK_WIDTH: u32 = 8;
 
 /// S-batch size for the residue body: how many of the `S` affine maps one
 /// body call handles. 128 fills a full λ-bit CCRH block (so packing isn't
 /// wasted) while keeping the per-batch working set small.
-const RESIDUE_BATCH_SIZE: usize = 128;
+pub(crate) const RESIDUE_BATCH_SIZE: usize = 128;
 
 /// First bulk-domain CCRH id available to the fold/body steps; the
 /// chunk/extract tree hashes allocate their windows above it. Reserving a
