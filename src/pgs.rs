@@ -107,6 +107,14 @@ impl EncodingInfo {
     pub fn n(&self) -> usize {
         self.bit_masks.len()
     }
+
+    /// The two labels of input bit `i`, indexed by bit value, for a garbler that
+    /// delivers the evaluator's labels through another garbled object. Revealing
+    /// both labels of a bit reveals `Δ₂`, and with it the labels of every other bit.
+    pub fn bit_labels(&self, i: usize) -> [Label; 2] {
+        let mask = &self.bit_masks[i];
+        [mask.clone(), label::add(mask, &self.d2)]
+    }
 }
 
 /// The evaluator's input labels, one boolean label per bit.
@@ -116,6 +124,19 @@ pub struct InputLabels {
 }
 
 impl InputLabels {
+    /// Input labels the evaluator obtained other than from [`encode`], in bit order.
+    /// Panics if a label is not boolean.
+    pub fn from_labels(labels: Vec<Label>) -> Self {
+        assert!(
+            labels.iter().all(|l| l.modulus() == 2),
+            "input labels must be boolean"
+        );
+        Self { labels }
+    }
+    /// The labels, in bit order.
+    pub fn labels(&self) -> &[Label] {
+        &self.labels
+    }
     /// Number of input bits.
     pub fn len(&self) -> usize {
         self.labels.len()
@@ -400,6 +421,72 @@ pub fn by_component(outputs: &[Vec<u64>]) -> Vec<Vec<u64>> {
 mod tests {
     use super::*;
     use crate::crt::bigint::FIRST_80_PRIMES;
+
+    /// Garbles `s_dim` random maps on `n` bits, and returns a random input's bits.
+    fn garbled_instance(n: u32, s_dim: usize) -> (Program, EncodingInfo, Vec<u64>) {
+        let mut rng = rand::rng();
+        let params = CrtParams::from_primes(&FIRST_80_PRIMES, n);
+        let residues = |rng: &mut rand::rngs::ThreadRng| -> Vec<Vec<u64>> {
+            let vals: Vec<u64> = (0..s_dim).map(|_| rng.random()).collect();
+            params
+                .primes
+                .iter()
+                .map(|&p| vals.iter().map(|&v| v % p).collect())
+                .collect()
+        };
+        let (a_res, b_res) = (residues(&mut rng), residues(&mut rng));
+        let (program, ek) = garble(&mut rng, &params, &a_res, &b_res);
+        let x_bits = (0..n).map(|_| rng.random_range(0..2u64)).collect();
+        (program, ek, x_bits)
+    }
+
+    /// `bit_labels` gives the labels `encode` selects from, and every bit's two
+    /// labels differ by the same offset.
+    #[test]
+    fn test_pgs_bit_labels_match_encode() {
+        let (_, ek, x_bits) = garbled_instance(33, 2);
+        let flipped: Vec<u64> = x_bits.iter().map(|b| 1 - b).collect();
+        let labels = encode(&ek, &x_bits);
+        let other = encode(&ek, &flipped);
+        let offset = ek.d2.clone();
+        for (i, &bit) in x_bits.iter().enumerate() {
+            let [zero, one] = ek.bit_labels(i);
+            assert_ne!(zero, one);
+            assert_eq!(label::add(&zero, &offset), one);
+            let (chosen, unchosen) = if bit == 1 { (one, zero) } else { (zero, one) };
+            assert_eq!(labels.labels()[i], chosen);
+            assert_eq!(other.labels()[i], unchosen);
+        }
+    }
+
+    /// Labels selected from `bit_labels` and wrapped in `from_labels` evaluate
+    /// exactly as the output of `encode` does, and any other label does not.
+    #[test]
+    fn test_pgs_from_labels_evaluates_like_encode() {
+        let (program, ek, x_bits) = garbled_instance(256, 3);
+        let expected = eval(&program, &encode(&ek, &x_bits), &x_bits);
+
+        let selected: Vec<Label> = (0..ek.n())
+            .map(|i| ek.bit_labels(i)[x_bits[i] as usize].clone())
+            .collect();
+        let labels = InputLabels::from_labels(selected);
+        assert_eq!(labels.len(), 256);
+        assert_eq!(eval(&program, &labels, &x_bits), expected);
+
+        let round_trip = InputLabels::from_labels(labels.labels().to_vec());
+        assert_eq!(eval(&program, &round_trip, &x_bits), expected);
+
+        let mut wrong = labels.labels().to_vec();
+        wrong[0] = ek.bit_labels(0)[1 - x_bits[0] as usize].clone();
+        let wrong = InputLabels::from_labels(wrong);
+        assert_ne!(eval(&program, &wrong, &x_bits), expected);
+    }
+
+    #[test]
+    #[should_panic(expected = "input labels must be boolean")]
+    fn test_pgs_from_labels_rejects_an_arithmetic_label() {
+        let _ = InputLabels::from_labels(vec![Label::zero(4)]);
+    }
 
     /// The split API agrees with the direct mod-p oracle, including at the
     /// production shape (n = 256, the 80-prime set).
